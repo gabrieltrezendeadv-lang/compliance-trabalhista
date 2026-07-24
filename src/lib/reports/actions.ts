@@ -110,7 +110,7 @@ export async function generateComplianceReport(): Promise<{
     const { data: membership } = await supabase
       .from("organization_members")
       .select(
-        "tenant_id, organizations(name, slug, legal_name, document_number, plan)"
+        "tenant_id, organizations(name, slug, cnpj, settings)"
       )
       .eq("user_id", user.id)
       .is("deleted_at", null)
@@ -120,9 +120,8 @@ export async function generateComplianceReport(): Promise<{
     const org = membership?.organizations as unknown as {
       name: string;
       slug: string;
-      legal_name: string | null;
-      document_number: string | null;
-      plan: string;
+      cnpj: string | null;
+      settings: Record<string, unknown> | null;
     } | null;
 
     if (!org) {
@@ -180,7 +179,7 @@ export async function generateComplianceReport(): Promise<{
         .order("created_at", { ascending: false }),
       supabase
         .from("assessment_invitations")
-        .select("cycle_id, responded_at"),
+        .select("cycle_id, used_at"),
       supabase
         .from("evidence_reports")
         .select("*", { count: "exact", head: true })
@@ -261,7 +260,7 @@ export async function generateComplianceReport(): Promise<{
         (i) => i.cycle_id === cycle.id
       );
       const responded = cycleInvitations.filter(
-        (i) => i.responded_at
+        (i) => i.used_at
       ).length;
       const total = cycleInvitations.length;
       return {
@@ -275,7 +274,7 @@ export async function generateComplianceReport(): Promise<{
     });
 
     const totalInv = invList.length;
-    const totalResp = invList.filter((i) => i.responded_at).length;
+    const totalResp = invList.filter((i) => i.used_at).length;
     const overallParticipation =
       totalInv > 0 ? Math.round((totalResp / totalInv) * 100) : 0;
 
@@ -307,10 +306,10 @@ export async function generateComplianceReport(): Promise<{
       generatedAt,
       organization: {
         name: org.name,
-        legalName: org.legal_name,
-        documentNumber: org.document_number,
+        legalName: null,
+        documentNumber: org.cnpj,
         slug: org.slug,
-        plan: org.plan,
+        plan: (org.settings as Record<string, unknown>)?.plan as string ?? "free",
       },
       summary: {
         establishments: estCount ?? 0,
