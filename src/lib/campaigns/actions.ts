@@ -226,6 +226,29 @@ export async function prepareCampaignSend(campaignId: string) {
 }
 
 // ============================================================================
+// Enviar campanha (chama o orchestrator de integração)
+// ============================================================================
+
+export async function executeCampaignSend(campaignId: string) {
+  // 1. Preparar entregas via RPC (resolve destinatários, cria campaign_deliveries)
+  const prepResult = await prepareCampaignSend(campaignId);
+  if (prepResult.error) {
+    return { error: prepResult.error };
+  }
+
+  // 2. Enviar via integração (mock ou real, conforme registry)
+  const { sendCampaign } = await import("@/lib/integrations/send-campaign");
+  const result = await sendCampaign(campaignId);
+
+  return {
+    success: true,
+    totalSent: result.totalSent,
+    totalFailed: result.totalFailed,
+    totalRecipients: prepResult.total_recipients,
+  };
+}
+
+// ============================================================================
 // Campaign Templates
 // ============================================================================
 

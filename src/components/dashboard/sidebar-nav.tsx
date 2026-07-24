@@ -11,6 +11,9 @@ import {
   ClipboardCheck,
   Shield,
   Send,
+  FileText,
+  AlertTriangle,
+  FileCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -19,8 +22,11 @@ const NAV_ITEMS = [
   { href: "/dashboard/establishments", label: "Estabelecimentos", icon: MapPin },
   { href: "/dashboard/departments", label: "Departamentos", icon: FolderTree },
   { href: "/dashboard/assessments", label: "Avaliações", icon: ClipboardCheck },
+  { href: "/dashboard/risks", label: "Riscos", icon: AlertTriangle },
   { href: "/dashboard/complaints", label: "Denúncias", icon: Shield },
   { href: "/dashboard/campaigns", label: "Campanhas", icon: Send },
+  { href: "/dashboard/evidence", label: "Evidências", icon: FileText },
+  { href: "/dashboard/reports", label: "Relatório", icon: FileCheck },
   { href: "/dashboard/members", label: "Membros", icon: Users },
   { href: "/dashboard/settings", label: "Configurações", icon: Settings },
 ] as const;

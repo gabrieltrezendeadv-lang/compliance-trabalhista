@@ -1,6 +1,8 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { IntegrationStatus } from "@/components/settings/integration-status";
+import { getIntegrationStatus } from "@/lib/integrations/send-campaign";
 
 export const metadata = {
   title: "Configurações — Compliance Trabalhista",
@@ -33,6 +35,8 @@ export default async function SettingsPage() {
     email: string | null;
     plan: string;
   } | null;
+
+  const integrations = getIntegrationStatus();
 
   return (
     <div className="space-y-6">
@@ -93,6 +97,36 @@ export default async function SettingsPage() {
               Nenhuma organização vinculada.
             </p>
           )}
+        </CardContent>
+      </Card>
+
+      <IntegrationStatus
+        email={integrations.email}
+        whatsapp={integrations.whatsapp}
+      />
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Variáveis de ambiente necessárias</CardTitle>
+          <CardDescription>
+            Para ativar provedores reais, configure estas variáveis no servidor
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-3 text-sm">
+            <div>
+              <p className="font-medium text-muted-foreground">E-mail (Resend)</p>
+              <code className="mt-1 block rounded bg-muted px-2 py-1 text-xs font-mono">
+                RESEND_API_KEY, RESEND_FROM_ADDRESS, RESEND_WEBHOOK_SECRET
+              </code>
+            </div>
+            <div>
+              <p className="font-medium text-muted-foreground">WhatsApp (Meta Cloud API)</p>
+              <code className="mt-1 block rounded bg-muted px-2 py-1 text-xs font-mono">
+                WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_APP_SECRET, WHATSAPP_VERIFY_TOKEN
+              </code>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </div>
