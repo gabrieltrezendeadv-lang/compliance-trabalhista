@@ -14,6 +14,7 @@ import {
   FileText,
   AlertTriangle,
   FileCheck,
+  CreditCard,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +28,7 @@ const NAV_ITEMS = [
   { href: "/dashboard/campaigns", label: "Campanhas", icon: Send },
   { href: "/dashboard/evidence", label: "Evidências", icon: FileText },
   { href: "/dashboard/reports", label: "Relatório", icon: FileCheck },
+  { href: "/dashboard/billing", label: "Assinatura", icon: CreditCard },
   { href: "/dashboard/members", label: "Membros", icon: Users },
   { href: "/dashboard/settings", label: "Configurações", icon: Settings },
 ] as const;

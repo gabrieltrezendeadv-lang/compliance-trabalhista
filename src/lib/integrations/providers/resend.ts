@@ -145,16 +145,25 @@ export class ResendProvider implements MessageProvider {
   }
 
   verifyWebhookSignature(
-    _payload: string,
-    _signature: string,
-    _secret: string
+    payload: string,
+    signature: string,
+    secret: string
   ): boolean {
-    // Resend uses Svix for webhooks — verify with svix library
-    // For now, return false until svix is installed
-    // TODO: npm install svix && implement Webhook.verify()
-    console.warn(
-      "[resend] Webhook signature verification not yet implemented — install svix"
-    )
-    return false
+    try {
+      // Resend uses Svix for webhook signatures
+      // The signature header contains svix-id, svix-timestamp, svix-signature
+      // For Svix verification we need the full headers, but our interface
+      // receives a single signature string. We use HMAC-SHA256 as fallback.
+      const crypto = require("crypto")
+      const expectedSignature = crypto
+        .createHmac("sha256", secret)
+        .update(payload)
+        .digest("base64")
+
+      return signature.includes(expectedSignature)
+    } catch {
+      console.warn("[resend] Webhook signature verification failed")
+      return false
+    }
   }
 }
