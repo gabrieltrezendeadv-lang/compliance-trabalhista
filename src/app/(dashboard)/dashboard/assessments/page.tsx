@@ -1,13 +1,13 @@
 import { getAssessmentCycles } from "@/lib/assessments/actions";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { ClipboardCheck, Plus, Calendar, Users } from "lucide-react";
+import { ClipboardCheck, Calendar, Users } from "lucide-react";
 import Link from "next/link";
 import {
   STATUS_LABELS,
   STATUS_COLORS,
 } from "@/lib/schemas/assessment";
 import type { AssessmentStatus } from "@/lib/schemas/assessment";
+import { CreateAssessmentCycleDialog } from "@/components/dashboard/create-assessment-cycle-dialog";
 
 export const metadata = {
   title: "Avaliações Psicossociais — Compliance Trabalhista",
@@ -27,11 +27,7 @@ export default async function AssessmentsPage() {
             Ciclos de avaliação de riscos psicossociais (NR-1/NR-17)
           </p>
         </div>
-        {/* TODO: modal de criação de ciclo */}
-        <Button>
-          <Plus className="mr-2 h-4 w-4" />
-          Novo ciclo
-        </Button>
+        <CreateAssessmentCycleDialog />
       </div>
 
       {cycles.length === 0 ? (

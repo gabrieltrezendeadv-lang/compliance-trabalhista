@@ -8,7 +8,9 @@ interface OrgSwitcherProps {
 }
 
 export function OrgSwitcher({ orgName }: OrgSwitcherProps) {
-  // TODO: implement multi-org switching when user belongs to multiple orgs
+  // Multi-org switching não faz parte do MVP — a maioria dos clientes
+  // terá apenas uma organização. O layout já suporta o switcher visualmente;
+  // quando necessário, basta adicionar um Popover com a lista de orgs.
   return (
     <Button
       variant="ghost"

@@ -16,7 +16,6 @@ import { createClient } from "@/lib/supabase/server"
 import { resolveProvider, getActiveProviderName } from "./registry"
 import type {
   Channel,
-  CampaignSendJob,
   CampaignSendResult,
   SendRequest,
 } from "./types"
@@ -82,8 +81,7 @@ export async function sendCampaign(
     .update({ status: "sending" })
     .eq("id", campaignId)
 
-  // 4. Determine channels to use
-  const channels = new Set(deliveries.map((d) => d.channel as Channel))
+  // 4. Determine providers used
   const providerNames: string[] = []
 
   // 5. Process each delivery
@@ -124,11 +122,17 @@ export async function sendCampaign(
     // Send
     const sendResult = await provider.send(request)
 
-    // Update delivery in database
+    // Update delivery in database — increment attempt_count on each send
+    const { data: currentDelivery } = await supabase
+      .from("campaign_deliveries")
+      .select("attempt_count")
+      .eq("id", delivery.id)
+      .single()
+
     const updateData: Record<string, unknown> = {
       status: sendResult.status,
       provider_id: sendResult.providerId ?? null,
-      attempt_count: 1, // TODO: increment on retry
+      attempt_count: ((currentDelivery?.attempt_count as number) ?? 0) + 1,
     }
 
     if (sendResult.success) {

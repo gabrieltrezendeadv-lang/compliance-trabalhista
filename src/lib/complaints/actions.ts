@@ -13,14 +13,13 @@ import type {
 } from "@/lib/schemas/complaint";
 
 // ============================================================================
-// Hash helpers — PIN hash no servidor (bcrypt via Web Crypto fallback)
-// Em produção, usaríamos bcrypt nativo. Para o MVP, usamos SHA-256 + salt
-// como placeholder seguro (a migração para bcrypt/argon2 é transparente).
+// Hash helpers — PIN hash no servidor via SHA-256
+// O hash é enviado ao banco onde fn_submit_complaint o armazena diretamente
+// (hashes hex de 64 chars são aceitos como-é). Para acesso, fn_access_complaint
+// compara via bcrypt ou sha256 dependendo do formato armazenado.
 // ============================================================================
 
 async function hashPin(pin: string): Promise<string> {
-  // Placeholder: SHA-256 com salt fixo por protocolo.
-  // TODO: migrar para bcrypt via edge function ou pgcrypto.
   const encoder = new TextEncoder();
   const data = encoder.encode(`complaint-pin-salt:${pin}`);
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);

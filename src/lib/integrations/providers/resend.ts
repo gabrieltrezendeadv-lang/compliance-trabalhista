@@ -7,6 +7,7 @@
  * Docs: https://resend.com/docs/api-reference
  */
 
+import { createHmac } from "crypto"
 import type {
   MessageProvider,
   SendRequest,
@@ -154,9 +155,7 @@ export class ResendProvider implements MessageProvider {
       // The signature header contains svix-id, svix-timestamp, svix-signature
       // For Svix verification we need the full headers, but our interface
       // receives a single signature string. We use HMAC-SHA256 as fallback.
-      const crypto = require("crypto")
-      const expectedSignature = crypto
-        .createHmac("sha256", secret)
+      const expectedSignature = createHmac("sha256", secret)
         .update(payload)
         .digest("base64")
 

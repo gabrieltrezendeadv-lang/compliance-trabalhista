@@ -1,7 +1,7 @@
 import { getEstablishments } from "@/lib/organizations/actions";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { MapPin, Plus, Building2 } from "lucide-react";
+import { MapPin, Building2 } from "lucide-react";
+import { CreateEstablishmentDialog } from "@/components/dashboard/create-establishment-dialog";
 
 export const metadata = {
   title: "Estabelecimentos — Compliance Trabalhista",
@@ -19,11 +19,7 @@ export default async function EstablishmentsPage() {
             Gerencie as unidades (CNPJs) da sua organização
           </p>
         </div>
-        {/* TODO: modal de criação */}
-        <Button>
-          <Plus className="mr-2 h-4 w-4" />
-          Novo estabelecimento
-        </Button>
+        <CreateEstablishmentDialog />
       </div>
 
       {establishments.length === 0 ? (
