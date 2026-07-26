@@ -165,15 +165,42 @@ export const createCampaignSchema = z.object({
   legal_basis: z.string().optional(),
   requires_acknowledgment: z.boolean().default(false),
   scheduled_at: z.string().optional(),
+  // SEC-005: .strict() rejects extra keys in target_scope
   target_scope: z
     .object({
       establishment_ids: z.array(z.string().uuid()).optional(),
       department_ids: z.array(z.string().uuid()).optional(),
     })
+    .strict()
     .optional(),
 });
 
 export type CreateCampaign = z.infer<typeof createCampaignSchema>;
+
+// ============================================================================
+// Schema: atualizar campanha (SEC-005: explicit allowed fields)
+// ============================================================================
+
+export const updateCampaignSchema = z.object({
+  name: z.string().min(1).optional(),
+  description: z.string().optional(),
+  subject: z.string().min(1).optional(),
+  body_html: z.string().optional(),
+  body_text: z.string().min(1).optional(),
+  legal_basis: z.string().optional(),
+  requires_acknowledgment: z.boolean().optional(),
+  scheduled_at: z.string().nullable().optional(),
+  target_scope: z
+    .object({
+      establishment_ids: z.array(z.string().uuid()).optional(),
+      department_ids: z.array(z.string().uuid()).optional(),
+    })
+    .strict()
+    .nullable()
+    .optional(),
+});
+
+export type UpdateCampaign = z.infer<typeof updateCampaignSchema>;
 
 // ============================================================================
 // Schema: delivery item (para lista de entregas)

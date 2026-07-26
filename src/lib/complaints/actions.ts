@@ -13,22 +13,6 @@ import type {
 } from "@/lib/schemas/complaint";
 
 // ============================================================================
-// Hash helpers — PIN hash no servidor (bcrypt via Web Crypto fallback)
-// Em produção, usaríamos bcrypt nativo. Para o MVP, usamos SHA-256 + salt
-// como placeholder seguro (a migração para bcrypt/argon2 é transparente).
-// ============================================================================
-
-async function hashPin(pin: string): Promise<string> {
-  // Placeholder: SHA-256 com salt fixo por protocolo.
-  // TODO: migrar para bcrypt via edge function ou pgcrypto.
-  const encoder = new TextEncoder();
-  const data = encoder.encode(`complaint-pin-salt:${pin}`);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-// ============================================================================
 // Public: Submissão de denúncia (sem autenticação)
 // ============================================================================
 
@@ -39,7 +23,6 @@ export async function submitComplaint(raw: unknown) {
   }
 
   const { pin, ...rest } = parsed.data;
-  const pinHash = await hashPin(pin);
 
   const supabase = await createClient();
   const { data, error } = await supabase.rpc("fn_submit_complaint", {
@@ -53,11 +36,12 @@ export async function submitComplaint(raw: unknown) {
     p_reporter_phone: rest.reporter_phone || null,
     p_establishment_name: rest.establishment_name || null,
     p_department_name: rest.department_name || null,
-    p_pin_hash: pinHash,
+    p_pin_hash: pin,  // raw PIN — bcrypt hashing happens in the DB function
   });
 
   if (error) {
-    return { error: error.message };
+    console.error("submitComplaint RPC error:", error.message);
+    return { error: "Erro ao registrar denúncia. Tente novamente." };
   }
 
   const result = data as { success: boolean; error?: string; protocol?: string };
@@ -79,16 +63,15 @@ export async function accessComplaint(raw: unknown) {
     return { error: parsed.error.flatten().fieldErrors };
   }
 
-  const pinHash = await hashPin(parsed.data.pin);
-
   const supabase = await createClient();
   const { data, error } = await supabase.rpc("fn_access_complaint", {
     p_protocol: parsed.data.protocol,
-    p_pin_hash: pinHash,
+    p_pin_hash: parsed.data.pin,  // raw PIN — bcrypt verification in DB
   });
 
   if (error) {
-    return { error: error.message };
+    console.error("accessComplaint RPC error:", error.message);
+    return { error: "Protocolo ou PIN inválido" };
   }
 
   const result = data as {
@@ -132,17 +115,16 @@ export async function sendReporterMessage(raw: unknown) {
     return { error: parsed.error.flatten().fieldErrors };
   }
 
-  const pinHash = await hashPin(parsed.data.pin);
-
   const supabase = await createClient();
   const { data, error } = await supabase.rpc("fn_send_reporter_message", {
     p_protocol: parsed.data.protocol,
-    p_pin_hash: pinHash,
+    p_pin_hash: parsed.data.pin,  // raw PIN — bcrypt verification in DB
     p_body: parsed.data.body,
   });
 
   if (error) {
-    return { error: error.message };
+    console.error("sendReporterMessage RPC error:", error.message);
+    return { error: "Protocolo ou PIN inválido" };
   }
 
   const result = data as { success: boolean; error?: string; message_id?: string };

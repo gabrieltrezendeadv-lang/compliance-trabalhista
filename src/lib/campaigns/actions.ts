@@ -84,14 +84,29 @@ export async function createCampaign(raw: unknown) {
   return { data };
 }
 
+// SEC-005: Added Zod validation and auth check for campaign updates
 export async function updateCampaign(
   campaignId: string,
-  updates: Record<string, unknown>
+  raw: unknown
 ) {
+  // Import the update schema for validation
+  const { updateCampaignSchema } = await import("@/lib/schemas/campaign");
+  const parsed = updateCampaignSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { error: parsed.error.flatten().fieldErrors };
+  }
+
   const supabase = await createClient();
+
+  // Verify user is authenticated
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Usuário não autenticado" };
+  }
+
   const { error } = await supabase
     .from("campaigns")
-    .update(updates)
+    .update(parsed.data)
     .eq("id", campaignId);
 
   if (error) {
@@ -229,7 +244,16 @@ export async function prepareCampaignSend(campaignId: string) {
 // Enviar campanha (chama o orchestrator de integração)
 // ============================================================================
 
+// SEC-005: Added auth check for campaign execution
 export async function executeCampaignSend(campaignId: string) {
+  const supabase = await createClient();
+
+  // Verify user is authenticated before executing
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Usuário não autenticado" };
+  }
+
   // 1. Preparar entregas via RPC (resolve destinatários, cria campaign_deliveries)
   const prepResult = await prepareCampaignSend(campaignId);
   if (prepResult.error) {

@@ -248,15 +248,32 @@ export async function updateMemberRole(memberId: string, raw: unknown) {
   return { success: true };
 }
 
+// SEC-004: Replaced hard DELETE with transactional RPC that does soft-delete,
+// last-owner protection, hierarchy check, and audit logging.
 export async function removeMember(memberId: string) {
   const supabase = await createClient();
-  const { error } = await supabase
-    .from("organization_members")
-    .delete()
-    .eq("id", memberId);
+  const { data, error } = await supabase.rpc("fn_remove_member", {
+    p_member_id: memberId,
+  });
 
   if (error) {
     return { error: error.message };
+  }
+
+  const result = data as { success: boolean; error?: string };
+
+  if (!result.success) {
+    const errorMessages: Record<string, string> = {
+      unauthenticated: "Usuário não autenticado",
+      no_tenant: "Organização não encontrada",
+      member_not_found: "Membro não encontrado",
+      already_removed: "Membro já foi removido",
+      cannot_remove_self: "Não é possível remover a si mesmo. Use a opção de sair da organização.",
+      insufficient_privileges: "Você não tem permissão para remover este membro",
+      forbidden: "Sem permissão para remover membros",
+      last_owner_cannot_be_removed: "O último proprietário não pode ser removido. Transfira a propriedade primeiro.",
+    };
+    return { error: errorMessages[result.error ?? ""] ?? "Erro ao remover membro" };
   }
 
   return { success: true };

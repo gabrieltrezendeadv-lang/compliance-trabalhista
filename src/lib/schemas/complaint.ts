@@ -196,8 +196,8 @@ export const submitComplaintSchema = z.object({
   department_name: z.string().optional(),
   pin: z
     .string()
-    .min(4, "PIN deve ter pelo menos 4 dígitos")
-    .max(8, "PIN deve ter no máximo 8 dígitos")
+    .min(6, "PIN deve ter pelo menos 6 dígitos")
+    .max(32, "PIN deve ter no máximo 32 dígitos")
     .regex(/^\d+$/, "PIN deve conter apenas números"),
 });
 
@@ -215,6 +215,7 @@ export const accessComplaintSchema = z.object({
   pin: z
     .string()
     .min(4, "PIN é obrigatório")
+    .max(32, "PIN deve ter no máximo 32 dígitos")
     .regex(/^\d+$/, "PIN deve conter apenas números"),
 });
 
@@ -226,7 +227,10 @@ export type AccessComplaint = z.infer<typeof accessComplaintSchema>;
 
 export const sendReporterMessageSchema = z.object({
   protocol: z.string().min(1),
-  pin: z.string().min(4),
+  pin: z
+    .string()
+    .min(4, "PIN é obrigatório")
+    .max(32, "PIN deve ter no máximo 32 dígitos"),
   body: z.string().min(1, "Mensagem não pode estar vazia"),
 });
 

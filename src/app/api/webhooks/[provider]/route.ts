@@ -8,13 +8,15 @@
  * Flow:
  * 1. Verify webhook signature (provider-specific)
  * 2. Parse payload into normalized WebhookEvent
- * 3. Find matching campaign_delivery by provider_id
- * 4. Update delivery status in database
+ * 3. Call fn_process_webhook_event RPC (transactional: find→update→log)
  *
- * Security:
+ * Security (SEC-006):
  * - Signature verification required (except in dev/mock mode)
- * - No tenant_id from frontend — resolved via provider_id lookup
- * - Raw payloads stored for audit trail
+ * - Resend: Svix HMAC-SHA256 (headers passed as JSON to verifyWebhookSignature)
+ * - WhatsApp: HMAC-SHA256 with crypto.timingSafeEqual
+ * - No raw payload stored — only sanitized metadata (no PII)
+ * - Transactional RPC ensures find→update→insert is atomic
+ * - Idempotent: duplicate event_id is silently ignored
  */
 
 import { createClient } from "@supabase/supabase-js"
@@ -75,6 +77,9 @@ export async function GET(
 
 /**
  * POST /api/webhooks/[provider] — receive delivery status webhooks
+ *
+ * SEC-006: Uses fn_process_webhook_event RPC for transactional,
+ * idempotent processing. No raw payload is stored.
  */
 export async function POST(
   request: Request,
@@ -106,12 +111,27 @@ export async function POST(
   const secret = WEBHOOK_SECRET_MAP[providerName]
 
   if (secret) {
-    const signature =
-      request.headers.get("x-hub-signature-256") ?? // WhatsApp
-      request.headers.get("svix-signature") ?? // Resend
-      ""
+    // SEC-006: Resend uses Svix — pass all svix-* headers as JSON string
+    // WhatsApp uses x-hub-signature-256
+    let signatureInput: string
 
-    const isValid = provider.verifyWebhookSignature(rawBody, signature, secret)
+    if (providerName === "resend") {
+      // Svix verification needs svix-id, svix-timestamp, svix-signature as object
+      const svixHeaders: Record<string, string> = {}
+      for (const key of ["svix-id", "svix-timestamp", "svix-signature"]) {
+        const val = request.headers.get(key)
+        if (val) svixHeaders[key] = val
+      }
+      signatureInput = JSON.stringify(svixHeaders)
+    } else {
+      signatureInput = request.headers.get("x-hub-signature-256") ?? ""
+    }
+
+    const isValid = provider.verifyWebhookSignature(
+      rawBody,
+      signatureInput,
+      secret
+    )
     if (!isValid) {
       console.warn(
         `[webhook/${providerName}] Invalid signature — rejecting`
@@ -133,106 +153,54 @@ export async function POST(
   const event = provider.parseWebhook(payload, headers)
 
   if (!event) {
-    // Not a status event we care about (e.g. email.clicked)
+    // Not a status event we care about (e.g. email.clicked, unknown WhatsApp status)
     return Response.json({ received: true })
   }
 
-  // 5. Find matching delivery by provider_id
+  // 5. Call fn_process_webhook_event RPC (transactional + idempotent)
+  // SEC-006: The RPC handles find→update→log atomically, checks for
+  // duplicate event_id, locks the delivery row with FOR UPDATE, and
+  // stores only sanitized metadata (no PII).
   try {
     const supabase = getServiceClient()
 
-    const { data: delivery, error: findError } = await supabase
-      .from("campaign_deliveries")
-      .select("id, campaign_id, status")
-      .eq("provider_id", event.providerId)
-      .limit(1)
-      .maybeSingle()
+    const { data, error } = await supabase.rpc("fn_process_webhook_event", {
+      p_provider: providerName,
+      p_event_id: event.eventId,
+      p_provider_message_id: event.providerId,
+      p_event_type: event.rawEventType,
+      p_status: event.status,
+      p_timestamp: event.timestamp,
+      p_error_code: event.error?.code ?? null,
+      p_error_message: event.error?.message ?? null,
+      p_metadata: event.metadata ?? {},
+    })
 
-    if (findError) {
+    if (error) {
       console.error(
-        `[webhook/${providerName}] DB error finding delivery:`,
-        findError.message
+        `[webhook/${providerName}] RPC fn_process_webhook_event error:`,
+        error.message
       )
       return Response.json({ error: "Internal error" }, { status: 500 })
     }
 
-    if (!delivery) {
-      // Could be a message not sent through our system
-      console.log(
-        `[webhook/${providerName}] No delivery found for providerId=${event.providerId}`
-      )
-      return Response.json({ received: true })
+    const result = data as {
+      success: boolean
+      action?: string
+      error?: string
     }
 
-    // 6. Update delivery status (only advance forward, never regress)
-    const statusOrder = [
-      "pending",
-      "queued",
-      "sent",
-      "delivered",
-      "read",
-    ]
-    const terminalStatuses = ["failed", "bounced", "rejected"]
-
-    const currentIdx = statusOrder.indexOf(delivery.status)
-    const newIdx = statusOrder.indexOf(event.status)
-    const isTerminal = terminalStatuses.includes(event.status)
-
-    // Only update if new status is "higher" or terminal
-    if (isTerminal || newIdx > currentIdx) {
-      const updateData: Record<string, unknown> = {
-        status: event.status,
-      }
-
-      if (event.status === "delivered") {
-        updateData.delivered_at = event.timestamp
-      } else if (event.status === "read") {
-        updateData.read_at = event.timestamp
-      } else if (terminalStatuses.includes(event.status)) {
-        updateData.failed_at = event.timestamp
-        if (event.error) {
-          updateData.error_code = event.error.code
-          updateData.error_message = event.error.message
-        }
-      }
-
-      const { error: updateError } = await supabase
-        .from("campaign_deliveries")
-        .update(updateData)
-        .eq("id", delivery.id)
-
-      if (updateError) {
-        console.error(
-          `[webhook/${providerName}] DB error updating delivery:`,
-          updateError.message
-        )
-        return Response.json({ error: "Internal error" }, { status: 500 })
-      }
-
+    if (!result.success) {
+      // Non-fatal — the RPC returns success=false for "no matching delivery"
+      // or "duplicate event" — both are normal conditions
       console.log(
-        `[webhook/${providerName}] Updated delivery=${delivery.id} status=${delivery.status}→${event.status}`
+        `[webhook/${providerName}] RPC returned: ${result.action ?? result.error}`
+      )
+    } else {
+      console.log(
+        `[webhook/${providerName}] Processed event=${event.eventId} action=${result.action}`
       )
     }
-
-    // 7. Store raw webhook event for audit trail
-    await supabase.from("webhook_events").insert({
-      provider: providerName,
-      event_id: event.eventId,
-      provider_message_id: event.providerId,
-      event_type: event.rawEventType,
-      delivery_id: delivery.id,
-      campaign_id: delivery.campaign_id,
-      payload: event.rawPayload,
-      received_at: new Date().toISOString(),
-    }).then(({ error }) => {
-      // Non-critical — log but don't fail the webhook
-      if (error) {
-        console.warn(
-          `[webhook/${providerName}] Failed to store webhook event:`,
-          error.message
-        )
-      }
-    })
   } catch (err) {
     console.error(`[webhook/${providerName}] Unexpected error:`, err)
     return Response.json({ error: "Internal error" }, { status: 500 })

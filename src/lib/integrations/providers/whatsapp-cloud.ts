@@ -2,7 +2,7 @@
  * WhatsApp Cloud API Provider (stub — ready for Meta credentials)
  *
  * Sends messages via Meta's WhatsApp Cloud API.
- * Webhook verification uses HMAC-SHA256 with app secret.
+ * Webhook verification uses HMAC-SHA256 with app secret (crypto.timingSafeEqual).
  *
  * Docs: https://developers.facebook.com/docs/whatsapp/cloud-api
  */
@@ -144,6 +144,7 @@ export class WhatsAppCloudProvider implements MessageProvider {
     const status = statuses?.[0]
     if (!status) return null
 
+    // SEC-006: Only map known status events. Unknown events return null.
     const statusMap: Record<string, WebhookEvent["status"]> = {
       sent: "sent",
       delivered: "delivered",
@@ -151,12 +152,18 @@ export class WhatsAppCloudProvider implements MessageProvider {
       failed: "failed",
     }
 
+    const mappedStatus = statusMap[status.status as string]
+    if (!mappedStatus) {
+      // Unknown status type — skip, don't default to "sent"
+      return null
+    }
+
     const errors = (status.errors as Array<{ code: number; title: string }>) ?? []
 
     return {
       eventId: crypto.randomUUID(),
       providerId: (status.id as string) ?? "",
-      status: statusMap[status.status as string] ?? "sent",
+      status: mappedStatus,
       timestamp:
         (status.timestamp as string) ?? new Date().toISOString(),
       rawEventType: `whatsapp.${status.status}`,
@@ -166,7 +173,11 @@ export class WhatsAppCloudProvider implements MessageProvider {
             message: errors[0].title,
           }
         : undefined,
-      rawPayload: payload,
+      // SEC-006: No rawPayload — only sanitized metadata (no PII)
+      metadata: {
+        whatsapp_status: status.status,
+        whatsapp_message_id: status.id,
+      },
     }
   }
 
@@ -175,12 +186,23 @@ export class WhatsAppCloudProvider implements MessageProvider {
     signature: string,
     secret: string
   ): boolean {
-    // Meta uses HMAC-SHA256 with app secret
+    // SEC-006: Meta uses HMAC-SHA256 with app secret
+    // Use crypto.timingSafeEqual to prevent timing attacks
     const expectedSignature = crypto
       .createHmac("sha256", secret)
       .update(payload)
       .digest("hex")
 
-    return `sha256=${expectedSignature}` === signature
+    const expected = `sha256=${expectedSignature}`
+
+    // Both must be same length for timingSafeEqual
+    if (expected.length !== signature.length) {
+      return false
+    }
+
+    return crypto.timingSafeEqual(
+      Buffer.from(expected),
+      Buffer.from(signature)
+    )
   }
 }

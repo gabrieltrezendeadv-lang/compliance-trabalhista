@@ -80,8 +80,10 @@ export interface WebhookEvent {
     code: string
     message: string
   }
-  /** Full raw payload for debugging (stored but not processed) */
-  rawPayload: Record<string, unknown>
+  // SEC-006: rawPayload removed — PII risk per NEO SST.
+  // Only sanitized metadata is stored in webhook_events.payload.
+  // Provider-specific metadata (no PII) for audit trail:
+  metadata?: Record<string, unknown>
 }
 
 // ─── Message Provider Interface ────────────────────────────────────────────
