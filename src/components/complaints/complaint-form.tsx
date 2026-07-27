@@ -290,8 +290,9 @@ export function ComplaintForm({ tenantSlug, tenantName }: ComplaintFormProps) {
       <Card>
         <CardHeader>
           <CardTitle>PIN de Acesso</CardTitle>
+          {/* CONSOLIDAÇÃO: Texto atualizado para refletir mínimo de 6 dígitos */}
           <CardDescription>
-            Crie um PIN numérico (4 a 8 dígitos) para acompanhar sua denúncia e
+            Crie um PIN numérico (6 a 32 dígitos) para acompanhar sua denúncia e
             receber respostas. Guarde-o com segurança — não é possível
             recuperá-lo.
           </CardDescription>
@@ -302,16 +303,17 @@ export function ComplaintForm({ tenantSlug, tenantName }: ComplaintFormProps) {
               <Label htmlFor="pin">
                 PIN <span className="text-red-500">*</span>
               </Label>
+              {/* CONSOLIDAÇÃO: maxLength alinhado com schema (32, não 8) */}
               <Input
                 id="pin"
                 type="password"
                 inputMode="numeric"
-                maxLength={8}
+                maxLength={32}
                 value={pin}
                 onChange={(e) =>
-                  setPin(e.target.value.replace(/\D/g, "").slice(0, 8))
+                  setPin(e.target.value.replace(/\D/g, "").slice(0, 32))
                 }
-                placeholder="••••"
+                placeholder="••••••"
                 required
               />
             </div>
@@ -323,12 +325,12 @@ export function ComplaintForm({ tenantSlug, tenantName }: ComplaintFormProps) {
                 id="pin_confirm"
                 type="password"
                 inputMode="numeric"
-                maxLength={8}
+                maxLength={32}
                 value={pinConfirm}
                 onChange={(e) =>
-                  setPinConfirm(e.target.value.replace(/\D/g, "").slice(0, 8))
+                  setPinConfirm(e.target.value.replace(/\D/g, "").slice(0, 32))
                 }
-                placeholder="••••"
+                placeholder="••••••"
                 required
               />
             </div>
@@ -350,7 +352,8 @@ export function ComplaintForm({ tenantSlug, tenantName }: ComplaintFormProps) {
           submitting ||
           subject.length < 5 ||
           description.length < 10 ||
-          pin.length < 4 ||
+          // CONSOLIDAÇÃO: PIN mínimo 6 para novas denúncias (alinhado com schema e DB)
+          pin.length < 6 ||
           pin !== pinConfirm
         }
       >

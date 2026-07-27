@@ -10,8 +10,8 @@
  * 2. Parse payload into normalized WebhookEvent
  * 3. Call fn_process_webhook_event RPC (transactional: find→update→log)
  *
- * Security (SEC-006):
- * - Signature verification required (except in dev/mock mode)
+ * Security (SEC-006 + CONSOLIDAÇÃO):
+ * - Signature verification required (FAIL CLOSED in production)
  * - Resend: Svix HMAC-SHA256 (headers passed as JSON to verifyWebhookSignature)
  * - WhatsApp: HMAC-SHA256 with crypto.timingSafeEqual
  * - No raw payload stored — only sanitized metadata (no PII)
@@ -78,8 +78,9 @@ export async function GET(
 /**
  * POST /api/webhooks/[provider] — receive delivery status webhooks
  *
- * SEC-006: Uses fn_process_webhook_event RPC for transactional,
+ * SEC-006 + CONSOLIDAÇÃO: Uses fn_process_webhook_event RPC for transactional,
  * idempotent processing. No raw payload is stored.
+ * CONSOLIDAÇÃO: Missing webhook secret fails closed in production.
  */
 export async function POST(
   request: Request,
@@ -106,7 +107,7 @@ export async function POST(
     return Response.json({ error: "Invalid JSON" }, { status: 400 })
   }
 
-  // 3. Verify signature (skip in dev when no secret is configured)
+  // 3. Verify signature
   const provider = resolveProvider(channel)
   const secret = WEBHOOK_SECRET_MAP[providerName]
 
@@ -139,6 +140,17 @@ export async function POST(
       return Response.json({ error: "Invalid signature" }, { status: 401 })
     }
   } else {
+    // CONSOLIDAÇÃO: Ausência de secret deve falhar fechada em produção
+    if (process.env.NODE_ENV === "production") {
+      console.error(
+        `[webhook/${providerName}] FATAL: No webhook secret configured in production — rejecting request`
+      )
+      return Response.json(
+        { error: "Webhook signature verification not configured" },
+        { status: 500 }
+      )
+    }
+    // Em desenvolvimento: permitir sem verificação (com log)
     console.log(
       `[webhook/${providerName}] No webhook secret configured — skipping signature check (dev mode)`
     )
@@ -169,7 +181,8 @@ export async function POST(
       p_event_id: event.eventId,
       p_provider_message_id: event.providerId,
       p_event_type: event.rawEventType,
-      p_status: event.status,
+      // CONSOLIDAÇÃO: Parâmetro correto é p_new_status (não p_status)
+      p_new_status: event.status,
       p_timestamp: event.timestamp,
       p_error_code: event.error?.code ?? null,
       p_error_message: event.error?.message ?? null,

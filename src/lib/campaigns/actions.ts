@@ -104,6 +104,17 @@ export async function updateCampaign(
     return { error: "Usuário não autenticado" };
   }
 
+  // CONSOLIDAÇÃO: Impedir edição de campanhas que não estão em draft
+  const { data: campaign } = await supabase
+    .from("campaigns")
+    .select("status")
+    .eq("id", campaignId)
+    .single();
+
+  if (campaign && campaign.status !== "draft") {
+    return { error: "Apenas campanhas em rascunho podem ser editadas" };
+  }
+
   const { error } = await supabase
     .from("campaigns")
     .update(parsed.data)
@@ -162,6 +173,7 @@ export async function getCampaignDeliveries(
     .select(
       `
       id,
+      recipient_id,
       channel,
       status,
       sent_at,
@@ -206,7 +218,8 @@ export async function getCampaignDeliveries(
       read_at: d.read_at,
       failed_at: d.failed_at,
       error_message: d.error_message,
-      acknowledged: ackSet.has(d.id),
+      // CONSOLIDAÇÃO: Usar recipient_id (não delivery id) para verificar acknowledgment
+      acknowledged: ackSet.has(d.recipient_id),
     };
   });
 

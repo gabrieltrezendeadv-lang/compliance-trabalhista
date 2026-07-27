@@ -3,17 +3,25 @@
 import { createClient } from "@/lib/supabase/server";
 import {
   submitComplaintSchema,
-  accessComplaintSchema,
-  sendReporterMessageSchema,
   updateComplaintStatusSchema,
 } from "@/lib/schemas/complaint";
 import type {
   ComplaintListItem,
   ComplaintDetail,
 } from "@/lib/schemas/complaint";
+import {
+  gatewayAccessComplaint,
+  gatewaySendReporterMessage,
+} from "@/lib/complaints/gateway";
 
 // ============================================================================
 // Public: Submissão de denúncia (sem autenticação)
+//
+// Permanece no fluxo público legítimo: anon client → fn_submit_complaint.
+// Não requer gateway confiável porque:
+// - fn_submit_complaint aceita anon/authenticated (não service_role only)
+// - Não há rate limit por IP para submissão (seria contraproducente)
+// - PIN é armazenado como bcrypt hash na DB function
 // ============================================================================
 
 export async function submitComplaint(raw: unknown) {
@@ -36,7 +44,7 @@ export async function submitComplaint(raw: unknown) {
     p_reporter_phone: rest.reporter_phone || null,
     p_establishment_name: rest.establishment_name || null,
     p_department_name: rest.department_name || null,
-    p_pin_hash: pin,  // raw PIN — bcrypt hashing happens in the DB function
+    p_pin_hash: pin, // raw PIN — bcrypt hashing happens in the DB function
   });
 
   if (error) {
@@ -55,92 +63,31 @@ export async function submitComplaint(raw: unknown) {
 
 // ============================================================================
 // Public: Acesso à caixa segura (protocolo + PIN)
+//
+// Roteado pelo gateway confiável (service_role + IP hash + rate limit dual).
+// O gateway faz validação strict, HMAC, chama fn_access_complaint_v2
+// e sanitiza a resposta (anti-enumeração, sem exposição de erros internos).
 // ============================================================================
 
 export async function accessComplaint(raw: unknown) {
-  const parsed = accessComplaintSchema.safeParse(raw);
-  if (!parsed.success) {
-    return { error: parsed.error.flatten().fieldErrors };
-  }
-
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc("fn_access_complaint", {
-    p_protocol: parsed.data.protocol,
-    p_pin_hash: parsed.data.pin,  // raw PIN — bcrypt verification in DB
-  });
-
-  if (error) {
-    console.error("accessComplaint RPC error:", error.message);
-    return { error: "Protocolo ou PIN inválido" };
-  }
-
-  const result = data as {
-    success: boolean;
-    error?: string;
-    complaint?: {
-      status: string;
-      category: string;
-      severity: string;
-      is_anonymous: boolean;
-      created_at: string;
-      updated_at: string;
-    };
-    messages?: Array<{
-      id: string;
-      sender_type: string;
-      body: string;
-      created_at: string;
-    }>;
-  };
-
-  if (!result.success) {
-    // Anti-enumeração: mensagem genérica
-    return { error: "Protocolo ou PIN inválido" };
-  }
-
-  return {
-    success: true,
-    complaint: result.complaint,
-    messages: result.messages ?? [],
-  };
+  return gatewayAccessComplaint(raw);
 }
 
 // ============================================================================
 // Public: Envio de mensagem pelo denunciante
+//
+// Roteado pelo gateway confiável (service_role + IP hash + rate limit dual).
+// O gateway faz validação strict, HMAC, chama fn_send_reporter_message_v2
+// e sanitiza a resposta.
 // ============================================================================
 
 export async function sendReporterMessage(raw: unknown) {
-  const parsed = sendReporterMessageSchema.safeParse(raw);
-  if (!parsed.success) {
-    return { error: parsed.error.flatten().fieldErrors };
-  }
-
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc("fn_send_reporter_message", {
-    p_protocol: parsed.data.protocol,
-    p_pin_hash: parsed.data.pin,  // raw PIN — bcrypt verification in DB
-    p_body: parsed.data.body,
-  });
-
-  if (error) {
-    console.error("sendReporterMessage RPC error:", error.message);
-    return { error: "Protocolo ou PIN inválido" };
-  }
-
-  const result = data as { success: boolean; error?: string; message_id?: string };
-
-  if (!result.success) {
-    if (result.error === "complaint_closed") {
-      return { error: "Esta denúncia foi encerrada e não aceita novas mensagens." };
-    }
-    return { error: "Protocolo ou PIN inválido" };
-  }
-
-  return { success: true };
+  return gatewaySendReporterMessage(raw);
 }
 
 // ============================================================================
 // Dashboard: Lista de denúncias (admin — metadata only)
+// Não afetado pelo gateway — fluxo autenticado via authenticated client.
 // ============================================================================
 
 export async function getComplaints(

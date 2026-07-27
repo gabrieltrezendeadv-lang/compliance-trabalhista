@@ -5,6 +5,10 @@
  * Webhook verification uses HMAC-SHA256 with app secret (crypto.timingSafeEqual).
  *
  * Docs: https://developers.facebook.com/docs/whatsapp/cloud-api
+ *
+ * CONSOLIDAÇÃO:
+ * - eventId determinístico (derivado do message_id, não crypto.randomUUID())
+ * - timestamp convertido de Unix epoch para ISO 8601
  */
 
 import crypto from "crypto"
@@ -160,13 +164,48 @@ export class WhatsAppCloudProvider implements MessageProvider {
 
     const errors = (status.errors as Array<{ code: number; title: string }>) ?? []
 
+    // CONSOLIDAÇÃO: Reject events with missing messageId or status
+    // Never generate non-deterministic eventIds (no crypto.randomUUID fallback)
+    const messageId = status.id as string | undefined
+    const statusStr = status.status as string | undefined
+    if (!messageId || !statusStr) return null
+
+    // CONSOLIDAÇÃO: eventId determinístico derivado de message_id + status
+    // Evita reprocessamento com IDs diferentes para o mesmo evento
+    const deterministicEventId = crypto
+      .createHash("sha256")
+      .update(`whatsapp:${messageId}:${statusStr}`)
+      .digest("hex")
+      .slice(0, 32)
+
+    // CONSOLIDAÇÃO: Converter e validar timestamp
+    // WhatsApp envia timestamp como string de Unix epoch em segundos
+    const rawTimestamp = status.timestamp as string | undefined
+    if (!rawTimestamp) return null
+
+    let isoTimestamp: string
+    if (/^\d+$/.test(rawTimestamp)) {
+      // Unix epoch em segundos → ISO 8601
+      isoTimestamp = new Date(parseInt(rawTimestamp, 10) * 1000).toISOString()
+    } else {
+      // Attempt to parse as ISO or other date string
+      const parsed = new Date(rawTimestamp)
+      if (isNaN(parsed.getTime())) return null
+      isoTimestamp = parsed.toISOString()
+    }
+
+    // Validate timestamp is reasonable (between year 2000 and 2100)
+    const tsMs = new Date(isoTimestamp).getTime()
+    const MIN_TIMESTAMP_MS = Date.UTC(2000, 0, 1) // 2000-01-01T00:00:00Z
+    const MAX_TIMESTAMP_MS = Date.UTC(2100, 0, 1) // 2100-01-01T00:00:00Z
+    if (tsMs < MIN_TIMESTAMP_MS || tsMs >= MAX_TIMESTAMP_MS) return null
+
     return {
-      eventId: crypto.randomUUID(),
-      providerId: (status.id as string) ?? "",
+      eventId: deterministicEventId,
+      providerId: messageId,
       status: mappedStatus,
-      timestamp:
-        (status.timestamp as string) ?? new Date().toISOString(),
-      rawEventType: `whatsapp.${status.status}`,
+      timestamp: isoTimestamp,
+      rawEventType: `whatsapp.${statusStr}`,
       error: errors.length
         ? {
             code: String(errors[0].code),
@@ -175,8 +214,8 @@ export class WhatsAppCloudProvider implements MessageProvider {
         : undefined,
       // SEC-006: No rawPayload — only sanitized metadata (no PII)
       metadata: {
-        whatsapp_status: status.status,
-        whatsapp_message_id: status.id,
+        whatsapp_status: statusStr,
+        whatsapp_message_id: messageId,
       },
     }
   }
