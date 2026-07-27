@@ -13,9 +13,15 @@
  */
 
 import { createClient } from "@/lib/supabase/server"
-import { resolveProvider, getActiveProviderName } from "./registry"
+import {
+  resolveProvider,
+  getActiveProviderName,
+  isRealProviderConfigured,
+  ChannelNotConfiguredError,
+} from "./registry"
 import type {
   Channel,
+  CampaignSendJob,
   CampaignSendResult,
   SendRequest,
 } from "./types"
@@ -75,23 +81,79 @@ export async function sendCampaign(
     }
   }
 
-  // 3. Update campaign status to 'sending'
+  // 3. SECOND DEFENSE — fail-closed guard inside sendCampaign.
+  //    The primary guard is in executeCampaignSend (actions.ts), which
+  //    blocks before prepareCampaignSend. This is a safety net in case
+  //    sendCampaign is called from another path.
+  //    If a channel is missing, we restore the campaign to "draft" and
+  //    leave deliveries as "pending" (no false "failed" state in DB).
+  const channels = new Set(deliveries.map((d) => d.channel as Channel))
+
+  for (const ch of channels) {
+    if (!isRealProviderConfigured(ch)) {
+      const label = ch === "email" ? "E-mail" : "WhatsApp"
+      console.error(
+        `[send-campaign] BLOCKED: canal "${ch}" não configurado — ` +
+          `campanha ${campaignId} restaurada para draft`
+      )
+
+      // Restore campaign to draft — deliveries stay "pending"
+      await supabase
+        .from("campaigns")
+        .update({ status: "draft" })
+        .eq("id", campaignId)
+
+      return {
+        campaignId,
+        totalSent: 0,
+        totalFailed: 0,
+        results: [],
+      }
+    }
+  }
+
+  // 4. Update campaign status to 'sending'
   await supabase
     .from("campaigns")
     .update({ status: "sending" })
     .eq("id", campaignId)
 
-  // 4. Determine providers used
-  const providerNames: string[] = []
-
   // 5. Process each delivery
+  const providerNames: string[] = []
   const results: CampaignSendResult["results"] = []
   let totalSent = 0
   let totalFailed = 0
 
   for (const delivery of deliveries) {
     const channel = delivery.channel as Channel
-    const provider = resolveProvider(channel)
+
+    // resolveProvider will throw ChannelNotConfiguredError if no real
+    // provider is available — third safety net.
+    // If triggered, restore campaign to draft and leave remaining
+    // deliveries as pending.
+    let provider
+    try {
+      provider = resolveProvider(channel)
+    } catch (err) {
+      if (err instanceof ChannelNotConfiguredError) {
+        console.error(
+          `[send-campaign] resolveProvider failed for "${channel}" — ` +
+            `restoring campaign ${campaignId} to draft`
+        )
+        await supabase
+          .from("campaigns")
+          .update({ status: "draft" })
+          .eq("id", campaignId)
+
+        return {
+          campaignId,
+          totalSent,
+          totalFailed,
+          results,
+        }
+      }
+      throw err
+    }
 
     if (!providerNames.includes(provider.name)) {
       providerNames.push(provider.name)
@@ -122,17 +184,11 @@ export async function sendCampaign(
     // Send
     const sendResult = await provider.send(request)
 
-    // Update delivery in database — increment attempt_count on each send
-    const { data: currentDelivery } = await supabase
-      .from("campaign_deliveries")
-      .select("attempt_count")
-      .eq("id", delivery.id)
-      .single()
-
+    // Update delivery in database
     const updateData: Record<string, unknown> = {
       status: sendResult.status,
       provider_id: sendResult.providerId ?? null,
-      attempt_count: ((currentDelivery?.attempt_count as number) ?? 0) + 1,
+      attempt_count: 1, // TODO: increment on retry
     }
 
     if (sendResult.success) {
@@ -160,9 +216,9 @@ export async function sendCampaign(
     })
   }
 
-  // 6. Update campaign status
+  // 6. Update campaign status — only to "sent" if deliveries actually succeeded
   const allProcessed = totalSent + totalFailed === deliveries.length
-  if (allProcessed) {
+  if (allProcessed && totalSent > 0) {
     await supabase
       .from("campaigns")
       .update({
@@ -170,6 +226,13 @@ export async function sendCampaign(
         sent_at: new Date().toISOString(),
         completed_at: new Date().toISOString(),
       })
+      .eq("id", campaignId)
+  } else if (allProcessed && totalSent === 0) {
+    // All deliveries failed via real provider errors (not config issue) —
+    // revert campaign to draft so it can be retried
+    await supabase
+      .from("campaigns")
+      .update({ status: "draft" })
       .eq("id", campaignId)
   }
 
@@ -186,7 +249,11 @@ export async function sendCampaign(
 }
 
 /**
- * Get integration status for display in the dashboard
+ * Get integration status for display in the dashboard.
+ *
+ * Returns "not-configured" (instead of mock names) when a real
+ * provider is not set up — so the UI can show "canal não configurado"
+ * and disable the send button.
  */
 export function getIntegrationStatus(): {
   email: { provider: string; configured: boolean }
@@ -195,14 +262,11 @@ export function getIntegrationStatus(): {
   return {
     email: {
       provider: getActiveProviderName("email"),
-      configured: !!process.env.RESEND_API_KEY,
+      configured: isRealProviderConfigured("email"),
     },
     whatsapp: {
       provider: getActiveProviderName("whatsapp"),
-      configured: !!(
-        process.env.WHATSAPP_ACCESS_TOKEN &&
-        process.env.WHATSAPP_PHONE_NUMBER_ID
-      ),
+      configured: isRealProviderConfigured("whatsapp"),
     },
   }
 }

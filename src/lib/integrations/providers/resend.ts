@@ -1,13 +1,12 @@
 /**
- * Resend Email Provider (stub — ready for API key)
+ * Resend Email Provider
  *
  * When RESEND_API_KEY is configured, this sends real emails via Resend.
- * Webhook verification uses Svix HMAC-SHA256.
+ * Webhook verification uses Svix HMAC-SHA256 (ADR-004 approved).
  *
  * Docs: https://resend.com/docs/api-reference
  */
 
-import { createHmac } from "crypto"
 import type {
   MessageProvider,
   SendRequest,
@@ -118,6 +117,7 @@ export class ResendProvider implements MessageProvider {
     const data = payload.data as Record<string, unknown> | undefined
     if (!data) return null
 
+    // SEC-006: Only map known status events. Unknown events return null.
     const statusMap: Record<string, WebhookEvent["status"]> = {
       "email.sent": "sent",
       "email.delivered": "delivered",
@@ -127,10 +127,16 @@ export class ResendProvider implements MessageProvider {
       "email.opened": "read",
     }
 
+    const mappedStatus = statusMap[eventType]
+    if (!mappedStatus) {
+      // Unknown event type (e.g. email.clicked) — skip, don't default to "sent"
+      return null
+    }
+
     return {
       eventId: (payload.id as string) ?? crypto.randomUUID(),
       providerId: (data.email_id as string) ?? "",
-      status: statusMap[eventType] ?? "sent",
+      status: mappedStatus,
       timestamp:
         (payload.created_at as string) ?? new Date().toISOString(),
       rawEventType: eventType,
@@ -141,27 +147,31 @@ export class ResendProvider implements MessageProvider {
               message: (data.bounce_type as string) ?? "Unknown bounce",
             }
           : undefined,
-      rawPayload: payload,
+      // SEC-006: No rawPayload — only sanitized metadata (no PII)
+      metadata: {
+        resend_event_type: eventType,
+        resend_event_id: payload.id,
+      },
     }
   }
 
   verifyWebhookSignature(
     payload: string,
-    signature: string,
+    _signature: string,
     secret: string
   ): boolean {
+    // SEC-006: Svix verification for Resend webhooks (ADR-004)
     try {
-      // Resend uses Svix for webhook signatures
-      // The signature header contains svix-id, svix-timestamp, svix-signature
-      // For Svix verification we need the full headers, but our interface
-      // receives a single signature string. We use HMAC-SHA256 as fallback.
-      const expectedSignature = createHmac("sha256", secret)
-        .update(payload)
-        .digest("base64")
-
-      return signature.includes(expectedSignature)
+      // svix is imported dynamically to avoid bundling issues
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { Webhook } = require("svix") as typeof import("svix")
+      const wh = new Webhook(secret)
+      // Svix needs the headers as an object; the caller passes them via
+      // the signature parameter as a JSON string containing svix-id, svix-timestamp, svix-signature
+      const headers = JSON.parse(_signature) as Record<string, string>
+      wh.verify(payload, headers)
+      return true
     } catch {
-      console.warn("[resend] Webhook signature verification failed")
       return false
     }
   }

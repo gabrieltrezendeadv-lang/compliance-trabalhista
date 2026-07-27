@@ -27,17 +27,14 @@ const PROVIDER_DISPLAY: Record<
     label: "Resend",
     description: "Envio de e-mails transacionais via API Resend",
   },
-  "mock-email": {
-    label: "Mock (desenvolvimento)",
-    description: "Simula envio de e-mails — sem entrega real",
-  },
   "whatsapp-cloud": {
     label: "WhatsApp Cloud API",
     description: "Envio via API oficial do WhatsApp (Meta)",
   },
-  "mock-whatsapp": {
-    label: "Mock (desenvolvimento)",
-    description: "Simula envio de WhatsApp — sem entrega real",
+  "not-configured": {
+    label: "Canal não configurado",
+    description:
+      "Configure as variáveis de ambiente do provedor para ativar este canal",
   },
 };
 
@@ -84,7 +81,7 @@ function ProviderRow({
     description: "",
   };
 
-  const isMock = provider.provider.startsWith("mock-");
+  const isNotConfigured = provider.provider === "not-configured";
 
   return (
     <div className="flex items-center justify-between rounded-lg border p-4">
@@ -93,7 +90,11 @@ function ProviderRow({
         <div>
           <p className="text-sm font-medium">
             {channel}:{" "}
-            <span className={isMock ? "text-yellow-600" : "text-foreground"}>
+            <span
+              className={
+                isNotConfigured ? "text-destructive" : "text-foreground"
+              }
+            >
               {display.label}
             </span>
           </p>
@@ -112,9 +113,9 @@ function ProviderRow({
           </>
         ) : (
           <>
-            <XCircle className="h-4 w-4 text-yellow-500" />
-            <span className="text-xs font-medium text-yellow-700">
-              Mock
+            <XCircle className="h-4 w-4 text-destructive" />
+            <span className="text-xs font-medium text-destructive">
+              Não configurado
             </span>
           </>
         )}

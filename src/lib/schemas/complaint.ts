@@ -196,8 +196,8 @@ export const submitComplaintSchema = z.object({
   department_name: z.string().optional(),
   pin: z
     .string()
-    .min(4, "PIN deve ter pelo menos 4 dígitos")
-    .max(8, "PIN deve ter no máximo 8 dígitos")
+    .min(6, "PIN deve ter pelo menos 6 dígitos")
+    .max(32, "PIN deve ter no máximo 32 dígitos")
     .regex(/^\d+$/, "PIN deve conter apenas números"),
 });
 
@@ -205,30 +205,48 @@ export type SubmitComplaint = z.infer<typeof submitComplaintSchema>;
 
 // ============================================================================
 // Schema: acesso à caixa segura (protocolo + PIN)
+// v1.2.1: max protocol length, .strict()
 // ============================================================================
 
-export const accessComplaintSchema = z.object({
-  protocol: z
-    .string()
-    .min(1, "Protocolo é obrigatório")
-    .transform((v) => v.toUpperCase().replace(/\s/g, "")),
-  pin: z
-    .string()
-    .min(4, "PIN é obrigatório")
-    .regex(/^\d+$/, "PIN deve conter apenas números"),
-});
+export const accessComplaintSchema = z
+  .object({
+    protocol: z
+      .string()
+      .min(1, "Protocolo é obrigatório")
+      .max(20, "Protocolo inválido")
+      .transform((v) => v.toUpperCase().replace(/\s/g, "")),
+    pin: z
+      .string()
+      .min(4, "PIN é obrigatório")
+      .max(32, "PIN deve ter no máximo 32 dígitos")
+      .regex(/^\d+$/, "PIN deve conter apenas números"),
+  })
+  .strict();
 
 export type AccessComplaint = z.infer<typeof accessComplaintSchema>;
 
 // ============================================================================
 // Schema: envio de mensagem pelo denunciante
+// v1.2.1: max protocol length, numeric regex on PIN, max body length, .strict()
 // ============================================================================
 
-export const sendReporterMessageSchema = z.object({
-  protocol: z.string().min(1),
-  pin: z.string().min(4),
-  body: z.string().min(1, "Mensagem não pode estar vazia"),
-});
+export const sendReporterMessageSchema = z
+  .object({
+    protocol: z
+      .string()
+      .min(1, "Protocolo é obrigatório")
+      .max(20, "Protocolo inválido"),
+    pin: z
+      .string()
+      .min(4, "PIN é obrigatório")
+      .max(32, "PIN deve ter no máximo 32 dígitos")
+      .regex(/^\d+$/, "PIN deve conter apenas números"),
+    body: z
+      .string()
+      .min(1, "Mensagem não pode estar vazia")
+      .max(10_000, "Mensagem excede o tamanho máximo"),
+  })
+  .strict();
 
 export type SendReporterMessage = z.infer<typeof sendReporterMessageSchema>;
 

@@ -28,6 +28,7 @@ import {
   Eye,
 } from "lucide-react";
 import { CampaignSendButton } from "@/components/campaigns/campaign-send-button";
+import { areChannelsReady } from "@/lib/integrations/registry";
 
 export async function generateMetadata({
   params,
@@ -63,6 +64,12 @@ export default async function CampaignDetailPage({
   const status = campaign.status as CampaignStatus;
   const type = campaign.type as CampaignType;
   const channel = campaign.channel as DeliveryChannel;
+
+  // SEC-BLOCK1: Check if required channels have real providers configured
+  const channelStatus = areChannelsReady(channel);
+  const missingLabels = channelStatus.missing.map((ch) =>
+    ch === "email" ? "E-mail" : "WhatsApp"
+  );
 
   const deliveredCount = (stats?.by_status?.delivered ?? 0) + (stats?.by_status?.read ?? 0);
   const failedCount =
@@ -104,7 +111,12 @@ export default async function CampaignDetailPage({
             {CAMPAIGN_STATUS_LABELS[status]}
           </span>
           {(status === "draft" || status === "scheduled") && (
-            <CampaignSendButton campaignId={campaign.id} status={status} />
+            <CampaignSendButton
+              campaignId={campaign.id}
+              status={status}
+              channelReady={channelStatus.ready}
+              missingChannels={missingLabels}
+            />
           )}
         </div>
       </div>

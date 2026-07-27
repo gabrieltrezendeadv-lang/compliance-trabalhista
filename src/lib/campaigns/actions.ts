@@ -84,14 +84,40 @@ export async function createCampaign(raw: unknown) {
   return { data };
 }
 
+// SEC-005: Added Zod validation and auth check for campaign updates
 export async function updateCampaign(
   campaignId: string,
-  updates: Record<string, unknown>
+  raw: unknown
 ) {
+  // Import the update schema for validation
+  const { updateCampaignSchema } = await import("@/lib/schemas/campaign");
+  const parsed = updateCampaignSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { error: parsed.error.flatten().fieldErrors };
+  }
+
   const supabase = await createClient();
+
+  // Verify user is authenticated
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Usuário não autenticado" };
+  }
+
+  // CONSOLIDAÇÃO: Impedir edição de campanhas que não estão em draft
+  const { data: campaign } = await supabase
+    .from("campaigns")
+    .select("status")
+    .eq("id", campaignId)
+    .single();
+
+  if (campaign && campaign.status !== "draft") {
+    return { error: "Apenas campanhas em rascunho podem ser editadas" };
+  }
+
   const { error } = await supabase
     .from("campaigns")
-    .update(updates)
+    .update(parsed.data)
     .eq("id", campaignId);
 
   if (error) {
@@ -147,6 +173,7 @@ export async function getCampaignDeliveries(
     .select(
       `
       id,
+      recipient_id,
       channel,
       status,
       sent_at,
@@ -191,7 +218,8 @@ export async function getCampaignDeliveries(
       read_at: d.read_at,
       failed_at: d.failed_at,
       error_message: d.error_message,
-      acknowledged: ackSet.has(d.id),
+      // CONSOLIDAÇÃO: Usar recipient_id (não delivery id) para verificar acknowledgment
+      acknowledged: ackSet.has(d.recipient_id),
     };
   });
 
@@ -229,14 +257,52 @@ export async function prepareCampaignSend(campaignId: string) {
 // Enviar campanha (chama o orchestrator de integração)
 // ============================================================================
 
+// SEC-005 + SEC-BLOCK1: Auth check + fail-closed provider check
 export async function executeCampaignSend(campaignId: string) {
-  // 1. Preparar entregas via RPC (resolve destinatários, cria campaign_deliveries)
+  const supabase = await createClient();
+
+  // Verify user is authenticated before executing
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Usuário não autenticado" };
+  }
+
+  // 1. FAIL-CLOSED GUARD — check providers BEFORE prepareCampaignSend.
+  //    prepareCampaignSend creates campaign_deliveries rows via RPC.
+  //    We must not create deliveries if the channel is not configured,
+  //    because those deliveries would sit as "pending" with no way to
+  //    actually send them.
+  const { data: campaign } = await supabase
+    .from("campaigns")
+    .select("channel")
+    .eq("id", campaignId)
+    .single();
+
+  if (!campaign) {
+    return { error: "Campanha não encontrada" };
+  }
+
+  const { areChannelsReady } = await import("@/lib/integrations/registry");
+  const { ready, missing } = areChannelsReady(campaign.channel);
+
+  if (!ready) {
+    const labels = missing.map((ch) =>
+      ch === "email" ? "E-mail" : "WhatsApp"
+    );
+    return {
+      error:
+        `Canal ${labels.join(" e ")} não configurado. ` +
+        `Configure as variáveis de ambiente do provedor antes de enviar.`,
+    };
+  }
+
+  // 2. Preparar entregas via RPC (resolve destinatários, cria campaign_deliveries)
   const prepResult = await prepareCampaignSend(campaignId);
   if (prepResult.error) {
     return { error: prepResult.error };
   }
 
-  // 2. Enviar via integração (mock ou real, conforme registry)
+  // 3. Enviar via integração (real provider garantido pelo guard acima)
   const { sendCampaign } = await import("@/lib/integrations/send-campaign");
   const result = await sendCampaign(campaignId);
 

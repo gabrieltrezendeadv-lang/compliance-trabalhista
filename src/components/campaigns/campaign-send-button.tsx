@@ -5,16 +5,22 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { executeCampaignSend } from "@/lib/campaigns/actions";
 import type { CampaignStatus } from "@/lib/schemas/campaign";
-import { Send, Loader2 } from "lucide-react";
+import { Send, Loader2, AlertTriangle } from "lucide-react";
 
 interface CampaignSendButtonProps {
   campaignId: string;
   status: CampaignStatus;
+  /** Whether all required channels for this campaign have real providers configured */
+  channelReady: boolean;
+  /** Human-readable list of missing channels (e.g. ["E-mail", "WhatsApp"]) */
+  missingChannels?: string[];
 }
 
 export function CampaignSendButton({
   campaignId,
   status,
+  channelReady,
+  missingChannels = [],
 }: CampaignSendButtonProps) {
   const router = useRouter();
   const [sending, setSending] = useState(false);
@@ -61,6 +67,23 @@ export function CampaignSendButton({
 
     router.refresh();
   };
+
+  // Channel not configured — button disabled with explanation
+  if (!channelReady) {
+    return (
+      <div className="flex flex-col items-end gap-1">
+        <Button disabled size="sm" className="gap-2" variant="outline">
+          <AlertTriangle className="h-4 w-4" />
+          Envio indisponível
+        </Button>
+        <p className="text-xs text-destructive max-w-[250px] text-right">
+          {missingChannels.length > 0
+            ? `Canal ${missingChannels.join(" e ")} não configurado`
+            : "Canal não configurado"}
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col items-end gap-1">
