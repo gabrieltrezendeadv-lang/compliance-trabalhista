@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict"
 import crypto from "node:crypto"
-import { WhatsAppCloudProvider } from "../src/lib/integrations/providers/whatsapp-cloud.ts"
+import { WhatsAppCloudProvider } from "../src/lib/integrations/providers/whatsapp-cloud"
 
 const provider = new WhatsAppCloudProvider({
   accessToken: "test-token",
