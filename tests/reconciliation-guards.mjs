@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
@@ -87,11 +87,37 @@ const checks = [
       assert.match(migration, /invitation_id DROP NOT NULL/);
       assert.match(migration, /fn_assessment_participation_stats/);
       assert.match(migration, /below_threshold/);
+      assert.doesNotMatch(
+        migration,
+        /fn_user_has_role\(ARRAY\['owner', 'admin', 'manager'\]\)/
+      );
+      const roleCasts =
+        migration.match(/'owner'::public\.organization_role/g) ?? [];
+      assert.equal(roleCasts.length, 4);
       assert.doesNotMatch(migration, /REVOKE ALL/);
       assert.match(action, /randomBytes\(32\)/);
       assert.match(action, /token_hash: tokenHash/);
       assert.match(action, /assessment_dispatches/);
       assert.doesNotMatch(action, /metadata:\s*\{[^}]*invitationId/s);
+    },
+  ],
+  [
+    "SEC-005 é etapa manual e não bloqueia migrations automáticas",
+    () => {
+      assert.equal(
+        existsSync(
+          new URL(
+            "../supabase/migrations/20260728154000_sec_005_default_function_privileges.sql",
+            import.meta.url
+          )
+        ),
+        false
+      );
+      const manual = read(
+        "supabase/manual/sec_005_default_function_privileges_dashboard.sql"
+      );
+      assert.match(manual, /ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin/);
+      assert.match(manual, /ETAPA MANUAL NO DASHBOARD SQL EDITOR/);
     },
   ],
   [
@@ -119,11 +145,18 @@ const checks = [
       const migration = read(
         "supabase/migrations/20260728155000_fix_005_close_expired_cycles.sql"
       );
+      const rollback = read(
+        "supabase/rollbacks/20260728155000_fix_005_close_expired_cycles_rollback.sql"
+      );
       const config = read("vercel.json");
       assert.match(route, /CRON_SECRET/);
       assert.match(route, /createServiceClient/);
       assert.match(route, /fn_close_expired_assessment_cycles/);
       assert.match(migration, /auth\.role\(\)/);
+      assert.match(
+        rollback,
+        /DROP FUNCTION IF EXISTS public\.fn_close_expired_assessment_cycles\(\)/
+      );
       assert.match(config, /close-assessment-cycles/);
     },
   ],

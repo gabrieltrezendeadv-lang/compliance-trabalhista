@@ -63,7 +63,7 @@ flowchart TD
 | `SEC-002` | `20260728154500_sec_002_retire_plan_limit.sql` | Proposto |
 | `SEC-003` | já coberto pelas migrations SEC-BLOCK1 | Não duplicado |
 | `SEC-004` | já coberto pelas migrations SEC-BLOCK1 | Não duplicado |
-| `SEC-005` | `20260728154000_sec_005_default_function_privileges.sql` | Proposto |
+| `SEC-005` | `supabase/manual/sec_005_default_function_privileges_dashboard.sql` | Manual via Dashboard SQL Editor; fora do fluxo automático |
 | `SEC-006` | `20260728153000_sec_006_table_privileges.sql` | Proposto |
 | `FIX-001` | `20260728150000_fix_001_evidence_reports.sql` | Proposto |
 | `FIX-002` | segmentação já corrigida em SEC-BLOCK1; UI completada | Não duplicado |

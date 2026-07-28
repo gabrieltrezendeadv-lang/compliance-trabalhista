@@ -1,12 +1,18 @@
--- SEC-005 — Política para funções futuras criadas por supabase_admin.
+-- SEC-005 — ETAPA MANUAL NO DASHBOARD SQL EDITOR.
+-- Não colocar este arquivo no fluxo automático de migrations: a role postgres
+-- não pode alterar os default privileges pertencentes a supabase_admin.
+-- Executar no SQL Editor do projeto/branch, confirmar que a sessão possui a
+-- autoridade necessária e conferir a consulta de verificação ao final.
+--
+-- Política para funções futuras criadas por supabase_admin.
 -- Estado anterior confirmado:
 -- {postgres=X/supabase_admin, anon=X/supabase_admin,
 --  authenticated=X/supabase_admin, service_role=X/supabase_admin}
 -- Estado posterior: preserva postgres e service_role e remove anon/authenticated.
 -- O owner das funções atuais é postgres e seu default já está restrito.
--- Esta migration exige execução por supabase_admin ou por role autorizada a
+-- Este script exige execução por supabase_admin ou por role autorizada a
 -- alterar seus default privileges. Em ambiente gerenciado, validar a role antes.
--- PROPOSTA: não executada automaticamente.
+-- PROPOSTA MANUAL: não executada automaticamente.
 
 ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public
   REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC, anon, authenticated;

@@ -88,7 +88,11 @@ CREATE POLICY assessment_dispatches_select_admin
   TO authenticated
   USING (
     tenant_id = public.fn_resolve_tenant_id()
-    AND public.fn_user_has_role(ARRAY['owner', 'admin', 'manager'])
+    AND public.fn_user_has_role(ARRAY[
+      'owner'::public.organization_role,
+      'admin'::public.organization_role,
+      'manager'::public.organization_role
+    ])
   );
 
 CREATE POLICY assessment_dispatches_insert_admin
@@ -97,7 +101,11 @@ CREATE POLICY assessment_dispatches_insert_admin
   TO authenticated
   WITH CHECK (
     tenant_id = public.fn_resolve_tenant_id()
-    AND public.fn_user_has_role(ARRAY['owner', 'admin', 'manager'])
+    AND public.fn_user_has_role(ARRAY[
+      'owner'::public.organization_role,
+      'admin'::public.organization_role,
+      'manager'::public.organization_role
+    ])
   );
 
 CREATE POLICY assessment_dispatches_update_admin
@@ -106,11 +114,19 @@ CREATE POLICY assessment_dispatches_update_admin
   TO authenticated
   USING (
     tenant_id = public.fn_resolve_tenant_id()
-    AND public.fn_user_has_role(ARRAY['owner', 'admin', 'manager'])
+    AND public.fn_user_has_role(ARRAY[
+      'owner'::public.organization_role,
+      'admin'::public.organization_role,
+      'manager'::public.organization_role
+    ])
   )
   WITH CHECK (
     tenant_id = public.fn_resolve_tenant_id()
-    AND public.fn_user_has_role(ARRAY['owner', 'admin', 'manager'])
+    AND public.fn_user_has_role(ARRAY[
+      'owner'::public.organization_role,
+      'admin'::public.organization_role,
+      'manager'::public.organization_role
+    ])
   );
 
 CREATE OR REPLACE FUNCTION public.fn_get_questionnaire_for_token(p_token text)
