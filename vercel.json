@@ -5,7 +5,7 @@
   "crons": [
     {
       "path": "/api/cron/close-assessment-cycles",
-      "schedule": "5 * * * *"
+      "schedule": "5 3 * * *"
     }
   ],
   "headers": [
