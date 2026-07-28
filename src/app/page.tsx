@@ -11,7 +11,6 @@ import {
   Lock,
   Users,
   ArrowRight,
-  Check,
 } from "lucide-react"
 
 export default async function Home() {
@@ -39,12 +38,6 @@ export default async function Home() {
               className="text-sm text-muted-foreground hover:text-foreground transition-colors hidden sm:inline"
             >
               Funcionalidades
-            </Link>
-            <Link
-              href="#planos"
-              className="text-sm text-muted-foreground hover:text-foreground transition-colors hidden sm:inline"
-            >
-              Planos
             </Link>
             <Link
               href="/login"
@@ -83,7 +76,7 @@ export default async function Home() {
               href="/signup"
               className="inline-flex h-12 items-center justify-center rounded-md bg-primary px-8 text-base font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors gap-2"
             >
-              Começar gratuitamente
+              Criar conta
               <ArrowRight className="h-4 w-4" />
             </Link>
             <Link
@@ -93,9 +86,6 @@ export default async function Home() {
               Conhecer funcionalidades
             </Link>
           </div>
-          <p className="mt-4 text-xs text-muted-foreground">
-            14 dias grátis. Sem cartão de crédito.
-          </p>
         </div>
       </section>
 
@@ -176,64 +166,6 @@ export default async function Home() {
         </div>
       </section>
 
-      {/* Pricing */}
-      <section id="planos" className="border-t bg-muted/30 py-20 md:py-28">
-        <div className="container mx-auto max-w-6xl px-6">
-          <div className="text-center mb-16">
-            <h2 className="text-3xl font-bold tracking-tight">
-              Planos para cada fase do seu programa
-            </h2>
-            <p className="mt-4 text-muted-foreground">
-              Comece com 14 dias grátis. Upgrade quando precisar.
-            </p>
-          </div>
-          <div className="grid gap-8 md:grid-cols-3 max-w-4xl mx-auto">
-            <PricingCard
-              name="Starter"
-              price="R$ 199"
-              description="Pequenas empresas iniciando compliance"
-              features={[
-                "3 estabelecimentos",
-                "15 membros",
-                "5 campanhas/mês",
-                "3 avaliações/mês",
-                "512 MB armazenamento",
-              ]}
-            />
-            <PricingCard
-              name="Professional"
-              price="R$ 499"
-              description="Empresas em crescimento"
-              features={[
-                "10 estabelecimentos",
-                "50 membros",
-                "20 campanhas/mês",
-                "10 avaliações/mês",
-                "2 GB armazenamento",
-                "Acesso à API",
-                "Marca personalizada",
-              ]}
-              highlighted
-            />
-            <PricingCard
-              name="Enterprise"
-              price="R$ 1.499"
-              description="Grandes organizações"
-              features={[
-                "Estabelecimentos ilimitados",
-                "Membros ilimitados",
-                "Campanhas ilimitadas",
-                "Avaliações ilimitadas",
-                "Armazenamento ilimitado",
-                "Acesso à API",
-                "Marca personalizada",
-                "Suporte prioritário",
-              ]}
-            />
-          </div>
-        </div>
-      </section>
-
       {/* CTA */}
       <section className="border-t py-20">
         <div className="container mx-auto max-w-6xl px-6 text-center">
@@ -241,14 +173,14 @@ export default async function Home() {
             Comece a proteger sua empresa hoje
           </h2>
           <p className="mt-4 text-muted-foreground max-w-xl mx-auto">
-            Cadastre-se em menos de 2 minutos. Sem cartão de crédito,
-            sem compromisso. 14 dias para testar todas as funcionalidades.
+            Cadastre-se para acessar os recursos de gestão, evidências e
+            acompanhamento do programa de compliance trabalhista.
           </p>
           <Link
             href="/signup"
             className="mt-8 inline-flex h-12 items-center justify-center rounded-md bg-primary px-8 text-base font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors gap-2"
           >
-            Criar conta gratuita
+            Criar conta
             <ArrowRight className="h-4 w-4" />
           </Link>
         </div>
@@ -300,56 +232,3 @@ function FeatureCard({
   )
 }
 
-function PricingCard({
-  name,
-  price,
-  description,
-  features,
-  highlighted = false,
-}: {
-  name: string
-  price: string
-  description: string
-  features: string[]
-  highlighted?: boolean
-}) {
-  return (
-    <div
-      className={`rounded-xl border p-6 ${
-        highlighted
-          ? "border-primary ring-1 ring-primary shadow-md"
-          : "shadow-sm"
-      }`}
-    >
-      {highlighted && (
-        <span className="mb-4 inline-block rounded-full bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
-          Mais popular
-        </span>
-      )}
-      <h3 className="text-lg font-bold">{name}</h3>
-      <p className="mt-1 text-sm text-muted-foreground">{description}</p>
-      <div className="mt-4">
-        <span className="text-3xl font-bold">{price}</span>
-        <span className="text-sm text-muted-foreground">/mês</span>
-      </div>
-      <ul className="mt-6 space-y-3">
-        {features.map((f) => (
-          <li key={f} className="flex items-start gap-2 text-sm">
-            <Check className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-            {f}
-          </li>
-        ))}
-      </ul>
-      <Link
-        href="/signup"
-        className={`mt-8 flex h-10 w-full items-center justify-center rounded-md text-sm font-medium transition-colors ${
-          highlighted
-            ? "bg-primary text-primary-foreground hover:bg-primary/90"
-            : "border hover:bg-accent"
-        }`}
-      >
-        Começar agora
-      </Link>
-    </div>
-  )
-}
