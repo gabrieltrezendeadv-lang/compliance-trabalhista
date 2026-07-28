@@ -7,25 +7,14 @@ import {
   sendReporterMessageSchema,
   updateComplaintStatusSchema,
 } from "@/lib/schemas/complaint";
+import {
+  gatewayAccessComplaint,
+  gatewaySendReporterMessage,
+} from "@/lib/complaints/gateway";
 import type {
   ComplaintListItem,
   ComplaintDetail,
 } from "@/lib/schemas/complaint";
-
-// ============================================================================
-// Hash helpers — PIN hash no servidor via SHA-256
-// O hash é enviado ao banco onde fn_submit_complaint o armazena diretamente
-// (hashes hex de 64 chars são aceitos como-é). Para acesso, fn_access_complaint
-// compara via bcrypt ou sha256 dependendo do formato armazenado.
-// ============================================================================
-
-async function hashPin(pin: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(`complaint-pin-salt:${pin}`);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-}
 
 // ============================================================================
 // Public: Submissão de denúncia (sem autenticação)
@@ -38,7 +27,6 @@ export async function submitComplaint(raw: unknown) {
   }
 
   const { pin, ...rest } = parsed.data;
-  const pinHash = await hashPin(pin);
 
   const supabase = await createClient();
   const { data, error } = await supabase.rpc("fn_submit_complaint", {
@@ -52,17 +40,19 @@ export async function submitComplaint(raw: unknown) {
     p_reporter_phone: rest.reporter_phone || null,
     p_establishment_name: rest.establishment_name || null,
     p_department_name: rest.department_name || null,
-    p_pin_hash: pinHash,
+    // O nome do parâmetro é legado. A função atual recebe o PIN bruto validado
+    // e faz o hash lento com salt individual exclusivamente no banco.
+    p_pin_hash: pin,
   });
 
   if (error) {
-    return { error: error.message };
+    return { error: "Não foi possível registrar a denúncia" };
   }
 
   const result = data as { success: boolean; error?: string; protocol?: string };
 
   if (!result.success) {
-    return { error: result.error ?? "Erro ao registrar denúncia" };
+    return { error: "Não foi possível registrar a denúncia" };
   }
 
   return { success: true, protocol: result.protocol };
@@ -75,50 +65,14 @@ export async function submitComplaint(raw: unknown) {
 export async function accessComplaint(raw: unknown) {
   const parsed = accessComplaintSchema.safeParse(raw);
   if (!parsed.success) {
-    return { error: parsed.error.flatten().fieldErrors };
-  }
-
-  const pinHash = await hashPin(parsed.data.pin);
-
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc("fn_access_complaint", {
-    p_protocol: parsed.data.protocol,
-    p_pin_hash: pinHash,
-  });
-
-  if (error) {
-    return { error: error.message };
-  }
-
-  const result = data as {
-    success: boolean;
-    error?: string;
-    complaint?: {
-      status: string;
-      category: string;
-      severity: string;
-      is_anonymous: boolean;
-      created_at: string;
-      updated_at: string;
+    return {
+      error: parsed.error.flatten().fieldErrors,
+      complaint: undefined,
+      messages: undefined,
     };
-    messages?: Array<{
-      id: string;
-      sender_type: string;
-      body: string;
-      created_at: string;
-    }>;
-  };
-
-  if (!result.success) {
-    // Anti-enumeração: mensagem genérica
-    return { error: "Protocolo ou PIN inválido" };
   }
 
-  return {
-    success: true,
-    complaint: result.complaint,
-    messages: result.messages ?? [],
-  };
+  return gatewayAccessComplaint(parsed.data);
 }
 
 // ============================================================================
@@ -131,29 +85,7 @@ export async function sendReporterMessage(raw: unknown) {
     return { error: parsed.error.flatten().fieldErrors };
   }
 
-  const pinHash = await hashPin(parsed.data.pin);
-
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc("fn_send_reporter_message", {
-    p_protocol: parsed.data.protocol,
-    p_pin_hash: pinHash,
-    p_body: parsed.data.body,
-  });
-
-  if (error) {
-    return { error: error.message };
-  }
-
-  const result = data as { success: boolean; error?: string; message_id?: string };
-
-  if (!result.success) {
-    if (result.error === "complaint_closed") {
-      return { error: "Esta denúncia foi encerrada e não aceita novas mensagens." };
-    }
-    return { error: "Protocolo ou PIN inválido" };
-  }
-
-  return { success: true };
+  return gatewaySendReporterMessage(parsed.data);
 }
 
 // ============================================================================

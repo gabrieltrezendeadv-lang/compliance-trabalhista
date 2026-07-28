@@ -17,7 +17,10 @@
  */
 
 import { createClient } from "@supabase/supabase-js"
-import { resolveBillingProvider } from "@/lib/billing/registry"
+import {
+  BillingNotConfiguredError,
+  resolveBillingProvider,
+} from "@/lib/billing/registry"
 import type { BillingEventType } from "@/lib/billing/types"
 
 function getServiceClient() {
@@ -63,9 +66,33 @@ export async function POST(request: Request) {
     return Response.json({ error: "Invalid JSON" }, { status: 400 })
   }
 
-  // 1. Verify webhook token
-  const provider = resolveBillingProvider()
+  // 1. Fail closed when no real provider is configured.
+  let provider: ReturnType<typeof resolveBillingProvider>
+  try {
+    provider = resolveBillingProvider()
+  } catch (error) {
+    if (error instanceof BillingNotConfiguredError) {
+      return Response.json(
+        { error: "Billing webhook unavailable" },
+        { status: 503 }
+      )
+    }
+    throw error
+  }
+
+  // 2. Verify webhook token.
   const secret = process.env.ASAAS_WEBHOOK_TOKEN
+  const insecureDevWebhookAllowed =
+    process.env.NODE_ENV !== "production" &&
+    process.env.ALLOW_INSECURE_BILLING_WEBHOOKS === "true"
+
+  if (!secret && !insecureDevWebhookAllowed) {
+    console.error("[webhook/billing] Webhook token is not configured")
+    return Response.json(
+      { error: "Billing webhook unavailable" },
+      { status: 503 }
+    )
+  }
 
   if (secret) {
     const token = request.headers.get("asaas-access-token") ?? ""
@@ -74,11 +101,9 @@ export async function POST(request: Request) {
       console.warn("[webhook/billing] Invalid token — rejecting")
       return Response.json({ error: "Invalid token" }, { status: 401 })
     }
-  } else {
-    console.log("[webhook/billing] No ASAAS_WEBHOOK_TOKEN configured — skipping check (dev)")
   }
 
-  // 2. Parse webhook
+  // 3. Parse webhook
   const headers: Record<string, string> = {}
   request.headers.forEach((value, key) => {
     headers[key] = value

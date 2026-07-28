@@ -8,31 +8,23 @@
 import type {
   BillingProvider,
   BillingWebhookEvent,
-  CreateCustomerRequest,
   CreateCustomerResult,
-  CreateSubscriptionRequest,
   CreateSubscriptionResult,
 } from "../types"
 
 export class MockBillingProvider implements BillingProvider {
   readonly name = "mock-billing"
 
-  async createCustomer(
-    request: CreateCustomerRequest
-  ): Promise<CreateCustomerResult> {
-    console.log(`[mock-billing] createCustomer: ${request.name} (${request.cpfCnpj})`)
+  async createCustomer(): Promise<CreateCustomerResult> {
+    console.log("[mock-billing] createCustomer")
     return {
       success: true,
       customerId: `mock_cus_${crypto.randomUUID().slice(0, 8)}`,
     }
   }
 
-  async createSubscription(
-    request: CreateSubscriptionRequest
-  ): Promise<CreateSubscriptionResult> {
-    console.log(
-      `[mock-billing] createSubscription: ${request.customerId} — R$${request.value} ${request.cycle}`
-    )
+  async createSubscription(): Promise<CreateSubscriptionResult> {
+    console.log("[mock-billing] createSubscription")
     return {
       success: true,
       subscriptionId: `mock_sub_${crypto.randomUUID().slice(0, 8)}`,

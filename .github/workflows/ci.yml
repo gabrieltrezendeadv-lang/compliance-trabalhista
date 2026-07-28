@@ -37,5 +37,8 @@ jobs:
       - name: Lint
         run: npx eslint src/
 
+      - name: P0 runtime guard tests
+        run: node tests/p0-runtime-guards.mjs
+
       - name: Build
         run: npx next build

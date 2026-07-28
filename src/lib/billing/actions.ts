@@ -1,7 +1,10 @@
 "use server"
 
 import { createClient } from "@/lib/supabase/server"
-import { resolveBillingProvider } from "./registry"
+import {
+  BillingNotConfiguredError,
+  resolveBillingProvider,
+} from "./registry"
 import type {
   BillingCycle,
   PaymentMethod,
@@ -234,7 +237,6 @@ export async function createSubscription(input: {
   customerCpfCnpj: string
 }): Promise<{ success: boolean; error?: string }> {
   const supabase = await createClient()
-  const provider = resolveBillingProvider()
 
   // 1. Buscar plano
   const { data: plan } = await supabase
@@ -262,7 +264,18 @@ export async function createSubscription(input: {
 
   if (!membership) return { success: false, error: "Organização não encontrada" }
 
-  // 3. Criar customer no provedor
+  // 3. Resolver provider real antes de enviar dados pessoais ou alterar o banco.
+  let provider: ReturnType<typeof resolveBillingProvider>
+  try {
+    provider = resolveBillingProvider()
+  } catch (error) {
+    if (error instanceof BillingNotConfiguredError) {
+      return { success: false, error: "Cobrança não configurada" }
+    }
+    throw error
+  }
+
+  // 4. Criar customer no provedor
   const customerResult = await provider.createCustomer({
     name: input.customerName,
     email: input.customerEmail,
@@ -273,13 +286,13 @@ export async function createSubscription(input: {
     return { success: false, error: customerResult.error }
   }
 
-  // 4. Calcular valor
+  // 5. Calcular valor
   const value =
     input.billingCycle === "yearly" && plan.price_yearly
       ? plan.price_yearly / 100
       : plan.price_monthly / 100
 
-  // 5. Criar assinatura no provedor
+  // 6. Criar assinatura no provedor
   const subResult = await provider.createSubscription({
     customerId: customerResult.customerId!,
     billingType: input.paymentMethod,
@@ -293,7 +306,7 @@ export async function createSubscription(input: {
     return { success: false, error: subResult.error }
   }
 
-  // 6. Salvar/atualizar assinatura no banco
+  // 7. Salvar/atualizar assinatura no banco
   const { error: upsertError } = await supabase
     .from("tenant_subscriptions")
     .upsert(
