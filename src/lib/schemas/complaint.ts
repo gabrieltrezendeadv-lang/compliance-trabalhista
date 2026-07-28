@@ -181,25 +181,31 @@ export type ComplaintDetail = z.infer<typeof complaintDetailSchema>;
 // Schema: formulário público de denúncia
 // ============================================================================
 
-export const submitComplaintSchema = z.object({
-  tenant_slug: z.string().min(1, "Organização é obrigatória"),
-  subject: z.string().min(5, "Assunto deve ter pelo menos 5 caracteres"),
-  description: z
-    .string()
-    .min(10, "Descrição deve ter pelo menos 10 caracteres"),
-  category: complaintCategorySchema.default("other"),
-  is_anonymous: z.boolean().default(true),
-  reporter_name: z.string().optional(),
-  reporter_email: z.string().email("E-mail inválido").optional().or(z.literal("")),
-  reporter_phone: z.string().optional(),
-  establishment_name: z.string().optional(),
-  department_name: z.string().optional(),
-  pin: z
-    .string()
-    .min(6, "PIN deve ter pelo menos 6 dígitos")
-    .max(32, "PIN deve ter no máximo 32 dígitos")
-    .regex(/^\d+$/, "PIN deve conter apenas números"),
-});
+export const submitComplaintSchema = z
+  .object({
+    tenant_slug: z.string().min(1, "Organização é obrigatória"),
+    subject: z.string().min(5, "Assunto deve ter pelo menos 5 caracteres"),
+    description: z
+      .string()
+      .min(10, "Descrição deve ter pelo menos 10 caracteres"),
+    category: complaintCategorySchema.default("other"),
+    is_anonymous: z.boolean().default(true),
+    reporter_name: z.string().optional(),
+    reporter_email: z
+      .string()
+      .email("E-mail inválido")
+      .optional()
+      .or(z.literal("")),
+    reporter_phone: z.string().optional(),
+    establishment_name: z.string().optional(),
+    department_name: z.string().optional(),
+    pin: z
+      .string()
+      .min(6, "PIN deve ter pelo menos 6 dígitos")
+      .max(32, "PIN deve ter no máximo 32 dígitos")
+      .regex(/^\d+$/, "PIN deve conter apenas números"),
+  })
+  .strict();
 
 export type SubmitComplaint = z.infer<typeof submitComplaintSchema>;
 

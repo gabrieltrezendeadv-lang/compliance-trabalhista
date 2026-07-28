@@ -11,9 +11,28 @@ import { MockBillingProvider } from "./providers/mock-billing"
 
 let mockBilling: MockBillingProvider | null = null
 
+export class BillingNotConfiguredError extends Error {
+  constructor() {
+    super("Billing provider is not configured")
+    this.name = "BillingNotConfiguredError"
+  }
+}
+
+function isProduction(): boolean {
+  return process.env.NODE_ENV === "production"
+}
+
+function isMockAllowed(): boolean {
+  return (
+    !isProduction() &&
+    process.env.ALLOW_MOCK_BILLING_PROVIDER === "true"
+  )
+}
+
 /**
  * Resolve the billing provider.
- * Priority: ASAAS_API_KEY env var → mock fallback
+ * Priority: ASAAS_API_KEY env var → explicit dev-only mock opt-in.
+ * Production always fails closed when Asaas is not configured.
  */
 export function resolveBillingProvider(): BillingProvider {
   const apiKey = process.env.ASAAS_API_KEY
@@ -22,10 +41,13 @@ export function resolveBillingProvider(): BillingProvider {
     return new AsaasProvider({ apiKey, sandbox })
   }
 
-  return getMockBillingProvider()
+  if (isMockAllowed()) return getMockBillingProvider()
+
+  throw new BillingNotConfiguredError()
 }
 
 export function getMockBillingProvider(): BillingProvider {
+  if (!isMockAllowed()) throw new BillingNotConfiguredError()
   if (!mockBilling) mockBilling = new MockBillingProvider()
   return mockBilling
 }
@@ -35,5 +57,6 @@ export function isBillingConfigured(): boolean {
 }
 
 export function getActiveBillingProviderName(): string {
-  return process.env.ASAAS_API_KEY ? "asaas" : "mock-billing"
+  if (process.env.ASAAS_API_KEY) return "asaas"
+  return isMockAllowed() ? "mock-billing" : "not-configured"
 }
