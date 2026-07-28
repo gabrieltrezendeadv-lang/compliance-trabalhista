@@ -45,7 +45,7 @@ export function ReviewForm({ riskItemId }: ReviewFormProps) {
     setError(null)
 
     formData.set("risk_item_id", riskItemId)
-    formData.set("review_date", new Date().toISOString())
+    formData.set("review_date", new Date().toISOString().slice(0, 10))
 
     const result = await createReview(formData)
 

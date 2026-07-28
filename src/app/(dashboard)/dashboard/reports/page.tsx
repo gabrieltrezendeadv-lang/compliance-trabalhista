@@ -1,8 +1,4 @@
-import Link from "next/link";
-import {
-  generateComplianceReport,
-  type ComplianceReportData,
-} from "@/lib/reports/actions";
+import { generateComplianceReport } from "@/lib/reports/actions";
 import {
   Card,
   CardContent,
@@ -18,11 +14,10 @@ export const metadata = {
 };
 
 const RISK_LEVEL_LABELS: Record<string, string> = {
-  very_high: "Muito alto",
+  critical: "Crítico",
   high: "Alto",
-  medium: "Médio",
+  moderate: "Moderado",
   low: "Baixo",
-  very_low: "Muito baixo",
 };
 
 const RISK_CATEGORY_LABELS: Record<string, string> = {
@@ -37,11 +32,11 @@ const RISK_CATEGORY_LABELS: Record<string, string> = {
 
 const RISK_STATUS_LABELS: Record<string, string> = {
   identified: "Identificado",
-  analyzing: "Em análise",
-  treating: "Em tratamento",
-  monitoring: "Em monitoramento",
-  closed: "Encerrado",
+  action_planned: "Ação planejada",
+  in_progress: "Em andamento",
+  mitigated: "Mitigado",
   accepted: "Aceito",
+  closed: "Encerrado",
 };
 
 const ACTION_STATUS_LABELS: Record<string, string> = {
@@ -53,12 +48,13 @@ const ACTION_STATUS_LABELS: Record<string, string> = {
 };
 
 const COMPLAINT_STATUS_LABELS: Record<string, string> = {
-  open: "Aberta",
-  under_investigation: "Em investigação",
-  awaiting_response: "Aguardando resposta",
+  pending: "Pendente",
+  under_review: "Em análise",
+  investigating: "Em investigação",
+  action_required: "Ação necessária",
   resolved: "Resolvida",
-  closed: "Encerrada",
-  dismissed: "Indeferida",
+  dismissed: "Arquivada",
+  reopened: "Reaberta",
 };
 
 const CAMPAIGN_TYPE_LABELS: Record<string, string> = {
@@ -545,7 +541,7 @@ export default async function ReportsPage() {
                 <div key={i} className="rounded-lg border p-3">
                   <div className="flex items-center justify-between">
                     <div>
-                      <p className="text-sm font-medium">{pkg.title}</p>
+                      <p className="text-sm font-medium">{pkg.name}</p>
                       <p className="text-xs text-muted-foreground">
                         {pkg.itemCount} item(ns) —{" "}
                         {pkg.status === "sealed" ? "Selado" : pkg.status}
@@ -553,9 +549,9 @@ export default async function ReportsPage() {
                       </p>
                     </div>
                   </div>
-                  {pkg.sha256Hash && (
+                  {pkg.packageHash && (
                     <p className="text-[10px] text-muted-foreground mt-1 font-mono break-all">
-                      SHA-256: {pkg.sha256Hash}
+                      SHA-256: {pkg.packageHash}
                     </p>
                   )}
                 </div>

@@ -78,11 +78,11 @@ export interface ComplianceReportData {
   evidence: {
     reports: number;
     packages: Array<{
-      title: string;
+      name: string;
       status: string;
       itemCount: number;
       sealedAt: string | null;
-      sha256Hash: string | null;
+      packageHash: string | null;
     }>;
   };
 }
@@ -186,7 +186,7 @@ export async function generateComplianceReport(): Promise<{
         .is("deleted_at", null),
       supabase
         .from("evidence_packages")
-        .select("id, title, status, sealed_at, sha256_hash")
+        .select("id, name, status, sealed_at, package_hash")
         .is("deleted_at", null)
         .order("created_at", { ascending: false }),
     ]);
@@ -286,11 +286,11 @@ export async function generateComplianceReport(): Promise<{
           .select("*", { count: "exact", head: true })
           .eq("package_id", pkg.id);
         return {
-          title: pkg.title,
+          name: pkg.name,
           status: pkg.status,
           itemCount: count ?? 0,
           sealedAt: pkg.sealed_at,
-          sha256Hash: pkg.sha256_hash,
+          packageHash: pkg.package_hash,
         };
       })
     );
@@ -309,7 +309,7 @@ export async function generateComplianceReport(): Promise<{
         legalName: null,
         documentNumber: org.cnpj,
         slug: org.slug,
-        plan: (org.settings as Record<string, unknown>)?.plan as string ?? "free",
+        plan: "Não aplicável",
       },
       summary: {
         establishments: estCount ?? 0,
@@ -317,7 +317,7 @@ export async function generateComplianceReport(): Promise<{
         members: memberCount ?? 0,
         totalRisks: risks.length,
         openComplaints: cList.filter((c) =>
-          ["open", "under_investigation", "awaiting_response"].includes(c.status)
+          ["pending", "under_review", "investigating", "reopened"].includes(c.status)
         ).length,
         campaignsSent,
         evidencePackagesSealed: sealedCount,

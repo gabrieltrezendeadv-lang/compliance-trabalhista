@@ -3,6 +3,10 @@
 import { revalidatePath } from "next/cache"
 import { createClient } from "@/lib/supabase/server"
 import { EVIDENCE_PAGE_SIZE } from "@/lib/constants"
+import {
+  createEvidencePackageSchema,
+  generateEvidenceReportSchema,
+} from "@/lib/schemas/evidence"
 
 /**
  * AVISO LEGAL: Este relatório depende de validação por profissional habilitado.
@@ -96,16 +100,30 @@ export async function getEvidenceReportDetail(id: string) {
 }
 
 export async function generateEvidenceReport(formData: FormData) {
-  const { supabase } = await resolveTenantId()
+  const { supabase, tenantId } = await resolveTenantId()
+  const parsed = generateEvidenceReportSchema.safeParse({
+    type: formData.get("type"),
+    title: formData.get("title"),
+    description: (formData.get("description") as string) || undefined,
+    source_type: formData.get("source_type"),
+    source_id: (formData.get("source_id") as string) || undefined,
+    period_start: (formData.get("period_start") as string) || undefined,
+    period_end: (formData.get("period_end") as string) || undefined,
+  })
 
-  const sourceType = formData.get("source_type") as string
-  const sourceId = formData.get("source_id") as string
-  const title = formData.get("title") as string
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Dados inválidos" }
+  }
 
   const { data, error } = await supabase.rpc("fn_generate_evidence_report", {
-    p_source_type: sourceType,
-    p_source_id: sourceId,
-    p_title: title,
+    p_tenant_id: tenantId,
+    p_type: parsed.data.type,
+    p_title: parsed.data.title,
+    p_source_type: parsed.data.source_type,
+    p_source_id: parsed.data.source_id ?? null,
+    p_period_start: parsed.data.period_start ?? null,
+    p_period_end: parsed.data.period_end ?? null,
+    p_description: parsed.data.description ?? null,
   })
 
   if (error) {
@@ -165,16 +183,25 @@ export async function getEvidencePackageDetail(id: string) {
 
 export async function createEvidencePackage(formData: FormData) {
   const { supabase, tenantId, user } = await resolveTenantId()
+  const parsed = createEvidencePackageSchema.safeParse({
+    name: formData.get("name"),
+    description: (formData.get("description") as string) || undefined,
+    period_start: formData.get("period_start"),
+    period_end: formData.get("period_end"),
+  })
 
-  const name = formData.get("name") as string
-  const description = (formData.get("description") as string) || null
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Dados inválidos" }
+  }
 
   const { data, error } = await supabase
     .from("evidence_packages")
     .insert({
       tenant_id: tenantId,
-      name,
-      description,
+      name: parsed.data.name,
+      description: parsed.data.description ?? null,
+      period_start: parsed.data.period_start,
+      period_end: parsed.data.period_end,
       status: "draft",
       created_by: user.id,
     })

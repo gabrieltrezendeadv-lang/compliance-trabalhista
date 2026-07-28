@@ -21,8 +21,6 @@ import {
   Activity,
   BarChart3,
 } from "lucide-react";
-import type { RiskLevel, RiskItemStatus, RiskSource, RiskCategory } from "@/lib/schemas/risk";
-
 export const metadata = {
   title: "Inventario de Riscos — Compliance Trabalhista",
 };
@@ -30,44 +28,41 @@ export const metadata = {
 // ── Label maps ──────────────────────────────────────────────────────────────
 
 const LEVEL_LABELS: Record<string, string> = {
-  very_low: "Muito baixo",
   low: "Baixo",
-  medium: "Medio",
+  moderate: "Moderado",
   high: "Alto",
-  very_high: "Muito alto",
+  critical: "Critico",
 };
 
 const LEVEL_COLORS: Record<string, string> = {
-  very_low: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
   low: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
-  medium: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300",
+  moderate: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300",
   high: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-300",
-  very_high: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300",
+  critical: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300",
 };
 
 const STATUS_LABELS: Record<string, string> = {
   identified: "Identificado",
-  analyzing: "Em analise",
-  treating: "Em tratamento",
-  monitoring: "Monitorando",
-  resolved: "Resolvido",
+  action_planned: "Acao planejada",
+  in_progress: "Em andamento",
+  mitigated: "Mitigado",
   accepted: "Aceito",
+  closed: "Encerrado",
 };
 
 const STATUS_COLORS: Record<string, string> = {
   identified: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300",
-  analyzing: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300",
-  treating: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300",
-  monitoring: "bg-cyan-100 text-cyan-800 dark:bg-cyan-900 dark:text-cyan-300",
-  resolved: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
+  action_planned: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300",
+  in_progress: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300",
+  mitigated: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
   accepted: "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300",
+  closed: "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-300",
 };
 
 const SOURCE_LABELS: Record<string, string> = {
   assessment: "Avaliacao",
   complaint: "Denuncia",
   inspection: "Inspecao",
-  audit: "Auditoria",
   manual: "Manual",
 };
 
@@ -75,7 +70,6 @@ const SOURCE_COLORS: Record<string, string> = {
   assessment: "bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-300",
   complaint: "bg-rose-100 text-rose-800 dark:bg-rose-900 dark:text-rose-300",
   inspection: "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-300",
-  audit: "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-300",
   manual: "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300",
 };
 
@@ -181,7 +175,7 @@ export default async function RisksPage({
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold text-red-600 dark:text-red-400">
-              {(summary?.by_level?.high ?? 0) + (summary?.by_level?.very_high ?? 0)}
+              {(summary?.by_level?.high ?? 0) + (summary?.by_level?.critical ?? 0)}
             </div>
           </CardContent>
         </Card>
@@ -195,7 +189,7 @@ export default async function RisksPage({
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {summary?.by_status?.treating ?? 0}
+              {summary?.by_status?.in_progress ?? 0}
             </div>
           </CardContent>
         </Card>
@@ -224,7 +218,7 @@ export default async function RisksPage({
             </span>
 
             {/* Status filter */}
-            {(["identified", "analyzing", "treating", "monitoring", "resolved", "accepted"] as const).map(
+            {(["identified", "action_planned", "in_progress", "mitigated", "accepted", "closed"] as const).map(
               (s) => {
                 const isActive = filters.status === s;
                 return (
@@ -246,7 +240,7 @@ export default async function RisksPage({
             <span className="mx-1 text-muted-foreground">|</span>
 
             {/* Level filter */}
-            {(["very_low", "low", "medium", "high", "very_high"] as const).map(
+            {(["low", "moderate", "high", "critical"] as const).map(
               (l) => {
                 const isActive = filters.level === l;
                 return (

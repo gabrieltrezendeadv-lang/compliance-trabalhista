@@ -6,7 +6,6 @@ export const riskSourceEnum = z.enum([
   "assessment",
   "complaint",
   "inspection",
-  "audit",
   "manual",
 ])
 export type RiskSource = z.infer<typeof riskSourceEnum>
@@ -23,21 +22,20 @@ export const riskCategoryEnum = z.enum([
 export type RiskCategory = z.infer<typeof riskCategoryEnum>
 
 export const riskLevelEnum = z.enum([
-  "very_low",
   "low",
-  "medium",
+  "moderate",
   "high",
-  "very_high",
+  "critical",
 ])
 export type RiskLevel = z.infer<typeof riskLevelEnum>
 
 export const riskItemStatusEnum = z.enum([
   "identified",
-  "analyzing",
-  "treating",
-  "monitoring",
-  "resolved",
+  "action_planned",
+  "in_progress",
+  "mitigated",
   "accepted",
+  "closed",
 ])
 export type RiskItemStatus = z.infer<typeof riskItemStatusEnum>
 
@@ -61,12 +59,19 @@ export type ActionStatus = z.infer<typeof actionStatusEnum>
 
 export const reviewRecommendationEnum = z.enum([
   "maintain",
-  "escalate",
-  "downgrade",
+  "intensify",
   "close",
-  "reassess",
+  "new_action",
 ])
 export type ReviewRecommendation = z.infer<typeof reviewRecommendationEnum>
+
+export const riskPriorityEnum = z.enum([
+  "low",
+  "medium",
+  "high",
+  "urgent",
+])
+export type RiskPriority = z.infer<typeof riskPriorityEnum>
 
 // ── Risk item schemas ──────────────────────────────────────────────────────
 
@@ -83,7 +88,7 @@ export const createRiskItemSchema = z.object({
     .max(5000),
   initial_risk_level: riskLevelEnum,
   initial_score: z.number().min(0).max(100).optional(),
-  priority: z.number().int().min(1).max(5).optional(),
+  priority: riskPriorityEnum.optional(),
   cycle_id: z.string().uuid("ID do ciclo inválido").optional(),
   section_id: z.string().uuid("ID da seção inválido").optional(),
   establishment_id: z.string().uuid("ID do estabelecimento inválido").optional(),
@@ -102,7 +107,7 @@ export const updateRiskItemSchema = z.object({
   residual_risk_level: riskLevelEnum.optional().nullable(),
   initial_score: z.number().min(0).max(100).optional().nullable(),
   status: riskItemStatusEnum.optional(),
-  priority: z.number().int().min(1).max(5).optional().nullable(),
+  priority: riskPriorityEnum.optional().nullable(),
   establishment_id: z.string().uuid().optional().nullable(),
   department_id: z.string().uuid().optional().nullable(),
   affected_group: z.string().max(200).optional().nullable(),
@@ -123,7 +128,10 @@ export const createActionPlanSchema = z.object({
     .max(5000),
   control_level: controlHierarchyEnum.optional(),
   responsible_user_id: z.string().uuid("ID do responsável inválido").optional(),
-  due_date: z.string().datetime("Data de vencimento inválida").optional(),
+  due_date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "Data de vencimento inválida")
+    .optional(),
   status: actionStatusEnum.default("planned"),
   notes: z.string().max(2000).optional(),
 })
@@ -134,7 +142,11 @@ export const updateActionPlanSchema = z.object({
   description: z.string().min(10).max(5000).optional(),
   control_level: controlHierarchyEnum.optional().nullable(),
   responsible_user_id: z.string().uuid().optional().nullable(),
-  due_date: z.string().datetime().optional().nullable(),
+  due_date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional()
+    .nullable(),
   status: actionStatusEnum.optional(),
   completed_at: z.string().datetime().optional().nullable(),
   notes: z.string().max(2000).optional().nullable(),
@@ -145,7 +157,9 @@ export type UpdateActionPlan = z.infer<typeof updateActionPlanSchema>
 
 export const createReviewSchema = z.object({
   risk_item_id: z.string().uuid("ID do risco inválido"),
-  review_date: z.string().datetime("Data da revisão inválida"),
+  review_date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "Data da revisão inválida"),
   new_risk_level: riskLevelEnum,
   new_score: z.number().min(0).max(100).optional(),
   assessment_method: z
@@ -175,7 +189,7 @@ export type RiskItemRow = {
   residual_risk_level: RiskLevel | null
   initial_score: number | null
   status: RiskItemStatus
-  priority: number | null
+  priority: RiskPriority
   establishment_id: string | null
   department_id: string | null
   affected_group: string | null

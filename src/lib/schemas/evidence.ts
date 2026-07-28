@@ -14,16 +14,17 @@ export const evidenceTypeEnum = z.enum([
 export type EvidenceType = z.infer<typeof evidenceTypeEnum>
 
 export const evidenceReportStatusEnum = z.enum([
-  "draft",
-  "generated",
-  "sealed",
+  "generating",
+  "ready",
+  "failed",
   "superseded",
 ])
 export type EvidenceReportStatus = z.infer<typeof evidenceReportStatusEnum>
 
 export const evidencePackageStatusEnum = z.enum([
-  "open",
+  "draft",
   "sealed",
+  "exported",
 ])
 export type EvidencePackageStatus = z.infer<typeof evidencePackageStatusEnum>
 
@@ -36,8 +37,8 @@ export const generateEvidenceReportSchema = z.object({
     .min(5, "Título deve ter pelo menos 5 caracteres")
     .max(300),
   description: z.string().max(2000).optional(),
-  reference_id: z.string().uuid("ID de referência inválido").optional(),
-  reference_type: z.string().max(100).optional(),
+  source_id: z.string().uuid("ID de origem inválido").optional(),
+  source_type: z.enum(["campaign", "assessment_cycle", "complaint_period"]),
   period_start: z.string().datetime().optional(),
   period_end: z.string().datetime().optional(),
   parameters: z
@@ -54,10 +55,13 @@ export const createEvidencePackageSchema = z.object({
     .min(3, "Nome deve ter pelo menos 3 caracteres")
     .max(300),
   description: z.string().max(2000).optional(),
-  report_ids: z
-    .array(z.string().uuid("ID do relatório inválido"))
-    .min(1, "Selecione pelo menos um relatório"),
+  period_start: z.string().datetime("Início do período inválido"),
+  period_end: z.string().datetime("Fim do período inválido"),
 })
+  .refine((data) => new Date(data.period_end) > new Date(data.period_start), {
+    message: "O fim do período deve ser posterior ao início",
+    path: ["period_end"],
+  })
 export type CreateEvidencePackage = z.infer<typeof createEvidencePackageSchema>
 
 export const sealEvidencePackageSchema = z.object({
@@ -88,8 +92,8 @@ export type EvidenceReportRow = {
   description: string | null
   status: EvidenceReportStatus
   version: number
-  reference_id: string | null
-  reference_type: string | null
+  source_id: string | null
+  source_type: string
   period_start: string | null
   period_end: string | null
   parameters: Record<string, unknown> | null
@@ -109,6 +113,8 @@ export type EvidencePackageRow = {
   name: string
   description: string | null
   status: EvidencePackageStatus
+  period_start: string
+  period_end: string
   sealed_at: string | null
   sealed_by: string | null
   package_hash: string | null
@@ -122,8 +128,7 @@ export type EvidencePackageItemRow = {
   id: string
   package_id: string
   report_id: string
-  sort_order: number
-  report_hash: string | null
+  order_index: number
   created_at: string
 }
 

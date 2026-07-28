@@ -16,7 +16,6 @@ import {
   AlertTriangle,
   ClipboardCheck,
   FileText,
-  Package,
   TrendingUp,
   Clock,
   CheckCircle,
@@ -27,19 +26,17 @@ export const metadata = {
 };
 
 const RISK_LEVEL_COLORS: Record<string, string> = {
-  very_high: "bg-red-500",
+  critical: "bg-red-500",
   high: "bg-orange-500",
-  medium: "bg-yellow-500",
+  moderate: "bg-yellow-500",
   low: "bg-green-500",
-  very_low: "bg-emerald-400",
 };
 
 const RISK_LEVEL_LABELS: Record<string, string> = {
-  very_high: "Muito alto",
+  critical: "Crítico",
   high: "Alto",
-  medium: "Médio",
+  moderate: "Moderado",
   low: "Baixo",
-  very_low: "Muito baixo",
 };
 
 export default async function DashboardPage() {
@@ -58,7 +55,7 @@ export default async function DashboardPage() {
     );
   }
 
-  const riskLevelOrder = ["very_high", "high", "medium", "low", "very_low"];
+  const riskLevelOrder = ["critical", "high", "moderate", "low"];
   const totalRiskBar = kpis.risksTotal || 1;
 
   return (
@@ -69,6 +66,47 @@ export default async function DashboardPage() {
           Visão geral consolidada da compliance trabalhista
         </p>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Jornada de implantação</CardTitle>
+          <CardDescription>
+            Siga esta sequência para colocar a operação da empresa em funcionamento.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+          <JourneyStep
+            number={1}
+            title="Estrutura"
+            description="Cadastre estabelecimentos e departamentos."
+            href="/dashboard/establishments"
+          />
+          <JourneyStep
+            number={2}
+            title="Colaboradores"
+            description="Informe nome e e-mail ou telefone dos destinatários."
+            href="/dashboard/employees"
+          />
+          <JourneyStep
+            number={3}
+            title="Avaliações"
+            description="Crie o ciclo e envie convites únicos e anônimos."
+            href="/dashboard/assessments"
+          />
+          <JourneyStep
+            number={4}
+            title="Campanhas"
+            description="Segmente comunicados por unidade ou departamento."
+            href="/dashboard/campaigns"
+          />
+          <JourneyStep
+            number={5}
+            title="Denúncias"
+            description="Divulgue o canal público exibido em Configurações."
+            href="/dashboard/settings"
+          />
+        </CardContent>
+      </Card>
 
       {/* Row 1: organização */}
       <div className="grid gap-4 sm:grid-cols-3">
@@ -367,6 +405,33 @@ function StatCard({
           )}
         </CardContent>
       </Card>
+    </Link>
+  );
+}
+
+function JourneyStep({
+  number,
+  title,
+  description,
+  href,
+}: {
+  number: number;
+  title: string;
+  description: string;
+  href: string;
+}) {
+  return (
+    <Link
+      href={href}
+      className="rounded-lg border p-4 transition-colors hover:bg-muted/50"
+    >
+      <span className="flex h-7 w-7 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
+        {number}
+      </span>
+      <p className="mt-3 text-sm font-semibold">{title}</p>
+      <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+        {description}
+      </p>
     </Link>
   );
 }

@@ -2,7 +2,6 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getRiskDetail } from "@/lib/risks/actions";
 import { getMembers } from "@/lib/organizations/actions";
-import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -19,7 +18,6 @@ import {
   Shield,
   Clock,
   Target,
-  Users,
   FileText,
   CheckCircle2,
   AlertTriangle,
@@ -45,44 +43,41 @@ export async function generateMetadata({
 // ── Label maps ──────────────────────────────────────────────────────────────
 
 const LEVEL_LABELS: Record<string, string> = {
-  very_low: "Muito baixo",
   low: "Baixo",
-  medium: "Medio",
+  moderate: "Moderado",
   high: "Alto",
-  very_high: "Muito alto",
+  critical: "Critico",
 };
 
 const LEVEL_COLORS: Record<string, string> = {
-  very_low: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
   low: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
-  medium: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300",
+  moderate: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300",
   high: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-300",
-  very_high: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300",
+  critical: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300",
 };
 
 const STATUS_LABELS: Record<string, string> = {
   identified: "Identificado",
-  analyzing: "Em analise",
-  treating: "Em tratamento",
-  monitoring: "Monitorando",
-  resolved: "Resolvido",
+  action_planned: "Acao planejada",
+  in_progress: "Em andamento",
+  mitigated: "Mitigado",
   accepted: "Aceito",
+  closed: "Encerrado",
 };
 
 const STATUS_COLORS: Record<string, string> = {
   identified: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300",
-  analyzing: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300",
-  treating: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300",
-  monitoring: "bg-cyan-100 text-cyan-800 dark:bg-cyan-900 dark:text-cyan-300",
-  resolved: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
+  action_planned: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300",
+  in_progress: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300",
+  mitigated: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
   accepted: "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300",
+  closed: "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-300",
 };
 
 const SOURCE_LABELS: Record<string, string> = {
   assessment: "Avaliacao",
   complaint: "Denuncia",
   inspection: "Inspecao",
-  audit: "Auditoria",
   manual: "Manual",
 };
 
@@ -122,10 +117,9 @@ const CONTROL_LABELS: Record<string, string> = {
 
 const RECOMMENDATION_LABELS: Record<string, string> = {
   maintain: "Manter",
-  escalate: "Intensificar",
-  downgrade: "Reduzir",
+  intensify: "Intensificar",
   close: "Encerrar",
-  reassess: "Reavaliar",
+  new_action: "Nova acao",
 };
 
 // ── Page ────────────────────────────────────────────────────────────────────

@@ -1,6 +1,13 @@
 "use server";
 
+import { createHash, randomBytes } from "node:crypto";
+import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
+import {
+  isRealProviderConfigured,
+  resolveProvider,
+} from "@/lib/integrations/registry";
+import type { Channel } from "@/lib/integrations/types";
 import {
   createCycleSchema,
   updateCycleSchema,
@@ -53,29 +60,31 @@ export async function createAssessmentCycle(raw: unknown) {
   }
 
   const supabase = await createClient();
-
-  // Resolver tenant_id do usuário
-  const { data: membership } = await supabase
-    .from("organization_members")
-    .select("tenant_id")
-    .is("deleted_at", null)
-    .limit(1)
-    .single();
-
-  if (!membership) {
-    return { error: "Organização não encontrada" };
-  }
-
   const {
     data: { user },
   } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "Usuário não autenticado" };
+  }
+
+  const { data: membership } = await supabase
+    .from("organization_members")
+    .select("tenant_id, role")
+    .eq("user_id", user.id)
+    .in("role", ["owner", "admin", "manager"])
+    .is("deleted_at", null)
+    .maybeSingle();
+
+  if (!membership) {
+    return { error: "Organização não encontrada ou permissão insuficiente" };
+  }
 
   const { data, error } = await supabase
     .from("assessment_cycles")
     .insert({
       ...parsed.data,
       tenant_id: membership.tenant_id,
-      created_by: user?.id,
+      created_by: user.id,
       settings: { max_value: 5 },
     })
     .select()
@@ -105,6 +114,179 @@ export async function updateAssessmentCycle(cycleId: string, raw: unknown) {
   }
 
   return { success: true };
+}
+
+export async function sendAssessmentInvitations(
+  cycleId: string,
+  channel: Channel
+) {
+  if (!["email", "whatsapp"].includes(channel)) {
+    return { error: "Canal inválido" };
+  }
+
+  if (!isRealProviderConfigured(channel)) {
+    return {
+      error:
+        channel === "email"
+          ? "O provedor de e-mail não está configurado"
+          : "O provedor de WhatsApp não está configurado",
+    };
+  }
+
+  const appUrlRaw =
+    process.env.NEXT_PUBLIC_APP_URL ??
+    (process.env.VERCEL_PROJECT_PRODUCTION_URL
+      ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+      : "");
+  let appUrl: URL;
+  try {
+    appUrl = new URL(appUrlRaw);
+  } catch {
+    return { error: "A URL pública do aplicativo não está configurada" };
+  }
+  if (process.env.NODE_ENV === "production" && appUrl.protocol !== "https:") {
+    return { error: "A URL pública precisa usar HTTPS em produção" };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { error: "Usuário não autenticado" };
+
+  const { data: cycle } = await supabase
+    .from("assessment_cycles")
+    .select("id, tenant_id, name, status, starts_at, ends_at")
+    .eq("id", cycleId)
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (!cycle) return { error: "Ciclo não encontrado" };
+
+  const { data: membership } = await supabase
+    .from("organization_members")
+    .select("role")
+    .eq("tenant_id", cycle.tenant_id)
+    .eq("user_id", user.id)
+    .in("role", ["owner", "admin", "manager"])
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (!membership) return { error: "Permissão insuficiente" };
+
+  const now = new Date();
+  if (new Date(cycle.ends_at) <= now) {
+    return { error: "O ciclo está encerrado" };
+  }
+  if (new Date(cycle.starts_at) > now) {
+    return { error: "O ciclo ainda não está ativo" };
+  }
+  if (cycle.status === "planning") {
+    const { error } = await supabase
+      .from("assessment_cycles")
+      .update({ status: "active" })
+      .eq("id", cycle.id)
+      .eq("tenant_id", cycle.tenant_id);
+    if (error) return { error: error.message };
+  } else if (cycle.status !== "active") {
+    return { error: "O ciclo não permite novos convites" };
+  }
+
+  const contactColumn = channel === "email" ? "email" : "phone";
+  const { data: employees, error: employeeError } = await supabase
+    .from("employee_profiles")
+    .select("id, full_name, email, phone, establishment_id, department_id")
+    .eq("tenant_id", cycle.tenant_id)
+    .eq("status", "active")
+    .not(contactColumn, "is", null)
+    .is("deleted_at", null)
+    .order("id");
+  if (employeeError) return { error: employeeError.message };
+
+  const { data: dispatched } = await supabase
+    .from("assessment_dispatches")
+    .select("employee_id")
+    .eq("cycle_id", cycle.id)
+    .eq("status", "sent");
+  const alreadySent = new Set((dispatched ?? []).map((item) => item.employee_id));
+  const pendingEmployees = (employees ?? []).filter(
+    (employee) => !alreadySent.has(employee.id)
+  );
+
+  if (pendingEmployees.length === 0) {
+    return { success: true, sent: 0, skipped: alreadySent.size, failed: 0 };
+  }
+
+  const provider = resolveProvider(channel);
+  let sent = 0;
+  let failed = 0;
+
+  for (const employee of pendingEmployees) {
+    const token = randomBytes(32).toString("base64url");
+    const tokenHash = createHash("sha256").update(token, "utf8").digest("hex");
+    const { data: invitation, error: invitationError } = await supabase
+      .from("assessment_invitations")
+      .insert({
+        cycle_id: cycle.id,
+        tenant_id: cycle.tenant_id,
+        token: null,
+        token_hash: tokenHash,
+        establishment_id: employee.establishment_id,
+        department_id: employee.department_id,
+        expires_at: cycle.ends_at,
+      })
+      .select("id")
+      .single();
+
+    if (invitationError || !invitation) {
+      failed += 1;
+      continue;
+    }
+
+    const assessmentUrl = new URL(
+      `/assessment/${encodeURIComponent(token)}`,
+      appUrl
+    ).toString();
+    const result = await provider.send({
+      idempotencyKey: `assessment:${cycle.id}:${employee.id}:${channel}`,
+      recipientName: employee.full_name,
+      recipientEmail: employee.email ?? undefined,
+      recipientPhone: employee.phone ?? undefined,
+      subject: `Avaliação psicossocial — ${cycle.name}`,
+      bodyText:
+        `Você foi convidado(a) a responder uma avaliação psicossocial anônima.\n\n` +
+        `A empresa verá somente resultados agregados. Acesse: ${assessmentUrl}`,
+      metadata: {
+        cycleId: cycle.id,
+        tenantId: cycle.tenant_id,
+      },
+    });
+
+    const { error: dispatchError } = await supabase
+      .from("assessment_dispatches")
+      .upsert(
+        {
+          tenant_id: cycle.tenant_id,
+          cycle_id: cycle.id,
+          employee_id: employee.id,
+          establishment_id: employee.establishment_id,
+          department_id: employee.department_id,
+          channel,
+          status: result.success ? "sent" : "failed",
+          provider_id: result.providerId ?? null,
+          error_code: result.error?.code ?? null,
+          created_by: user.id,
+        },
+        { onConflict: "cycle_id,employee_id" }
+      );
+
+    if (result.success && !dispatchError) {
+      sent += 1;
+    } else {
+      failed += 1;
+    }
+  }
+
+  revalidatePath(`/dashboard/assessments/${cycle.id}`);
+  return { success: failed === 0, sent, failed, skipped: alreadySent.size };
 }
 
 // ============================================================================
