@@ -61,11 +61,10 @@ const RISK_LEVEL_OPTIONS = [
 ] as const
 
 const PRIORITY_OPTIONS = [
-  { value: "1", label: "1 - Muito baixa" },
-  { value: "2", label: "2 - Baixa" },
-  { value: "3", label: "3 - Media" },
-  { value: "4", label: "4 - Alta" },
-  { value: "5", label: "5 - Muito alta" },
+  { value: "low", label: "Baixa" },
+  { value: "medium", label: "Media" },
+  { value: "high", label: "Alta" },
+  { value: "urgent", label: "Urgente" },
 ] as const
 
 export function RiskCreateForm({

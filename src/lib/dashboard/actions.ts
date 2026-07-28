@@ -134,7 +134,12 @@ export async function getDashboardKPIs(): Promise<{
     for (const c of complaintList) {
       complaintsByStatus[c.status] = (complaintsByStatus[c.status] ?? 0) + 1;
     }
-    const openStatuses = ["open", "under_investigation", "awaiting_response"];
+    const openStatuses = [
+      "pending",
+      "under_review",
+      "investigating",
+      "reopened",
+    ];
     const complaintsOpen = complaintList.filter((c) =>
       openStatuses.includes(c.status)
     ).length;

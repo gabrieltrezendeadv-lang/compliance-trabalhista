@@ -14,6 +14,8 @@ import {
 } from "@/lib/schemas/assessment";
 import type { AssessmentStatus } from "@/lib/schemas/assessment";
 import { Calendar, Users, ShieldAlert, AlertTriangle, Lock } from "lucide-react";
+import { GenerateEvidenceButton } from "@/components/evidence/generate-evidence-button";
+import { SendAssessmentInvitations } from "@/components/assessment/send-assessment-invitations";
 
 export async function generateMetadata({
   params,
@@ -49,14 +51,15 @@ export default async function CycleDetailPage({
   const status = cycle.status as AssessmentStatus;
   const startsAt = new Date(cycle.starts_at);
   const endsAt = new Date(cycle.ends_at);
-  const totalInvited = participation.reduce(
-    (acc, p) => acc + Number(p.invited_count),
-    0
+  const overallParticipation = participation.find(
+    (item) => item.scope === "overall"
   );
-  const totalResponded = participation.reduce(
-    (acc, p) => acc + Number(p.responded_count),
-    0
+  const groupParticipation = participation.filter(
+    (item) => item.scope !== "overall"
   );
+  const overallProtected = overallParticipation?.below_threshold ?? false;
+  const totalInvited = Number(overallParticipation?.invited_count ?? 0);
+  const totalResponded = Number(overallParticipation?.responded_count ?? 0);
   const overallRate =
     totalInvited > 0
       ? ((totalResponded / totalInvited) * 100).toFixed(1)
@@ -72,12 +75,36 @@ export default async function CycleDetailPage({
             <p className="mt-1 text-muted-foreground">{cycle.description}</p>
           )}
         </div>
-        <span
-          className={`rounded-md px-2.5 py-1 text-xs font-medium ${STATUS_COLORS[status]}`}
-        >
-          {STATUS_LABELS[status]}
-        </span>
+        <div className="flex items-start gap-2">
+          <GenerateEvidenceButton
+            sourceId={cycleId}
+            sourceType="assessment_cycle"
+            reportType="assessment_result"
+            title={`Evidência — ${cycle.name}`}
+          />
+          <span
+            className={`rounded-md px-2.5 py-1 text-xs font-medium ${STATUS_COLORS[status]}`}
+          >
+            {STATUS_LABELS[status]}
+          </span>
+        </div>
       </div>
+
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between gap-4">
+          <div>
+            <CardTitle className="text-base">Enviar avaliação</CardTitle>
+            <CardDescription>
+              Os convites usam os contatos ativos de Colaboradores. O token é
+              armazenado como hash e as respostas futuras não guardam vínculo
+              com o convite ou com a identidade do colaborador.
+            </CardDescription>
+          </div>
+          <SendAssessmentInvitations
+            disabled={status === "closed" || status === "archived"}
+          />
+        </CardHeader>
+      </Card>
 
       {/* Resumo rápido */}
       <div className="grid gap-4 sm:grid-cols-4">
@@ -103,7 +130,9 @@ export default async function CycleDetailPage({
             <Users className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{totalInvited}</div>
+            <div className="text-2xl font-bold">
+              {overallProtected ? "Protegido" : totalInvited}
+            </div>
           </CardContent>
         </Card>
         <Card>
@@ -114,7 +143,9 @@ export default async function CycleDetailPage({
             <Users className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{totalResponded}</div>
+            <div className="text-2xl font-bold">
+              {overallProtected ? "Protegido" : totalResponded}
+            </div>
           </CardContent>
         </Card>
         <Card>
@@ -125,7 +156,9 @@ export default async function CycleDetailPage({
             <ShieldAlert className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{overallRate}%</div>
+            <div className="text-2xl font-bold">
+              {overallProtected ? "Protegido" : `${overallRate}%`}
+            </div>
           </CardContent>
         </Card>
       </div>
@@ -234,14 +267,14 @@ export default async function CycleDetailPage({
           </CardDescription>
         </CardHeader>
         <CardContent>
-          {participation.length === 0 ? (
+          {groupParticipation.length === 0 ? (
             <p className="text-sm text-muted-foreground py-4 text-center">
               Nenhum convite enviado ainda.
             </p>
           ) : (
             <div className="space-y-2">
-              {participation.map((stat, idx) => {
-                const rate = Number(stat.participation_rate);
+              {groupParticipation.map((stat, idx) => {
+                const rate = Number(stat.participation_rate ?? 0);
                 return (
                   <div
                     key={idx}
@@ -253,12 +286,13 @@ export default async function CycleDetailPage({
                         {stat.department_name && ` → ${stat.department_name}`}
                       </p>
                       <p className="text-xs text-muted-foreground">
-                        {Number(stat.responded_count)} de {Number(stat.invited_count)}{" "}
-                        convidados
+                        {stat.below_threshold
+                          ? "Participação protegida pelo limiar de anonimato"
+                          : `${Number(stat.responded_count)} de ${Number(stat.invited_count)} convidados`}
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
-                      {rate < 50 && (
+                      {!stat.below_threshold && rate < 50 && (
                         <AlertTriangle className="h-4 w-4 text-yellow-500" />
                       )}
                       <span
@@ -270,7 +304,9 @@ export default async function CycleDetailPage({
                               : "text-red-600"
                         }`}
                       >
-                        {rate.toFixed(0)}%
+                        {stat.below_threshold
+                          ? "Protegido"
+                          : `${rate.toFixed(0)}%`}
                       </span>
                     </div>
                   </div>

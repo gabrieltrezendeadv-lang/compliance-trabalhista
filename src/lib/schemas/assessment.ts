@@ -158,13 +158,15 @@ export type DimensionResult = z.infer<typeof dimensionResultSchema>;
 // ============================================================================
 
 export const participationStatSchema = z.object({
-  establishment_id: z.string().uuid(),
-  establishment_name: z.string(),
+  scope: z.enum(["overall", "group"]).default("group"),
+  establishment_id: z.string().uuid().nullable(),
+  establishment_name: z.string().nullable(),
   department_id: z.string().uuid().nullable(),
   department_name: z.string().nullable(),
-  invited_count: z.number().int(),
-  responded_count: z.number().int(),
-  participation_rate: z.number(),
+  invited_count: z.number().int().nullable(),
+  responded_count: z.number().int().nullable(),
+  participation_rate: z.number().nullable(),
+  below_threshold: z.boolean().default(false),
 });
 
 export type ParticipationStat = z.infer<typeof participationStatSchema>;

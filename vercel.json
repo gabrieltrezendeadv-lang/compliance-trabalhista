@@ -2,6 +2,12 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
   "regions": ["gru1"],
+  "crons": [
+    {
+      "path": "/api/cron/close-assessment-cycles",
+      "schedule": "5 3 * * *"
+    }
+  ],
   "headers": [
     {
       "source": "/(.*)",

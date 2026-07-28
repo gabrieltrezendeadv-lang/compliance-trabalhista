@@ -174,7 +174,7 @@ export function ActionPlanForm({ riskItemId, members }: ActionPlanFormProps) {
                 <Input
                   id="ap-due-date"
                   name="due_date"
-                  type="datetime-local"
+                  type="date"
                 />
               </div>
             </div>

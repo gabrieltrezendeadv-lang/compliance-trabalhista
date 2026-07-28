@@ -40,28 +40,97 @@ export async function getCampaign(campaignId: string) {
 }
 
 export async function createCampaign(raw: unknown) {
-  const parsed = createCampaignSchema.safeParse(raw);
+  const input =
+    raw instanceof FormData ? Object.fromEntries(raw.entries()) : raw;
+  const source =
+    input && typeof input === "object"
+      ? (input as Record<string, unknown>)
+      : {};
+  const establishmentId =
+    typeof source.target_establishment_id === "string"
+      ? source.target_establishment_id
+      : "";
+  const departmentId =
+    typeof source.target_department_id === "string"
+      ? source.target_department_id
+      : "";
+  const computedTargetScope =
+    establishmentId || departmentId
+      ? {
+          ...(establishmentId
+            ? { establishment_ids: [establishmentId] }
+            : {}),
+          ...(departmentId ? { department_ids: [departmentId] } : {}),
+        }
+      : undefined;
+  const parsed = createCampaignSchema.safeParse({
+    ...source,
+    template_id: source.template_id || undefined,
+    description: source.description || undefined,
+    body_html: source.body_html || undefined,
+    legal_basis: source.legal_basis || undefined,
+    scheduled_at: source.scheduled_at || undefined,
+    requires_acknowledgment:
+      source.requires_acknowledgment === true ||
+      source.requires_acknowledgment === "on",
+    target_scope: computedTargetScope,
+  });
   if (!parsed.success) {
     return { error: parsed.error.flatten().fieldErrors };
   }
 
   const supabase = await createClient();
 
-  // Resolver tenant_id
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { error: "Usuário não autenticado" };
+
   const { data: membership } = await supabase
     .from("organization_members")
-    .select("tenant_id")
+    .select("tenant_id, role")
+    .eq("user_id", user.id)
+    .in("role", ["owner", "admin", "manager"])
     .is("deleted_at", null)
     .limit(1)
-    .single();
+    .maybeSingle();
 
   if (!membership) {
     return { error: "Organização não encontrada" };
   }
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data: establishment } = establishmentId
+    ? await supabase
+        .from("establishments")
+        .select("id")
+        .eq("id", establishmentId)
+        .eq("tenant_id", membership.tenant_id)
+        .is("deleted_at", null)
+        .maybeSingle()
+    : { data: null };
+  if (establishmentId && !establishment) {
+    return { error: "Estabelecimento inválido para esta organização" };
+  }
+
+  const { data: department } = departmentId
+    ? await supabase
+        .from("departments")
+        .select("id, establishment_id")
+        .eq("id", departmentId)
+        .eq("tenant_id", membership.tenant_id)
+        .is("deleted_at", null)
+        .maybeSingle()
+    : { data: null };
+  if (departmentId && !department) {
+    return { error: "Departamento inválido para esta organização" };
+  }
+  if (
+    department &&
+    establishmentId &&
+    department.establishment_id !== establishmentId
+  ) {
+    return { error: "O departamento não pertence ao estabelecimento selecionado" };
+  }
 
   const { target_scope, ...rest } = parsed.data;
 
@@ -72,7 +141,7 @@ export async function createCampaign(raw: unknown) {
       tenant_id: membership.tenant_id,
       target_scope: target_scope ?? null,
       status: parsed.data.scheduled_at ? "scheduled" : "draft",
-      created_by: user?.id,
+      created_by: user.id,
     })
     .select()
     .single();

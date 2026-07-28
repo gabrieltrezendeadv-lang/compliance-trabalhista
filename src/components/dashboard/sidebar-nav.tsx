@@ -14,7 +14,6 @@ import {
   FileText,
   AlertTriangle,
   FileCheck,
-  CreditCard,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -22,13 +21,13 @@ const NAV_ITEMS = [
   { href: "/dashboard", label: "Painel", icon: LayoutDashboard },
   { href: "/dashboard/establishments", label: "Estabelecimentos", icon: MapPin },
   { href: "/dashboard/departments", label: "Departamentos", icon: FolderTree },
+  { href: "/dashboard/employees", label: "Colaboradores", icon: Users },
   { href: "/dashboard/assessments", label: "Avaliações", icon: ClipboardCheck },
   { href: "/dashboard/risks", label: "Riscos", icon: AlertTriangle },
   { href: "/dashboard/complaints", label: "Denúncias", icon: Shield },
   { href: "/dashboard/campaigns", label: "Campanhas", icon: Send },
   { href: "/dashboard/evidence", label: "Evidências", icon: FileText },
   { href: "/dashboard/reports", label: "Relatório", icon: FileCheck },
-  { href: "/dashboard/billing", label: "Assinatura", icon: CreditCard },
   { href: "/dashboard/members", label: "Membros", icon: Users },
   { href: "/dashboard/settings", label: "Configurações", icon: Settings },
 ] as const;

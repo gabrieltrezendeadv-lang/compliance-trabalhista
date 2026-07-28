@@ -220,9 +220,9 @@ test("CG-12: No 'use client' module imports service.ts", () => {
   );
 });
 
-// ── CG-13: service.ts is only imported by gateway.ts ───────────────────────
+// ── CG-13: service.ts stays behind audited server-only entrypoints ─────────
 
-test("CG-13: service.ts is imported only by gateway.ts (within complaints/)", () => {
+test("CG-13: service.ts is imported only by audited server entrypoints", () => {
   const allTsFiles = findTsFiles(SRC_ROOT);
   const importers: string[] = [];
 
@@ -238,11 +238,13 @@ test("CG-13: service.ts is imported only by gateway.ts (within complaints/)", ()
     }
   }
 
-  // Only gateway.ts (and possibly service.ts itself) should reference it
+  const allowedServerEntrypoints = new Set([
+    "lib/complaints/gateway.ts",
+    "lib/supabase/service.ts",
+    "app/api/cron/close-assessment-cycles/route.ts",
+  ]);
   const unexpected = importers.filter(
-    (f) =>
-      !f.includes("gateway.ts") &&
-      !f.includes("supabase/service.ts")
+    (file) => !allowedServerEntrypoints.has(file)
   );
 
   assert.equal(

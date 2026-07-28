@@ -4,8 +4,6 @@ import { SidebarNav } from "@/components/dashboard/sidebar-nav";
 import { UserMenu } from "@/components/dashboard/user-menu";
 import { OrgSwitcher } from "@/components/dashboard/org-switcher";
 import { Separator } from "@/components/ui/separator";
-import { getSubscriptionWarning } from "@/lib/billing/guard";
-import { SubscriptionWarning } from "@/components/billing/subscription-warning";
 
 export default async function DashboardLayout({
   children,
@@ -43,9 +41,6 @@ export default async function DashboardLayout({
   const fullName = profile?.full_name ?? "";
   const email = profile?.email ?? user.email ?? "";
 
-  // Check billing status for warning banner
-  const warning = await getSubscriptionWarning();
-
   return (
     <div className="flex h-screen overflow-hidden">
       {/* Sidebar */}
@@ -72,15 +67,6 @@ export default async function DashboardLayout({
       {/* Main content */}
       <main className="flex-1 overflow-y-auto">
         <div className="container mx-auto max-w-5xl px-6 py-8">
-          {warning && (
-            <div className="mb-6">
-              <SubscriptionWarning
-                level={warning.level}
-                title={warning.title}
-                message={warning.message}
-              />
-            </div>
-          )}
           {children}
         </div>
       </main>

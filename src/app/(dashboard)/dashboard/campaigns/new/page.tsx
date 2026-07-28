@@ -1,12 +1,21 @@
 import { getCampaignTemplates } from "@/lib/campaigns/actions";
 import { CampaignCreateForm } from "@/components/campaigns/campaign-create-form";
+import {
+  getDepartments,
+  getEstablishments,
+} from "@/lib/organizations/actions";
 
 export const metadata = {
   title: "Nova Campanha — Compliance Trabalhista",
 };
 
 export default async function NewCampaignPage() {
-  const templatesResult = await getCampaignTemplates();
+  const [templatesResult, establishmentsResult, departmentsResult] =
+    await Promise.all([
+      getCampaignTemplates(),
+      getEstablishments(),
+      getDepartments(),
+    ]);
 
   const templates = (templatesResult.data ?? []).map(
     (t: Record<string, unknown>) => ({
@@ -31,11 +40,17 @@ export default async function NewCampaignPage() {
         </p>
       </div>
 
-      <CampaignCreateForm templates={templates} />
-
-      <p className="text-xs text-muted-foreground text-center">
-        Este relatorio depende de validacao por profissional habilitado.
-      </p>
+      <CampaignCreateForm
+        templates={templates}
+        establishments={establishmentsResult.data.map((item) => ({
+          id: item.id,
+          name: item.name,
+        }))}
+        departments={departmentsResult.data.map((item) => ({
+          id: item.id,
+          name: item.name,
+        }))}
+      />
     </div>
   );
 }

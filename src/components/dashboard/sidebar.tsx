@@ -58,6 +58,11 @@ const navItems = [
     icon: AlertTriangle,
   },
   {
+    label: "Colaboradores",
+    href: "/dashboard/employees",
+    icon: Users,
+  },
+  {
     label: "Membros",
     href: "/dashboard/members",
     icon: Users,

@@ -36,6 +36,8 @@ interface Template {
 
 interface CampaignCreateFormProps {
   templates: Template[]
+  establishments: { id: string; name: string }[]
+  departments: { id: string; name: string }[]
 }
 
 const TYPE_OPTIONS = [
@@ -53,7 +55,11 @@ const CHANNEL_OPTIONS = [
   { value: "both", label: "E-mail + WhatsApp" },
 ] as const
 
-export function CampaignCreateForm({ templates }: CampaignCreateFormProps) {
+export function CampaignCreateForm({
+  templates,
+  establishments,
+  departments,
+}: CampaignCreateFormProps) {
   const [pending, setPending] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [success, setSuccess] = React.useState(false)
@@ -186,6 +192,46 @@ export function CampaignCreateForm({ templates }: CampaignCreateFormProps) {
                 ))}
               </SelectContent>
             </Select>
+          </div>
+
+          <div className="rounded-lg border p-4">
+            <p className="font-medium">Destinatários</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              A campanha usa os contatos ativos cadastrados em Colaboradores.
+              Deixe os filtros vazios para alcançar todos os colaboradores ativos.
+            </p>
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label>Estabelecimento</Label>
+                <Select name="target_establishment_id">
+                  <SelectTrigger>
+                    <SelectValue placeholder="Todos" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {establishments.map((item) => (
+                      <SelectItem key={item.id} value={item.id}>
+                        {item.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Departamento</Label>
+                <Select name="target_department_id">
+                  <SelectTrigger>
+                    <SelectValue placeholder="Todos" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {departments.map((item) => (
+                      <SelectItem key={item.id} value={item.id}>
+                        {item.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
           </div>
 
           {/* Subject */}

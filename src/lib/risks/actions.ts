@@ -130,9 +130,7 @@ export async function createRiskItem(formData: FormData) {
     initial_score: formData.get("initial_score")
       ? Number(formData.get("initial_score"))
       : undefined,
-    priority: formData.get("priority")
-      ? Number(formData.get("priority"))
-      : undefined,
+    priority: (formData.get("priority") as string) || undefined,
     cycle_id: (formData.get("cycle_id") as string) || undefined,
     section_id: (formData.get("section_id") as string) || undefined,
     establishment_id:
@@ -180,6 +178,7 @@ export async function updateRiskItem(riskId: string, formData: FormData) {
     "initial_risk_level",
     "residual_risk_level",
     "status",
+    "priority",
     "establishment_id",
     "department_id",
     "affected_group",
@@ -192,7 +191,7 @@ export async function updateRiskItem(riskId: string, formData: FormData) {
     }
   }
 
-  const numericFields = ["initial_score", "priority"] as const
+  const numericFields = ["initial_score"] as const
 
   for (const field of numericFields) {
     const value = formData.get(field)
