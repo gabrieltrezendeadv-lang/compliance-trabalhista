@@ -81,6 +81,12 @@ const checks = [
       const migration = read(
         "supabase/migrations/20260728152500_priv_001_anonymous_assessments.sql"
       );
+      const privacyRollback = read(
+        "supabase/rollbacks/20260728152500_priv_001_anonymous_assessments_rollback.sql"
+      );
+      const submissionRollback = read(
+        "supabase/rollbacks/20260728152000_fix_004_assessment_submission_rollback.sql"
+      );
       const action = read("src/lib/assessments/actions.ts");
       assert.match(migration, /token_hash/);
       assert.match(migration, /submission_batch_id/);
@@ -99,6 +105,20 @@ const checks = [
       assert.match(action, /token_hash: tokenHash/);
       assert.match(action, /assessment_dispatches/);
       assert.doesNotMatch(action, /metadata:\s*\{[^}]*invitationId/s);
+      assert.match(
+        privacyRollback,
+        /CREATE OR REPLACE FUNCTION public\.fn_get_questionnaire_for_token/
+      );
+      assert.match(privacyRollback, /WHERE ai\.token = p_token/);
+      assert.doesNotMatch(privacyRollback, /ai\.token_hash/);
+      assert.match(
+        privacyRollback,
+        /TO anon, authenticated, service_role/
+      );
+      assert.match(
+        submissionRollback,
+        /TO anon, authenticated, service_role/
+      );
     },
   ],
   [

@@ -49,5 +49,5 @@ $function$;
 
 REVOKE EXECUTE ON FUNCTION public.fn_submit_assessment(text, text)
   FROM PUBLIC, authenticated, service_role;
-GRANT EXECUTE ON FUNCTION public.fn_submit_assessment(text, text) TO anon;
-
+GRANT EXECUTE ON FUNCTION public.fn_submit_assessment(text, text)
+  TO anon, authenticated, service_role;

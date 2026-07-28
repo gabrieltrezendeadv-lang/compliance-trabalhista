@@ -103,7 +103,99 @@ ALTER TABLE public.assessment_invitations
   ALTER COLUMN token SET NOT NULL,
   DROP COLUMN token_hash;
 
--- Os corpos anteriores das funções são restaurados pelos rollbacks de
--- FIX-003 e FIX-004, nesta ordem:
--- 20260728151000_fix_003_reverse_scoring_rollback.sql
--- 20260728152000_fix_004_assessment_submission_rollback.sql
+CREATE OR REPLACE FUNCTION public.fn_get_questionnaire_for_token(p_token text)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path TO ''
+AS $function$
+DECLARE
+  v_invitation record;
+  v_cycle record;
+  v_template record;
+  v_sections jsonb;
+BEGIN
+  SELECT ai.id, ai.cycle_id, ai.used_at, ai.expires_at
+  INTO v_invitation
+  FROM public.assessment_invitations ai
+  WHERE ai.token = p_token;
+
+  IF v_invitation IS NULL THEN
+    RETURN jsonb_build_object('valid', false, 'error', 'token_not_found');
+  END IF;
+
+  IF v_invitation.used_at IS NOT NULL THEN
+    RETURN jsonb_build_object('valid', false, 'error', 'already_submitted');
+  END IF;
+
+  IF v_invitation.expires_at IS NOT NULL
+     AND v_invitation.expires_at < now() THEN
+    RETURN jsonb_build_object('valid', false, 'error', 'token_expired');
+  END IF;
+
+  SELECT ac.id, ac.status, ac.questionnaire_template_id, ac.ends_at
+  INTO v_cycle
+  FROM public.assessment_cycles ac
+  WHERE ac.id = v_invitation.cycle_id
+    AND ac.deleted_at IS NULL;
+
+  IF v_cycle IS NULL OR v_cycle.status <> 'active' THEN
+    RETURN jsonb_build_object('valid', false, 'error', 'cycle_not_active');
+  END IF;
+
+  IF v_cycle.ends_at < now() THEN
+    RETURN jsonb_build_object('valid', false, 'error', 'cycle_ended');
+  END IF;
+
+  SELECT qt.name, qt.description, qt.response_scale
+  INTO v_template
+  FROM public.questionnaire_templates qt
+  WHERE qt.id = v_cycle.questionnaire_template_id
+    AND qt.deleted_at IS NULL;
+
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'id', s.id,
+      'name', s.name,
+      'description', s.description,
+      'dimension_code', s.dimension_code,
+      'items', (
+        SELECT COALESCE(jsonb_agg(
+          jsonb_build_object(
+            'id', i.id,
+            'text', i.text,
+            'help_text', i.help_text,
+            'required', i.required
+          )
+          ORDER BY i.display_order
+        ), '[]'::jsonb)
+        FROM public.questionnaire_items i
+        WHERE i.section_id = s.id
+      )
+    )
+    ORDER BY s.display_order
+  ), '[]'::jsonb)
+  INTO v_sections
+  FROM public.questionnaire_sections s
+  WHERE s.template_id = v_cycle.questionnaire_template_id;
+
+  RETURN jsonb_build_object(
+    'valid', true,
+    'template', jsonb_build_object(
+      'name', v_template.name,
+      'description', v_template.description,
+      'response_scale', v_template.response_scale
+    ),
+    'sections', v_sections
+  );
+END;
+$function$;
+
+REVOKE EXECUTE ON FUNCTION public.fn_get_questionnaire_for_token(text)
+  FROM PUBLIC, anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.fn_get_questionnaire_for_token(text)
+  TO anon, authenticated, service_role;
+
+-- Os demais corpos anteriores são restaurados pelos rollbacks de FIX-003 e
+-- FIX-004, executados depois deste arquivo na ordem cronológica inversa.
