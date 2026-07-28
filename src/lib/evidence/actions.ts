@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache"
 import { createClient } from "@/lib/supabase/server"
+import { requireTenant } from "@/lib/tenant-guard"
 import { EVIDENCE_PAGE_SIZE } from "@/lib/constants"
 import {
   createEvidencePackageSchema,
@@ -17,25 +18,13 @@ import {
 
 async function resolveTenantId() {
   const supabase = await createClient()
+  const { tenantId } = await requireTenant()
 
   const {
     data: { user },
-    error: authError,
   } = await supabase.auth.getUser()
 
-  if (authError || !user) {
-    throw new Error("Usuário não autenticado")
-  }
-
-  const { data: tenantId, error: rpcError } = await supabase.rpc(
-    "fn_resolve_tenant_id",
-  )
-
-  if (rpcError || !tenantId) {
-    throw new Error("Não foi possível resolver o tenant")
-  }
-
-  return { supabase, user, tenantId: tenantId as string }
+  return { supabase, user: user!, tenantId }
 }
 
 // ── Evidence Reports ────────────────────────────────────────────────────────

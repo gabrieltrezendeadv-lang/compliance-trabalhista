@@ -124,8 +124,8 @@ export async function generateComplianceReport(): Promise<{
       settings: Record<string, unknown> | null;
     } | null;
 
-    if (!org) {
-      return { data: null, error: "Organização não encontrada" };
+    if (!membership || !org) {
+      return { data: null, error: "NO_TENANT" };
     }
 
     // --- Queries paralelas ---

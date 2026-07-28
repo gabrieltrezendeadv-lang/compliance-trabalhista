@@ -35,8 +35,13 @@ export default async function DashboardLayout({
     .limit(1)
     .single();
 
+  // Guard: authenticated user without any organization → onboarding
+  if (!membership) {
+    redirect("/onboarding");
+  }
+
   const orgName =
-    (membership?.organizations as unknown as { name: string } | null)?.name ??
+    (membership.organizations as unknown as { name: string } | null)?.name ??
     "Minha Organização";
   const fullName = profile?.full_name ?? "";
   const email = profile?.email ?? user.email ?? "";
