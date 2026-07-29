@@ -1,0 +1,108 @@
+name: Baseline dump (TEMPORÁRIO)
+
+# =============================================================================
+# WORKFLOW TEMPORÁRIO — REMOVER APÓS OBTER O schema.sql
+#
+# A máquina de desenvolvimento não tem credencial de conexão ao PostgreSQL, e
+# o agente não deve manipular secrets. Este job usa o Repository secret
+# SUPABASE_DB_URL_DUMP para gerar um dump SCHEMA-ONLY do schema `public` e
+# publicá-lo como artefato.
+#
+# GARANTIAS:
+#   - operação exclusivamente de LEITURA no banco (pg_dump --schema-only)
+#   - o secret nunca é impresso, ecoado ou gravado em arquivo
+#   - nenhum dado de tabela é extraído (verificado por asserção)
+#   - não commita, não faz push, não altera o repositório nem o banco
+#
+# ESTE ARQUIVO DEVE DESAPARECER NO COMMIT SEGUINTE.
+# =============================================================================
+
+on:
+  push:
+    branches: [chore/database-baseline]
+
+concurrency:
+  group: baseline-dump-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dump:
+    name: Dump schema-only
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # pg_dump precisa ser >= versão do servidor (PostgreSQL 17.6).
+      # O cliente padrão do runner é mais antigo e recusaria a conexão.
+      - name: Instalar postgresql-client-17
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          pg_dump --version
+
+      # --schema-only  : nenhuma linha de dado
+      # --no-owner     : portável para ambiente descartável
+      # --no-privileges: ACLs ficam em supabase/baseline/security.sql
+      - name: Gerar dump schema-only
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL_DUMP }}
+        run: |
+          if [ -z "$DB_URL" ]; then
+            echo "FALHA: secret SUPABASE_DB_URL_DUMP ausente ou vazio"
+            exit 1
+          fi
+          mkdir -p supabase/baseline
+          pg_dump "$DB_URL" \
+            --schema-only \
+            --schema=public \
+            --no-owner \
+            --no-privileges \
+            --no-tablespaces \
+            -f supabase/baseline/schema.sql
+          echo "dump concluído: $(wc -c < supabase/baseline/schema.sql) bytes"
+
+      - name: Asserção — nenhum dado no dump
+        run: |
+          F=supabase/baseline/schema.sql
+          FAIL=0
+          if grep -qE '^COPY .* FROM stdin;' "$F"; then
+            echo "FALHA: dump contém blocos COPY (dados)"; FAIL=1
+          fi
+          if grep -qiE '^INSERT INTO ' "$F"; then
+            echo "FALHA: dump contém INSERT (dados)"; FAIL=1
+          fi
+          if grep -qE 'eyJ[A-Za-z0-9_-]{20,}' "$F"; then
+            echo "FALHA: possível JWT no dump"; FAIL=1
+          fi
+          if grep -qiE 'postgres(ql)?://[^ ]*:[^ ]*@' "$F"; then
+            echo "FALHA: possível connection string no dump"; FAIL=1
+          fi
+          exit $FAIL
+
+      - name: Asserção — estrutura esperada presente
+        run: |
+          F=supabase/baseline/schema.sql
+          T=$(grep -cE '^CREATE TABLE ' "$F")
+          FN=$(grep -cE '^CREATE (OR REPLACE )?FUNCTION ' "$F")
+          P=$(grep -cE '^CREATE POLICY ' "$F")
+          echo "tabelas=$T funcoes=$FN policies=$P"
+          [ "$T"  -eq 39 ] || { echo "FALHA: esperado 39 tabelas, obtido $T"; exit 1; }
+          [ "$FN" -eq 50 ] || { echo "FALHA: esperado 50 funcoes, obtido $FN"; exit 1; }
+          [ "$P"  -eq 78 ] || { echo "FALHA: esperado 78 policies, obtido $P"; exit 1; }
+
+      - name: Checksum
+        run: sha256sum supabase/baseline/schema.sql
+
+      - name: Publicar schema.sql como artefato
+        uses: actions/upload-artifact@v6
+        with:
+          name: baseline-schema
+          path: supabase/baseline/schema.sql
+          if-no-files-found: error
+          retention-days: 7
