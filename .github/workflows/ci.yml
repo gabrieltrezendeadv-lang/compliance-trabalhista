@@ -12,6 +12,73 @@ concurrency:
 
 jobs:
   # ══════════════════════════════════════════════════════════════════════════
+  # TEMPORÁRIO — REMOVER APÓS GERAR O LOCKFILE
+  #
+  # A máquina de desenvolvimento é Windows, sem WSL e sem Docker. O npm no
+  # Windows não resolve `@emnapi/core` e `@emnapi/runtime` no topo da árvore:
+  # são peerDependencies de `@napi-rs/wasm-runtime`, que por sua vez é
+  # dependência opcional `cpu: wasm32`. O npm só as materializa em Linux — o
+  # que fez o `npm ci` do runner falhar na execução 30461227692.
+  #
+  # Este job gera o lockfile no ambiente exato do CI e o publica como
+  # artefato. Ele NÃO commita, NÃO faz push e NÃO altera o repositório.
+  #
+  # ESTE JOB DEVE DESAPARECER NO COMMIT SEGUINTE.
+  # ══════════════════════════════════════════════════════════════════════════
+  lockfile-linux-temp:
+    name: Lockfile Linux (temporário)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Pin npm 10.9.8
+        run: |
+          npm i -g npm@10.9.8
+          node -v
+          npm -v
+
+      - name: Regenerate lockfile (sem instalar, sem scripts)
+        run: npm install --package-lock-only --include=optional --ignore-scripts
+
+      - name: Validar entradas top-level de @emnapi
+        run: |
+          node -e "
+            const l = require('./package-lock.json');
+            const alvos = ['node_modules/@emnapi/core', 'node_modules/@emnapi/runtime'];
+            const faltando = alvos.filter((k) => !l.packages[k]);
+            if (faltando.length) {
+              console.error('FALHA: ausentes no lockfile -> ' + faltando.join(', '));
+              process.exit(1);
+            }
+            for (const k of alvos) {
+              const p = l.packages[k];
+              console.log(k + ' -> ' + p.version + ' | resolved: ' + !!p.resolved + ' | integrity: ' + !!p.integrity);
+              if (!p.resolved || !p.integrity) {
+                console.error('FALHA: entrada incompleta em ' + k);
+                process.exit(1);
+              }
+            }
+          "
+
+      - name: Comprovar que o lockfile funciona no Linux
+        run: npm ci
+
+      - name: Publicar lockfile como artefato
+        uses: actions/upload-artifact@v6
+        with:
+          name: package-lock-linux
+          path: package-lock.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # ══════════════════════════════════════════════════════════════════════════
   # GATE BLOQUEANTE — lint + typecheck + testes + build
   # ══════════════════════════════════════════════════════════════════════════
   verify:
@@ -19,9 +86,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           # Piso real da toolchain de testes: Node >= 20.19.0
           # (vite@8, jsdom@29). Fixado em 22 LTS por margem.
@@ -34,16 +101,23 @@ jobs:
       - name: Verify (lint + typecheck + test + build)
         run: npm run verify
 
+      # Sem `if: always()`: cobertura só faz sentido quando instalação e verify
+      # passaram. Rodá-la após falha produzia um segundo erro que mascarava a
+      # causa real (foi o que aconteceu na execução 30461227692, onde o npm ci
+      # falhou e este passo falhou em seguida por motivo derivado).
       - name: Coverage report
-        if: always()
         run: npx --no-install vitest run --coverage
 
+      # O upload permanece com `if: always()` para preservar cobertura parcial
+      # quando o passo anterior falha. `if-no-files-found: ignore` garante que
+      # a ausência do diretório não acrescente uma falha própria.
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage
           path: coverage/
+          if-no-files-found: ignore
           retention-days: 14
 
   # ══════════════════════════════════════════════════════════════════════════
@@ -55,9 +129,9 @@ jobs:
     needs: verify
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -75,10 +149,11 @@ jobs:
 
       - name: Upload Playwright report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: playwright-report
           path: playwright-report/
+          if-no-files-found: ignore
           retention-days: 14
 
   # ══════════════════════════════════════════════════════════════════════════
@@ -90,18 +165,23 @@ jobs:
   # (next@9.3.3, eslint-config-next@0.2.4), por isso `npm audit fix` NÃO é
   # executado — nem aqui, nem localmente.
   #
-  # continue-on-error preserva o código de saída real do comando: a falha
-  # aparece no log e no resumo do job, mas não reprova o PR.
+  # `continue-on-error` fica SOMENTE nos passos de audit, que retornam exit 1
+  # por causa das vulnerabilidades conhecidas. No nível do job ele foi
+  # removido: assim uma falha de infraestrutura (checkout, setup-node, npm ci)
+  # continua visível como falha real, em vez de ser silenciada junto com o
+  # resultado esperado do audit.
+  #
+  # Nenhum passo usa `|| true`: o código de saída real do comando é preservado
+  # e aparece no log.
   # ══════════════════════════════════════════════════════════════════════════
   audit:
     name: Dependency audit (informativo)
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -114,14 +194,14 @@ jobs:
         run: npm audit --audit-level=high
 
       - name: Save audit report
-        if: always()
         continue-on-error: true
         run: npm audit --json > npm-audit.json
 
       - name: Upload audit report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: npm-audit
           path: npm-audit.json
+          if-no-files-found: ignore
           retention-days: 30
