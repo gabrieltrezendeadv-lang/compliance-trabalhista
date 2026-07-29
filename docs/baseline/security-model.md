@@ -59,7 +59,37 @@ Remoções de membro usam soft delete (`deleted_at`), conforme o escopo.
 |---|---|---|
 | `resolveTenantId()` local chamando `fn_resolve_tenant_id` | `src/lib/evidence/actions.ts:18`, `src/lib/risks/actions.ts` | **duplicado** em dois arquivos; lança `Error` genérico |
 | Consulta direta a `organization_members` com `.limit(1)` | employees, campaigns, complaints, assessments, reports, billing | escolhe um tenant **arbitrário** para usuário com mais de uma organização |
-| Consulta com `.single()` | `src/app/(dashboard)/layout.tsx:30-35` | **lança exceção** para usuário com múltiplas memberships |
+| Consulta com `.limit(1).single()` | `src/app/(dashboard)/layout.tsx:30-35` | seleção arbitrária — **não lança**; ver correção abaixo |
+
+> **CORREÇÃO (29/07/2026).** A versão anterior afirmava que `.single()`
+> **lançaria exceção** para usuário multi-organização. Errado em dois pontos:
+> o `postgrest-js` **retorna** erro em `{ data, error }` (`dist/index.cjs:405-415`)
+> e o projeto não usa `throwOnError()`; e `.limit(1)` impede o `PGRST116` por
+> multiplicidade.
+>
+> **A causa real é não determinismo, e está no SQL.** A definição observada no
+> banco é:
+>
+> ```sql
+> CREATE OR REPLACE FUNCTION public.fn_resolve_tenant_id()
+>  RETURNS uuid LANGUAGE sql STABLE SECURITY DEFINER
+>  SET search_path TO 'public', 'pg_temp'
+> AS $$
+>   SELECT tenant_id FROM organization_members
+>   WHERE user_id = auth.uid() AND deleted_at IS NULL
+>   LIMIT 1;          -- ← sem ORDER BY
+> $$;
+> ```
+>
+> **31 policies em 15 tabelas** dependem dela. Um usuário multi-organização
+> enxerga apenas o tenant sorteado, inclusive suas próprias memberships nos
+> demais — multi-org está quebrado na camada de banco, coerente com a decisão
+> de mantê-lo fora do MVP.
+>
+> `organization_members.created_at` é `NOT NULL` com default `now()`, e `id` é
+> PK: `ORDER BY created_at ASC, id ASC` é suficiente para determinismo. A
+> correção afeta as 31 policies e ficará em **migration isolada**, com testes
+> reais de RLS. Registrado como TG-12.
 
 ### 3.2 Usuário sem organização não é redirecionado
 
@@ -221,17 +251,39 @@ neutralização em produção **não** é coberta por nenhum teste versionado.
 
 ---
 
-## 10. Risco aceito — default privileges
+## 10. Default privileges — risco MITIGADO, verificado no banco
 
-Conforme escopo §19, permanece registrado o risco relativo aos *default
-privileges*. O tratamento é **manual e deliberado**:
+> **ATUALIZADO (29/07/2026)** com introspecção real.
 
-- `supabase/manual/sec_005_default_function_privileges_dashboard.sql` (+ rollback);
-- `supabase/scripts/sec001_alter_default_privileges_dashboard.sql`.
+O endurecimento SEC-001/SEC-005 **está aplicado**. O default privilege para
+funções criadas por `postgres` no schema `public` é:
 
-O guard de reconciliação verifica que SEC-005 permanece etapa manual e **não**
-bloqueia migrations automáticas. Compensação exigida pelo escopo: **revisão
-explícita dos grants de toda nova função**, sem exceção.
+```
+{postgres=X/postgres}
+```
+
+Ou seja, **função nova não recebe `EXECUTE` automático** para `anon`,
+`authenticated` ou `PUBLIC`. O risco registrado no escopo §19 está, na prática,
+mitigado para funções desse proprietário.
+
+**Verificação independente:** nenhuma das **50 funções** de `public` concede
+`EXECUTE` a `PUBLIC` — nenhuma ACL contém a forma `=X/` sem papel nomeado.
+
+Ressalva: objetos criados por `supabase_admin` ainda seguem o default
+permissivo da plataforma (`{postgres=X, anon=X, authenticated=X,
+service_role=X}`). Migrations rodam como `postgres`, então o caminho normal
+está protegido — mas a compensação exigida pelo escopo (**revisão explícita
+dos grants de toda nova função**) continua necessária.
+
+### Achado novo — `FORCE ROW LEVEL SECURITY` ausente
+
+**Nenhuma das 39 tabelas** usa `FORCE ROW LEVEL SECURITY`
+(`relforcerowsecurity = false` em todas). Consequência: o proprietário das
+tabelas — `postgres` — **ignora todas as policies**.
+
+É o comportamento padrão do PostgreSQL e não é defeito por si. Mas significa
+que qualquer conexão como `postgres` (migrations, dashboard do Supabase, `psql`
+administrativo) não é contida por policy alguma. Registrado como **S9**.
 
 ---
 
@@ -239,7 +291,9 @@ explícita dos grants de toda nova função**, sem exceção.
 
 | # | Severidade | Pendência |
 |---|---|---|
-| S1 | **Alta** | Policies de PRIV-001 dependem de `fn_resolve_tenant_id`, não versionada (§7) |
+| S1 | ~~Alta~~ → **Média** | `fn_resolve_tenant_id` **existe no banco** e está capturada em `supabase/baseline/schema.sql`. Continua não versionada como migration (uma das 23 não reconciliadas). As policies de PRIV-001 não estão quebradas |
+| S9 | Média | Nenhuma tabela usa `FORCE ROW LEVEL SECURITY`: o proprietário `postgres` ignora todas as policies (§10) |
+| S10 | Média | `fn_resolve_tenant_id` sem `ORDER BY` → seleção de tenant não determinística, afetando 31 policies (§3) — TG-12 |
 | S2 | **Alta** | Usuário sem organização não é redirecionado; resolução de tenant em três padrões distintos (§3) |
 | S3 | **Alta** | Nenhum teste cross-tenant A × B; matriz de papéis não auditável (§8) |
 | S4 | Média | Guards de segurança mais extensos não rodam no CI por falta de `tsx` (§8) |

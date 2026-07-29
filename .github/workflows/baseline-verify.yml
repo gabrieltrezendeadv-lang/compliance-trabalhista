@@ -1,0 +1,142 @@
+name: Baseline verify
+
+# =============================================================================
+# Valida que o baseline de banco é REALMENTE restaurável.
+#
+# Sobe uma stack Supabase descartável no runner, restaura schema.sql +
+# security.sql, executa verify.sql, faz backup, restaura o backup e executa
+# verify.sql de novo.
+#
+# NUNCA se conecta ao projeto remoto. Não usa secrets. Toda a operação
+# acontece contra o Postgres efêmero do runner, descartado ao fim do job.
+#
+# A stack do Supabase é necessária porque o schema depende de objetos que o
+# dump de `public` não contém: auth.uid(), auth.role(), auth.users e o
+# pgcrypto instalado no schema `extensions`.
+# =============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths: ['supabase/baseline/**', '.github/workflows/baseline-verify.yml']
+  pull_request:
+    branches: [main]
+    paths: ['supabase/baseline/**', '.github/workflows/baseline-verify.yml']
+
+concurrency:
+  group: baseline-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  restore-and-verify:
+    name: Restaurar e verificar
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Conferir ausência de dados e secrets no baseline
+        run: |
+          FAIL=0
+          for F in supabase/baseline/*.sql; do
+            grep -qE '^COPY .* FROM stdin;' "$F" && { echo "FALHA: COPY em $F"; FAIL=1; }
+            grep -qiE '^INSERT INTO ' "$F" && { echo "FALHA: INSERT em $F"; FAIL=1; }
+            grep -qE 'eyJ[A-Za-z0-9_-]{20,}' "$F" && { echo "FALHA: possível JWT em $F"; FAIL=1; }
+            grep -qiE 'postgres(ql)?://[^ ]*:[^ ]*@' "$F" && { echo "FALHA: connection string em $F"; FAIL=1; }
+          done
+          exit $FAIL
+
+      # psql precisa ser >= 17.6 para entender a diretiva \restrict emitida
+      # pelo pg_dump que gerou o snapshot.
+      - name: Instalar postgresql-client-17
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo "PGBIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Subir stack Supabase descartável
+        run: |
+          mkdir -p /tmp/sbtest
+          cd /tmp/sbtest
+          supabase init --force
+          supabase start --exclude realtime,storage-api,imgproxy,studio,edge-runtime,logflare,vector,supavisor
+          echo "DB_URL=$(supabase status -o env | grep '^DB_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+
+      - name: Confirmar pré-requisitos da stack
+        run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -c "SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='auth' AND proname IN ('uid','role');"
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -c "SELECT rolname FROM pg_roles WHERE rolname IN ('anon','authenticated','service_role') ORDER BY 1;"
+
+      # ── 1ª rodada: restaurar o baseline e verificar ─────────────────────────
+      - name: Restaurar schema.sql
+        working-directory: ${{ github.workspace }}
+        run: "$PGBIN/psql \"$DB_URL\" -v ON_ERROR_STOP=1 -f supabase/baseline/schema.sql"
+
+      - name: Aplicar security.sql
+        working-directory: ${{ github.workspace }}
+        run: "$PGBIN/psql \"$DB_URL\" -v ON_ERROR_STOP=1 -f supabase/baseline/security.sql"
+
+      - name: Executar verify.sql (pós-restauração)
+        working-directory: ${{ github.workspace }}
+        run: "$PGBIN/psql \"$DB_URL\" -v ON_ERROR_STOP=1 -f supabase/baseline/verify.sql"
+
+      - name: Conferir que as funções compilam
+        run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -c "
+            DO \$\$
+            DECLARE r record; n int := 0;
+            BEGIN
+              FOR r IN SELECT p.oid::regprocedure::text AS sig FROM pg_proc p
+                       JOIN pg_namespace nsp ON nsp.oid=p.pronamespace WHERE nsp.nspname='public'
+              LOOP
+                PERFORM pg_get_functiondef((r.sig)::regprocedure);
+                n := n + 1;
+              END LOOP;
+              RAISE NOTICE 'funcoes validas: %', n;
+            END \$\$;"
+
+      - name: Conferir que as policies referenciam objetos existentes
+        run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -c "
+            SELECT count(*) AS policies_validas FROM pg_policy pol
+            WHERE pg_get_expr(pol.polqual, pol.polrelid) IS NOT NULL
+               OR pg_get_expr(pol.polwithcheck, pol.polrelid) IS NOT NULL;"
+
+      # ── 2ª rodada: backup do descartável, restauração e nova verificação ────
+      - name: Backup do ambiente descartável
+        run: |
+          "$PGBIN/pg_dump" "$DB_URL" --schema-only --schema=public --no-owner --no-privileges -f /tmp/backup.sql
+          echo "backup: $(wc -c < /tmp/backup.sql) bytes"
+          sha256sum /tmp/backup.sql
+
+      - name: Resetar o descartável para estado limpo
+        run: |
+          cd /tmp/sbtest
+          supabase db reset --no-seed
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -c "
+            SELECT count(*) AS tabelas_apos_reset FROM pg_class c
+            JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname='public' AND c.relkind='r';"
+
+      - name: Restaurar o backup
+        working-directory: ${{ github.workspace }}
+        run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f /tmp/backup.sql
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/baseline/security.sql
+
+      - name: Executar verify.sql (pós-restauração do backup)
+        working-directory: ${{ github.workspace }}
+        run: "$PGBIN/psql \"$DB_URL\" -v ON_ERROR_STOP=1 -f supabase/baseline/verify.sql"
+
+      - name: Derrubar a stack
+        if: always()
+        run: cd /tmp/sbtest && supabase stop --no-backup || true
