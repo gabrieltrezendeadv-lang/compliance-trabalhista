@@ -12,7 +12,7 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test:unit": "vitest run",
-    "test:reconciliation": "node tests/reconciliation-guards.mjs && node tests/p0-runtime-guards.mjs",
+    "test:reconciliation": "node tests/reconciliation-guards.mjs && node tests/p0-runtime-guards.mjs && node tests/migration-freeze-guard.mjs",
     "test": "npm run test:unit && npm run test:reconciliation",
     "test:e2e": "playwright test",
     "verify": "npm run lint && npm run typecheck && npm run test && npm run build"

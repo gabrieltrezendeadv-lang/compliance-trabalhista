@@ -204,31 +204,73 @@ documentos de baseline **existem** e estão capturadas aqui — incluindo
 **❌ Não totalmente resolvido.** O histórico de migrations **não está
 reconciliado**. Persiste uma divergência real:
 
-- o banco registra **36 migrations** aplicadas;
-- o repositório versiona **13** em `supabase/migrations/`;
-- as 23 restantes — `foundation`, `onboarding_function`, `create_evidence_tables`,
-  `assessment_tables`, `create_billing_tables_only`, a série `sec001`–`sec006`,
-  entre outras — **nunca foram versionadas**.
+- o banco registra **36 versões** aplicadas;
+- o repositório tem **13 arquivos** em `supabase/migrations/`, que cobrem **15**
+  dessas versões (`priv_001` foi aplicada dividida em três);
+- restam **21 versões sem arquivo correspondente antes da recuperação** —
+  `foundation`, `onboarding_function`, `create_evidence_tables`,
+  `evidence_security_definer_functions`, `create_profiles_table`,
+  `assessment_tables`, `assessment_functions`, `migrate_pin_to_bcrypt`,
+  `fix_rls_recursion_complaint_investigators`, `create_risk_inventory_tables`,
+  `risk_inventory_functions`, `create_webhook_events_table`,
+  `add_trialing_to_subscription_status`, `create_billing_tables_only`,
+  `create_billing_functions` e a série `sec001`–`sec006`.
+
+**Nenhuma migration é irrecuperável.** O SQL original das 36 está preservado na
+coluna `statements` de `supabase_migrations.schema_migrations` — cerca de
+272 KB — e é dela que `supabase migration fetch` reconstrói arquivos locais
+([documentação oficial](https://supabase.com/docs/reference/cli/supabase-migration-fetch)).
+
+Sete correspondências estão **provadas** por MD5 de SQL normalizado: três
+arquivos do repositório e quatro das seis migrations `sec001`–`sec006`
+preservadas na branch `origin/security/block1-deploy` (commit `9f99a92`).
 
 Consequência prática: um banco criado a partir de `supabase/migrations/`
 continua incompleto. Este snapshot contorna o problema para fins de
 reconstrução e teste, mas **não o resolve**.
 
-### Estratégia proposta para a reconciliação
+### Risco imediato — migrations congeladas
 
-1. Gerar, a partir deste snapshot, uma migration de baseline marcada como já
-   aplicada (`supabase migration repair --status applied`), sem reexecutar as
-   36 migrations do histórico.
-2. Conferir, uma a uma, quais das 13 migrations versionadas correspondem a
-   entradas do histórico remoto e quais são propostas nunca aplicadas.
-3. Corrigir os cabeçalhos desatualizados — `20260728154500_sec_002_retire_plan_limit.sql`
-   diz "PROPOSTA: não executada automaticamente", mas **está aplicada**
-   (versão `20260728191311`).
-4. Passar a exigir, daí em diante, que toda migration nasça versionada.
+Os 13 arquivos têm prefixos de versão **ausentes** do histórico remoto
+(interseção vazia). Como o CLI compara por timestamp, para ele os 13 estão
+pendentes, e um `supabase db push` tentaria aplicá-los contra um banco onde o
+DDL equivalente já existe.
 
-Enquanto isso não acontecer, **o R1 permanece parcialmente aberto** e os testes
-de RLS/ACL que dependem de um banco reconstruível a partir das migrations
-continuam bloqueados. Ver [`tests/db/README-R1.md`](../../tests/db/README-R1.md).
+As migrations estão **congeladas**, com guarda automática em
+`tests/migration-freeze-guard.mjs` executada pelo `verify`. Ver
+[`supabase/migrations/README.md`](../migrations/README.md).
+
+### Estratégia aprovada para a reconciliação
+
+Fonte de verdade: **o histórico registrado no banco**.
+
+1. **Fase 1 — congelamento.** Bloquear `db push` por documentação e guarda de
+   CI. Sem alteração de banco.
+2. **Fase 2 — recuperação.** `supabase migration fetch --linked` em ambiente
+   descartável, recuperando as 36 com os timestamps remotos. Operação de
+   leitura no banco.
+3. **Fase 3 — reconciliação.** Os 13 arquivos atuais migram para
+   `supabase/history/pre-reconciliation/` como evidência histórica — contêm
+   comentários e queries de verificação que não foram aplicados — e
+   `supabase/migrations/` passa a conter apenas o histórico canônico das 36.
+4. **Fase 4 — validação.** Aplicar as 36 em banco descartável e comparar com
+   `schema.sql`. Critério de sucesso: diff estrutural vazio.
+
+Também a corrigir na Fase 3: o cabeçalho de
+`20260728154500_sec_002_retire_plan_limit.sql` diz "PROPOSTA: não executada
+automaticamente", mas a migration **está aplicada** (versão `20260728191311`).
+
+Enquanto as quatro fases não se completarem, **o R1 permanece parcialmente
+aberto** e os testes de RLS/ACL que dependem de reconstrução a partir das
+migrations continuam bloqueados. Ver
+[`tests/db/README-R1.md`](../../tests/db/README-R1.md).
+
+### Item separado — ausência de rollbacks
+
+As 36 versões aplicadas têm a coluna `rollback` **vazia**. Não existe rollback
+registrado para nenhuma alteração já em produção. É risco **independente** desta
+reconciliação, não será resolvido com rollbacks retroativos inventados, e não
+deve bloquear a reconciliação. Registrado para tratamento próprio.
 
 ---
 

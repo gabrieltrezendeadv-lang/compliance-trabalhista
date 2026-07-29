@@ -25,7 +25,7 @@
 | Bloqueio | Estado | Desbloqueio |
 |---|---|---|
 | **R1 — estrutural** | ✅ **RESOLVIDO** | Snapshot em [`supabase/baseline/`](../../supabase/baseline/README.md), validado por restauração descartável. As 19 tabelas e 7 funções **existem**; o banco tem 39 tabelas, 50 funções e 78 policies |
-| **R1 — histórico** | ❌ **ABERTO** | 36 migrations aplicadas × 13 versionadas — 23 nunca versionadas. Reconciliação pendente |
+| **R1 — histórico** | ❌ **ABERTO** | 36 versões aplicadas × 13 arquivos (que cobrem 15 versões) — **21 versões sem arquivo correspondente antes da recuperação**. Nenhuma é irrecuperável: o SQL original das 36 está em `supabase_migrations.schema_migrations.statements`. Migrations **congeladas** até a reconciliação — ver [`supabase/migrations/README.md`](../../supabase/migrations/README.md) |
 | **43582c3** | ❌ **ABERTO** | `requireTenant()` e `/onboarding` existem só em `feat/onboarding-tenant-guard`. A integração será por **nova branch a partir de `main`**, sem cherry-pick |
 
 **O que mudou na prática:** os testes de RLS e ACL passam a ser executáveis,

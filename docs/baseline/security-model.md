@@ -293,6 +293,7 @@ administrativo) não é contida por policy alguma. Registrado como **S9**.
 |---|---|---|
 | S1 | ~~Alta~~ → **Média** | `fn_resolve_tenant_id` **existe no banco** e está capturada em `supabase/baseline/schema.sql`. Continua não versionada como migration (uma das 23 não reconciliadas). As policies de PRIV-001 não estão quebradas |
 | S9 | Média | Nenhuma tabela usa `FORCE ROW LEVEL SECURITY`: o proprietário `postgres` ignora todas as policies (§10) |
+| S11 | **Alta** | **Nenhuma das 36 migrations aplicadas tem rollback registrado.** A coluna `rollback` de `supabase_migrations.schema_migrations` está vazia em todas. Não existe caminho de reversão para nenhuma alteração já em produção — ver §13 |
 | S10 | Média | `fn_resolve_tenant_id` sem `ORDER BY` → seleção de tenant não determinística, afetando 31 policies (§3) — TG-12 |
 | S2 | **Alta** | Usuário sem organização não é redirecionado; resolução de tenant em três padrões distintos (§3) |
 | S3 | **Alta** | Nenhum teste cross-tenant A × B; matriz de papéis não auditável (§8) |
@@ -315,3 +316,52 @@ Regras do roadmap §3 que permanecem válidas e **não** foram exercidas nesta e
 - `service_role` nunca no frontend;
 - erro de segurança nunca silenciado para fazer teste passar;
 - nada marcado como entregue sem evidência dos testes.
+
+---
+
+## 13. S11 — ausência total de rollbacks registrados
+
+> **Item independente.** Não é parte da reconciliação de migrations e não deve
+> bloqueá-la. Registrado aqui para tratamento próprio.
+
+### O fato
+
+A coluna `rollback text[]` de `supabase_migrations.schema_migrations` está
+**vazia nas 36 versões aplicadas**. Verificado por consulta somente leitura em
+29/07/2026: `array_length(rollback, 1)` retorna `0` para todas.
+
+Não existe caminho de reversão registrado para **nenhuma** alteração já
+aplicada no banco tratado preventivamente como produção.
+
+### O que isso não significa
+
+O repositório tem 10 arquivos em `supabase/rollbacks/`, escritos à mão para as
+migrations mais recentes. Eles não estão registrados no banco, mas existem como
+SQL revisado. A ausência é do **registro no histórico**, não necessariamente do
+raciocínio de reversão.
+
+Também não significa perda: o SQL original das 36 está preservado em
+`statements`, e o snapshot estrutural em `supabase/baseline/` permite
+reconstrução completa. O que falta é o caminho de **volta** de cada passo.
+
+### O que não será feito
+
+**Rollbacks retroativos inventados estão descartados.** Deduzir a reversão de
+uma migration a partir do estado final do banco reproduz o defeito da
+Estratégia D já rejeitada: perde ordem, estados intermediários e efeitos não
+dedutíveis. Um rollback errado é pior que rollback ausente — dá falsa
+segurança para executar a operação que ele não sabe desfazer.
+
+### Tratamento proposto
+
+1. Passar a exigir rollback **para toda migration nova**, revisado e testado em
+   ambiente descartável, como já fazem os 10 arquivos de `supabase/rollbacks/`.
+2. Para as 36 já aplicadas, tratar a reversão como **restauração de backup**,
+   não como rollback de migration — e validar que backup e restauração
+   funcionam, o que hoje não está comprovado para o banco remoto.
+3. Reavaliar depois da reconciliação, quando cada versão tiver arquivo próprio
+   e for possível avaliar reversibilidade caso a caso.
+
+O item 2 é o mais urgente: sem restauração testada, não há caminho de
+recuperação comprovado para o banco de produção — independentemente de
+migrations.
