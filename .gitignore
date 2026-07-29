@@ -3,3 +3,9 @@ node_modules/
 .env
 .env.local
 *.tsbuildinfo
+
+# Artefatos de teste (Etapa 1)
+coverage/
+playwright-report/
+test-results/
+.playwright/
