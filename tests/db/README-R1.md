@@ -20,10 +20,18 @@
 
 ## Por que existem duas classes de bloqueio
 
-| Bloqueio | Natureza | Desbloqueio |
+> **ATUALIZADO EM 29/07/2026.** O R1 foi **parcialmente** resolvido.
+
+| Bloqueio | Estado | Desbloqueio |
 |---|---|---|
-| **R1** | O schema não está versionado: 19 tabelas e 7 funções usadas pela aplicação não têm definição no repositório | dump `pg_dump --schema-only` ou introspecção autorizada em branch descartável |
-| **43582c3** | `requireTenant()` e a rota `/onboarding` existem apenas na branch `feat/onboarding-tenant-guard`, não em `main` | rebase daquela branch sobre `main` e passagem pelo novo gate `verify` |
+| **R1 — estrutural** | ✅ **RESOLVIDO** | Snapshot em [`supabase/baseline/`](../../supabase/baseline/README.md), validado por restauração descartável. As 19 tabelas e 7 funções **existem**; o banco tem 39 tabelas, 50 funções e 78 policies |
+| **R1 — histórico** | ❌ **ABERTO** | 36 migrations aplicadas × 13 versionadas — 23 nunca versionadas. Reconciliação pendente |
+| **43582c3** | ❌ **ABERTO** | `requireTenant()` e `/onboarding` existem só em `feat/onboarding-tenant-guard`. A integração será por **nova branch a partir de `main`**, sem cherry-pick |
+
+**O que mudou na prática:** os testes de RLS e ACL passam a ser executáveis,
+porque agora é possível reconstruir o banco em ambiente descartável. O que
+**não** mudou: nenhum desses testes foi escrito ainda, e nenhum caso abaixo
+pode ser marcado como coberto antes de existir teste executado com sucesso.
 
 ---
 
@@ -145,12 +153,39 @@ casos ficam registrados como contrato.
 | # | Situação | Comportamento exigido |
 |---|---|---|
 | TG-11 | usuário sem organização acessa `/dashboard` | redirecionado a `/onboarding` |
-| TG-12 | usuário com múltiplas memberships | seleção determinística, sem exceção |
+| TG-12 | usuário com múltiplas memberships | **seleção determinística e documentada** |
 
-> **Defeito conhecido em `main`, a ser corrigido por `43582c3`:**
-> `src/app/(dashboard)/layout.tsx` consulta memberships com `.single()`, que
-> lança quando há mais de uma linha, e sem membership apenas exibe o rótulo
-> `"Minha Organização"` em vez de redirecionar. TG-11 e TG-12 falham hoje.
+> **CORREÇÃO DA PREMISSA (29/07/2026).**
+>
+> A versão anterior descrevia TG-12 como "`.single()` lança quando há mais de
+> uma linha". **Estava errado.** O `postgrest-js` retorna erro em
+> `{ data, error }` em vez de lançar (`dist/index.cjs:405-415`), o projeto não
+> usa `throwOnError()`, e `.limit(1)` impede o `PGRST116` por multiplicidade.
+>
+> **O problema verdadeiro é a seleção não determinística — e está no SQL:**
+>
+> ```sql
+> SELECT tenant_id FROM organization_members
+> WHERE user_id = auth.uid() AND deleted_at IS NULL
+> LIMIT 1;          -- ← sem ORDER BY
+> ```
+>
+> **31 policies em 15 tabelas** dependem de `fn_resolve_tenant_id()`.
+>
+> **Escopo de TG-12, revisado:**
+> - troca **manual** de organização permanece **fora do MVP**
+>   (`org-switcher.tsx` é stub visual, com comentário explícito);
+> - a seleção **automática** do tenant deve ser determinística e documentada;
+> - coluna de ordenação **confirmada no schema real**:
+>   `organization_members.created_at` é `NOT NULL` com default `now()`, e `id`
+>   é PK — `ORDER BY created_at ASC, id ASC` dá ordem total. Semântica: *a
+>   membership mais antiga vence*;
+> - a correção **não entra** na integração do onboarding: será **migration
+>   isolada**, com testes reais de RLS, após a reconciliação do histórico.
+>
+> **TG-11 permanece válido:** `src/app/(dashboard)/layout.tsx` não redireciona
+> usuário sem membership — apenas exibe `"Minha Organização"` e segue
+> renderizando. É defeito real, ainda presente em `main`.
 
 ---
 

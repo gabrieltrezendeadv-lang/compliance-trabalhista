@@ -187,6 +187,27 @@ segue renderizando o dashboard. Ou seja, o usuário sem organização entra num
 dashboard vazio em vez de ser direcionado ao onboarding, contrariando o escopo
 §4.1 e a Etapa 3 do roadmap.
 
+> **CORREÇÃO (29/07/2026).** Uma versão anterior deste documento afirmava que
+> `.single()` **lançaria exceção** para usuário com múltiplas organizações.
+> **Isso estava errado, em dois pontos:**
+>
+> 1. O `postgrest-js` **retorna** o erro em `{ data, error }` — não lança
+>    (`dist/index.cjs:405-415`); o projeto não usa `throwOnError()`. Como o
+>    código desestrutura apenas `data`, nenhuma exceção se propaga.
+> 2. `.limit(1)` restringe o resultado a uma linha, de modo que o `PGRST116`
+>    por multiplicidade **não pode** ocorrer.
+>
+> **O defeito real é outro: seleção não determinística.** Nenhuma das 11
+> consultas de membership do projeto usa `ORDER BY` — e a causa raiz está no
+> SQL, não no TypeScript: `fn_resolve_tenant_id()` é
+> `SELECT tenant_id FROM organization_members WHERE user_id = auth.uid() AND
+> deleted_at IS NULL LIMIT 1`, **sem `ORDER BY`**. Como 31 policies em 15
+> tabelas comparam `tenant_id = fn_resolve_tenant_id()`, um usuário multi-org
+> enxerga apenas o tenant sorteado. Registrado como TG-12.
+>
+> Troca manual de organização permanece **fora do MVP** — `org-switcher.tsx` é
+> um stub visual, com comentário explícito nesse sentido.
+
 Além disso, a resolução de tenant em `main` é **duplicada e inline**:
 `src/lib/evidence/actions.ts:18` e `src/lib/risks/actions.ts` definem cada um
 seu próprio `resolveTenantId()` chamando `fn_resolve_tenant_id`; os demais
@@ -224,7 +245,7 @@ webhook com HMAC e `timingSafeEqual`). Não há **nenhuma** ocorrência de
 | D4 | WhatsApp implementado em Cloud API, não Evolution — tratado em §8. |
 | D5 | Contrato de variáveis de ambiente divergente do roadmap §5.2 — ver `architecture.md` §5. |
 | D6 | Gate de campanhas do escopo §21 inatingível por ausência de ciclo de vida — ver §5. |
-| D7 | Estado real do banco desconhecido: migrations como `20260728154500_sec_002_retire_plan_limit.sql` trazem no cabeçalho *"PROPOSTA: não executada automaticamente"*. O repositório não permite saber o que está aplicado em qual ambiente. |
+| D7 | ~~Estado real do banco desconhecido~~ — **RESOLVIDO** em 29/07/2026. **SEC-002 ESTÁ APLICADA** (histórico `20260728191311`; `check_plan_limit` com ACL `{postgres=X}`): o cabeçalho *"PROPOSTA: não executada automaticamente"* está desatualizado. A migration `20260729000000_onboarding_tenant_guard` **nunca foi aplicada**. |
 | D8 | Convenção de branches do roadmap §4.1 não seguida: `feat/onboarding-tenant-guard` equivale ao PR#4 da tabela §8, executado antes dos PRs 1–3. |
 
 ---
@@ -273,7 +294,7 @@ Executado no commit `3f616a5`, em 29/07/2026, Node v24.13.0 / npm 11.6.2.
 
 | # | Severidade | Problema | Etapa que trata |
 |---|---|---|---|
-| R1 | **Bloqueante** | Schema não versionado — impede reconstruir o banco a partir do repo, validar migration em branch descartável e executar rollback comparado, que é gate obrigatório de **todas** as etapas | 0 (parcial) / requer dump |
+| R1 | **Parcialmente resolvido** | **Estruturalmente resolvido** em 29/07/2026: snapshot em `supabase/baseline/`, validado por restauração descartável. O banco tem 39 tabelas, 50 funções e 78 policies. **Continua aberto** quanto ao histórico: 36 migrations aplicadas × 13 versionadas — 23 nunca versionadas | reconciliação pendente |
 | R2 | **Bloqueante** | Sem runner de testes e sem gate `verify` no CI, a regra *"PR não mergeia se `verify` falhar"* não é aplicável | 1 |
 | R3 | Alto | 7 funções chamadas sem definição no repo → erro garantido em qualquer ambiente criado a partir das migrations versionadas | 0 / 1 |
 | R4 | Alto | Resolução de tenant inconsistente e sem redirecionamento de usuário sem organização (§7) | 3 (branch pendente) |

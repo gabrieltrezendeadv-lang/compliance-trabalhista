@@ -4,44 +4,58 @@
 **Commit de referência:** `3f616a5` (`origin/main`)
 **Data:** 29/07/2026
 
-> **Método: derivação a partir do código-fonte e das migrations versionadas.**
-> Por decisão do proprietário, este inventário **não** foi obtido por dump nem
-> por introspecção do banco. Nenhum acesso a Supabase remoto, branch ou produção
-> foi realizado. Toda linha marcada como *lacuna* significa "não existe no
-> repositório" — **não** significa "não existe no banco".
+> **ATUALIZADO EM 29/07/2026 — introspecção real do banco realizada.**
+>
+> A versão anterior deste documento derivava o inventário do código-fonte e
+> marcava 19 tabelas e 7 funções como "lacuna", significando "não existe no
+> repositório". A introspecção do projeto `tvwgzpgyfdfrbdaeoqzl` confirmou que
+> **todas existem no banco**. As seções abaixo foram corrigidas.
+>
+> Snapshot estrutural versionado em [`supabase/baseline/`](../../supabase/baseline/README.md).
 
 ---
 
-## 1. Bloqueante R1 — o schema não está versionado
+## 1. Estado do R1 — parcialmente resolvido
 
-O repositório versiona **11 tabelas** e **29 funções**. A aplicação consulta
-**27 tabelas** e chama **25 funções**. O cruzamento revela:
+O R1 tem duas metades. Uma foi resolvida; a outra não.
 
-- **19 tabelas** consultadas pela aplicação **sem `CREATE TABLE` no repositório**;
-- **7 funções** chamadas pela aplicação ou por migrations **sem `CREATE FUNCTION` no repositório**.
+### ✅ Estruturalmente resolvido
 
-### Por que isto é bloqueante
+O schema é reconstruível a partir do repositório, e a reconstrução foi validada
+por restauração em ambiente descartável (workflow `baseline-verify.yml`):
 
-O roadmap (§1, gate 4) exige que toda alteração seja validada com *"aplicação e
-rollback em branch Supabase ou banco descartável"*. Um banco criado a partir
-das migrations deste repositório **não conterá** as 19 tabelas nem as 7 funções
-listadas adiante — a aplicação falharia imediatamente. Portanto:
+| Métrica | Valor real |
+|---|---:|
+| Tabelas em `public` | **39** |
+| Com RLS habilitado | **39 (100%)** |
+| Funções em `public` | **50** |
+| Policies | **78** |
+| Tipos | **25** (24 enums + `plan_limits`) |
+| Triggers | **31** |
+| Constraints | **159** |
+| Índices | **124** |
 
-- não é possível reconstruir o banco a partir do repositório;
-- não é possível validar migrations em branch descartável;
-- não é possível comparar estado anterior × posterior de forma confiável;
-- o gate de banco/deploy fica **parcialmente inviável** para todas as etapas.
+As 19 tabelas e as 7 funções antes marcadas como lacuna **existem** e estão
+capturadas no snapshot — inclusive `fn_resolve_tenant_id`, da qual dependem 31
+policies em 15 tabelas.
 
-### Como resolver (fora do escopo desta etapa)
+### ❌ Não totalmente resolvido — histórico de migrations não reconciliado
 
-Uma das duas ações, ambas dependentes do proprietário:
+| Origem | Migrations |
+|---|---:|
+| Registradas no banco | **36** |
+| Versionadas em `supabase/migrations/` | **13** |
+| **Nunca versionadas** | **23** |
 
-1. fornecer `pg_dump --schema-only` do projeto Supabase, a partir do qual se
-   gera uma migration de baseline (`00000000000000_baseline.sql`); ou
-2. autorizar introspecção somente leitura em branch descartável.
+Entre as não versionadas: `foundation`, `onboarding_function`,
+`create_evidence_tables`, `create_profiles_table`, `assessment_tables`,
+`create_risk_inventory_tables`, `create_billing_tables_only`,
+`create_webhook_events_table` e a série `sec001`–`sec006`.
 
-Enquanto nenhuma das duas ocorrer, **R1 permanece aberto** e este inventário
-continua sendo uma aproximação derivada do código.
+**Consequência:** um banco criado a partir de `supabase/migrations/` continua
+incompleto. O snapshot contorna isso para reconstrução e teste, mas não
+substitui a reconciliação. Estratégia proposta no
+[README do baseline](../../supabase/baseline/README.md#estratégia-proposta-para-a-reconciliação).
 
 ---
 
@@ -65,10 +79,11 @@ Origem: `CREATE TABLE` em `supabase/migrations/**`.
 | `campaign_acknowledgments` | `20260724150000` |
 | `assessment_dispatches` | `20260728152000_fix_004_assessment_submission.sql` |
 
-### 2.2 LACUNA — usadas pela aplicação, sem definição no repositório (19)
+### 2.2 CONFIRMADAS NO BANCO — não versionadas como migration (19)
 
-Origem: ocorrências de `.from("...")` em `src/`, subtraídas as versionadas.
-**Nenhuma destas tabelas pode ser recriada a partir deste repositório.**
+**Correção:** estas tabelas **existem** no banco e estão capturadas em
+`supabase/baseline/schema.sql`. O que falta é a migration que as criou estar
+versionada — elas vieram das 23 migrations não reconciliadas (§1).
 
 | # | Tabela | Consumidor principal |
 |---:|---|---|
@@ -138,10 +153,11 @@ Origem: `CREATE [OR REPLACE] FUNCTION public.*` em `supabase/migrations/**`.
 `check_plan_limit` (duas assinaturas; `EXECUTE` revogado de todas as roles pela
 migration `20260728154500_sec_002_retire_plan_limit.sql`).
 
-### 3.2 LACUNA — chamadas sem definição no repositório (7)
+### 3.2 CONFIRMADAS NO BANCO — não versionadas como migration (7)
 
-**Estas são as chamadas que produziriam erro imediato em um banco reconstruído
-a partir deste repositório.**
+**Correção:** todas as 7 **existem** no banco e estão em
+`supabase/baseline/schema.sql`. O erro ocorreria apenas num banco reconstruído
+somente a partir de `supabase/migrations/`, sem o snapshot.
 
 | # | Função | Chamada em | Papel |
 |---:|---|---|---|
@@ -194,20 +210,25 @@ risco desta lista.
 
 ---
 
-## 5. Estado de aplicação desconhecido
+## 5. Estado de aplicação — agora conhecido
 
-Não é possível determinar, a partir do repositório, quais migrations estão
-aplicadas em quais ambientes. Vários arquivos declaram explicitamente que são
-propostas — por exemplo, o cabeçalho de
-`20260728154500_sec_002_retire_plan_limit.sql`:
+**Correção.** A versão anterior dizia que o estado era indeterminável. A
+introspecção resolveu isso.
 
-```
--- PROPOSTA: não executada automaticamente.
-```
+**SEC-002 ESTÁ APLICADA.** O cabeçalho de
+`20260728154500_sec_002_retire_plan_limit.sql` diz "PROPOSTA: não executada
+automaticamente", e isso está **desatualizado**: a migration consta do
+histórico do banco como versão `20260728191311`, e `check_plan_limit` tem ACL
+`{postgres=X/postgres}` nas duas assinaturas — nenhuma role de API a executa.
 
-Consequência: as seções acima descrevem **o que o repositório define**, não o
-que o banco contém. Registrado como risco **R7** em
-[`current-state.md`](./current-state.md) §11.
+As 13 migrations versionadas correspondem a entradas do histórico remoto. O que
+não corresponde é o inverso: 23 migrations aplicadas no banco não têm arquivo
+no repositório (§1).
+
+**Não aplicada:** `20260729000000_onboarding_tenant_guard` — a migration da
+branch `feat/onboarding-tenant-guard` **nunca foi executada**. O banco mantém
+`fn_create_organization_with_owner` retornando `uuid` e lançando
+`RAISE EXCEPTION`, e `fn_check_active_tenant` **não existe**.
 
 ---
 
@@ -219,23 +240,29 @@ que o banco contém. Registrado como risco **R7** em
 `fn_user_has_any_role`.
 
 **Nenhuma dessas 4 funções é chamada pelo código atual.** O arquivo está
-obsoleto: as 22 tabelas restantes e as 25 RPCs efetivamente usadas ficam sem
-tipagem, e as consultas correspondentes perdem checagem estática. Registrado
-como risco **R8**. A regeneração via `supabase gen types` depende da resolução
-de R1.
+obsoleto: cobre 5 das **39** tabelas reais, e as 25 RPCs efetivamente usadas
+ficam sem tipagem. Registrado como risco **R8**.
+
+Com o R1 estruturalmente resolvido, a regeneração via `supabase gen types`
+**está desbloqueada** e pode ser feita em PR próprio.
 
 ---
 
 ## 7. Resumo quantitativo
 
-| Métrica | Valor |
-|---|---:|
-| Tabelas consultadas pela aplicação | 27 |
-| Tabelas versionadas no repositório | 11 |
-| **Tabelas em lacuna** | **19** |
-| Funções chamadas pela aplicação | 25 |
-| Funções versionadas no repositório | 29 |
-| **Funções em lacuna** | **7** |
-| Migrations versionadas | 13 |
-| Migrations sem rollback versionado | 4 |
-| Tabelas cobertas por `src/types/database.ts` | 5 |
+| Métrica | Repositório | **Banco real** |
+|---|---:|---:|
+| Tabelas | 11 versionadas | **39** |
+| Com RLS | — | **39 (100%)** |
+| Funções | 29 versionadas | **50** |
+| Policies | ~20 versionadas | **78** |
+| Tipos | — | **25** |
+| Triggers | — | **31** |
+| Constraints | — | **159** |
+| Índices | — | **124** |
+| Migrations | 13 versionadas | **36 aplicadas** |
+| Migrations sem rollback versionado | 4 | — |
+| Tabelas em `src/types/database.ts` | 5 | de 39 |
+
+**Divergência central:** 23 migrations aplicadas no banco não têm arquivo no
+repositório. É o que mantém o R1 parcialmente aberto.
