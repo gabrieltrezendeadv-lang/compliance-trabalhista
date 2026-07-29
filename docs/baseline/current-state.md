@@ -294,7 +294,7 @@ Executado no commit `3f616a5`, em 29/07/2026, Node v24.13.0 / npm 11.6.2.
 
 | # | Severidade | Problema | Etapa que trata |
 |---|---|---|---|
-| R1 | **Parcialmente resolvido** | **Estruturalmente resolvido** em 29/07/2026: snapshot em `supabase/baseline/`, validado por restauração descartável. O banco tem 39 tabelas, 50 funções e 78 policies. **Continua aberto** quanto ao histórico: 36 migrations aplicadas × 13 versionadas — 23 nunca versionadas | reconciliação pendente |
+| R1 | **Parcialmente resolvido** | **Estruturalmente resolvido** em 29/07/2026: snapshot em `supabase/baseline/`, validado por restauração descartável. O banco tem 39 tabelas, 50 funções e 78 policies. **Continua aberto** quanto ao histórico: 36 versões aplicadas × 13 arquivos (que cobrem 15 versões) — **21 versões sem arquivo correspondente antes da recuperação**. Nenhuma é irrecuperável: o SQL original das 36 está em `supabase_migrations.schema_migrations.statements` | reconciliação pendente — migrations **congeladas**, ver `supabase/migrations/README.md` |
 | R2 | **Bloqueante** | Sem runner de testes e sem gate `verify` no CI, a regra *"PR não mergeia se `verify` falhar"* não é aplicável | 1 |
 | R3 | Alto | 7 funções chamadas sem definição no repo → erro garantido em qualquer ambiente criado a partir das migrations versionadas | 0 / 1 |
 | R4 | Alto | Resolução de tenant inconsistente e sem redirecionamento de usuário sem organização (§7) | 3 (branch pendente) |

@@ -41,21 +41,38 @@ policies em 15 tabelas.
 
 ### ❌ Não totalmente resolvido — histórico de migrations não reconciliado
 
-| Origem | Migrations |
+| Origem | Quantidade |
 |---|---:|
-| Registradas no banco | **36** |
-| Versionadas em `supabase/migrations/` | **13** |
-| **Nunca versionadas** | **23** |
+| Versões registradas no banco | **36** |
+| Arquivos em `supabase/migrations/` | **13** |
+| Versões cobertas por esses arquivos | **15** |
+| **Versões sem arquivo correspondente antes da recuperação** | **21** |
 
-Entre as não versionadas: `foundation`, `onboarding_function`,
-`create_evidence_tables`, `create_profiles_table`, `assessment_tables`,
-`create_risk_inventory_tables`, `create_billing_tables_only`,
-`create_webhook_events_table` e a série `sec001`–`sec006`.
+São 15 versões cobertas por 13 arquivos porque
+`20260728152500_priv_001_anonymous_assessments.sql` foi aplicada **dividida em
+três** versões (`_ddl`, `_fns1`, `_fns2_grants`).
 
-**Consequência:** um banco criado a partir de `supabase/migrations/` continua
-incompleto. O snapshot contorna isso para reconstrução e teste, mas não
-substitui a reconciliação. Estratégia proposta no
-[README do baseline](../../supabase/baseline/README.md#estratégia-proposta-para-a-reconciliação).
+Entre as 21 sem arquivo: `foundation`, `onboarding_function`,
+`create_evidence_tables`, `evidence_security_definer_functions`,
+`create_profiles_table`, `assessment_tables`, `assessment_functions`,
+`migrate_pin_to_bcrypt`, `fix_rls_recursion_complaint_investigators`,
+`create_risk_inventory_tables`, `risk_inventory_functions`,
+`create_webhook_events_table`, `add_trialing_to_subscription_status`,
+`create_billing_tables_only`, `create_billing_functions` e a série
+`sec001`–`sec006`.
+
+**Nenhuma é irrecuperável.** O SQL original das 36 está preservado na coluna
+`statements` de `supabase_migrations.schema_migrations` — cerca de 272 KB — e é
+dela que `supabase migration fetch` reconstrói arquivos. Sete correspondências
+já estão provadas por MD5 de SQL normalizado; as 6 migrations `sec001`–`sec006`
+têm ainda arquivo preservado na branch `origin/security/block1-deploy`
+(commit `9f99a92`), quatro delas idênticas ao aplicado.
+
+**Consequência atual:** um banco criado a partir de `supabase/migrations/`
+continua incompleto, e os 13 arquivos têm prefixos de versão **ausentes** do
+histórico remoto — o que torna `supabase db push` perigoso. As migrations estão
+**congeladas**; ver [`supabase/migrations/README.md`](../../supabase/migrations/README.md).
+O snapshot em `supabase/baseline/` é a via de reconstrução enquanto isso.
 
 ---
 
@@ -83,7 +100,8 @@ Origem: `CREATE TABLE` em `supabase/migrations/**`.
 
 **Correção:** estas tabelas **existem** no banco e estão capturadas em
 `supabase/baseline/schema.sql`. O que falta é a migration que as criou estar
-versionada — elas vieram das 23 migrations não reconciliadas (§1).
+versionada — elas vieram das 21 versões sem arquivo correspondente antes da
+recuperação (§1).
 
 | # | Tabela | Consumidor principal |
 |---:|---|---|
@@ -222,8 +240,8 @@ histórico do banco como versão `20260728191311`, e `check_plan_limit` tem ACL
 `{postgres=X/postgres}` nas duas assinaturas — nenhuma role de API a executa.
 
 As 13 migrations versionadas correspondem a entradas do histórico remoto. O que
-não corresponde é o inverso: 23 migrations aplicadas no banco não têm arquivo
-no repositório (§1).
+não corresponde é o inverso: 21 versões aplicadas no banco não têm arquivo
+correspondente no repositório antes da recuperação (§1).
 
 **Não aplicada:** `20260729000000_onboarding_tenant_guard` — a migration da
 branch `feat/onboarding-tenant-guard` **nunca foi executada**. O banco mantém
@@ -264,5 +282,7 @@ Com o R1 estruturalmente resolvido, a regeneração via `supabase gen types`
 | Migrations sem rollback versionado | 4 | — |
 | Tabelas em `src/types/database.ts` | 5 | de 39 |
 
-**Divergência central:** 23 migrations aplicadas no banco não têm arquivo no
-repositório. É o que mantém o R1 parcialmente aberto.
+**Divergência central:** 21 versões aplicadas no banco não têm arquivo
+correspondente no repositório antes da recuperação, e os 13 arquivos existentes
+têm prefixos de versão ausentes do histórico remoto. É o que mantém o R1
+parcialmente aberto — e o que motivou o congelamento das migrations.
