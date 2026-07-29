@@ -38,6 +38,7 @@ import {
   collaboratorA,
   managerA,
   ownerA,
+  ownerB,
   userWithoutOrg,
   type Identity,
 } from "../../fixtures/identities";
@@ -263,29 +264,68 @@ describe("isolamento cross-tenant (camada de aplicação)", () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 describe("origem do tenant_id", () => {
-  it("grava o tenant da membership, nunca um enviado pelo cliente", async () => {
+  /**
+   * Formulário VÁLIDO, sem campo extra — a escrita precisa acontecer para que
+   * o payload possa ser inspecionado.
+   *
+   * A versão anterior deste teste enviava `tenant_id` extra e envolvia as
+   * asserções em `if (payload)`. Como o schema é `.strict()`, a entrada era
+   * rejeitada, nenhum insert ocorria, `payload` ficava `undefined` e o bloco
+   * inteiro era pulado: o teste passava sem verificar absolutamente nada.
+   * Asserção de segurança nunca pode ser condicional a um payload opcional.
+   *
+   * A rejeição de campo extra é verificada separadamente, em "allowlist de
+   * campos".
+   */
+  it("grava o tenant da membership no payload do insert", async () => {
     const fake = install(ownerA);
 
-    // Tentativa de injeção: o formulário traz o tenant do B.
-    await createEmployee(
-      form({ ...VALID_EMPLOYEE, tenant_id: TENANT_B.id } as Record<string, string>)
-    );
+    const result = await createEmployee(form(VALID_EMPLOYEE));
+    expect(result.success).toBe(true);
 
-    const insert = writeOperations(fake.calls)[0];
-    const payload = insert?.payload as Record<string, unknown> | undefined;
+    const writes = writeOperations(fake.calls);
+    expect(writes).toHaveLength(1);
 
-    if (payload) {
-      expect(payload.tenant_id).toBe(TENANT_A.id);
-      expect(payload.tenant_id).not.toBe(TENANT_B.id);
-    }
+    const insert = writes[0];
+    expect(insert.table).toBe("employee_profiles");
+    expect(insert.operation).toBe("insert");
+    expect(insert.payload).toBeDefined();
+
+    const payload = insert.payload as Record<string, unknown>;
+    expect(payload.tenant_id).toBe(TENANT_A.id);
+    expect(payload.tenant_id).not.toBe(TENANT_B.id);
+  });
+
+  it("usa o tenant de quem está autenticado, não um tenant fixo", async () => {
+    // Mesma ação, identidade do tenant B: o tenant gravado precisa acompanhar
+    // a membership, provando que não há valor constante embutido.
+    const fake = install(ownerB, {
+      from: { organization_members: { data: ownerB.membership, error: null } },
+    });
+
+    const result = await createEmployee(form(VALID_EMPLOYEE));
+    expect(result.success).toBe(true);
+
+    const writes = writeOperations(fake.calls);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].payload).toBeDefined();
+
+    const payload = writes[0].payload as Record<string, unknown>;
+    expect(payload.tenant_id).toBe(TENANT_B.id);
+    expect(payload.tenant_id).not.toBe(TENANT_A.id);
   });
 
   it("força status 'active' na criação", async () => {
     const fake = install(ownerA);
 
-    await createEmployee(form(VALID_EMPLOYEE));
+    const result = await createEmployee(form(VALID_EMPLOYEE));
+    expect(result.success).toBe(true);
 
-    const payload = writeOperations(fake.calls)[0].payload as Record<string, unknown>;
+    const writes = writeOperations(fake.calls);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].payload).toBeDefined();
+
+    const payload = writes[0].payload as Record<string, unknown>;
     expect(payload.status).toBe("active");
   });
 });
