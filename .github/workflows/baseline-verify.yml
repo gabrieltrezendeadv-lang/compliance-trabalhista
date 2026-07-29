@@ -77,6 +77,15 @@ jobs:
           "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -c "SELECT rolname FROM pg_roles WHERE rolname IN ('anon','authenticated','service_role') ORDER BY 1;"
 
       # ── 1ª rodada: restaurar o baseline e verificar ─────────────────────────
+      #
+      # O dump contém `CREATE SCHEMA public`, e a stack do Supabase já cria
+      # esse schema ao subir. Removê-lo antes da restauração é o que torna o
+      # snapshot aplicável tal como foi gerado, sem editar o arquivo.
+      # Seguro: aqui é um Postgres efêmero do runner; os schemas da plataforma
+      # (auth, storage, extensions) ficam intactos.
+      - name: Preparar schema public limpo
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS public CASCADE;"'
+
       - name: Restaurar schema.sql
         working-directory: ${{ github.workspace }}
         run: "$PGBIN/psql \"$DB_URL\" -v ON_ERROR_STOP=1 -f supabase/baseline/schema.sql"
@@ -130,6 +139,7 @@ jobs:
       - name: Restaurar o backup
         working-directory: ${{ github.workspace }}
         run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS public CASCADE;"
           "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f /tmp/backup.sql
           "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/baseline/security.sql
 
