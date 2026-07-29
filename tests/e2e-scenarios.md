@@ -1,5 +1,21 @@
 # E2E Test Scenarios — SEC-BLOCK1-CONSOLIDATION v1.2.1
 
+> **Estado na Etapa 1 (29/07/2026):** os 10 cenários abaixo continuam sendo
+> roteiro **manual**. Todos exigem banco com dados semeados e estão bloqueados
+> pelo R1 — registrados em [`db/README-R1.md`](./db/README-R1.md) §4 como
+> R1-E2E-01 a R1-E2E-07. Não foram convertidos em `test.skip`: representar
+> funcionalidade bloqueada com testes ignorados mascararia a lacuna.
+>
+> O E2E **automatizado** que já roda sem banco nem credenciais está em
+> [`e2e/public-routes.spec.ts`](./e2e/public-routes.spec.ts) — rotas públicas,
+> ausência de sessão, erro controlado, cabeçalhos de segurança e
+> acessibilidade básica.
+>
+> **Correção de rota:** o cenário E2E-01 abaixo aponta para
+> `/denuncia/{tenant_slug}`. A rota real implementada é `/report/[slug]`
+> (`src/app/(public)/report/[slug]/page.tsx`). O texto original foi preservado
+> para não reescrever o histórico do documento.
+
 ## Prerequisites
 
 - EXPAND migration applied (`fn_access_complaint_v2`, `fn_send_reporter_message_v2`, `fn_check_pin_rate_limit_v2` exist)

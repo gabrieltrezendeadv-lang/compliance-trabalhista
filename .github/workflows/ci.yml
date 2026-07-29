@@ -11,34 +11,130 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-and-build:
-    name: Lint & Build
+  # ══════════════════════════════════════════════════════════════════════════
+  # GATE BLOQUEANTE — lint + typecheck + testes + build
+  # ══════════════════════════════════════════════════════════════════════════
+  verify:
+    name: Verify
     runs-on: ubuntu-latest
 
-    env:
-      NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: placeholder-anon-key
-      NEXT_PUBLIC_APP_URL: http://localhost:3000
-
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          # Piso real da toolchain de testes: Node >= 20.19.0
+          # (vite@8, jsdom@29). Fixado em 22 LTS por margem.
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
         run: npm ci
 
-      - name: TypeScript check
-        run: npx tsc --noEmit
+      - name: Verify (lint + typecheck + test + build)
+        run: npm run verify
 
-      - name: Lint
-        run: npx eslint src/
+      # Sem `if: always()`: cobertura só faz sentido quando instalação e verify
+      # passaram. Rodá-la após falha produzia um segundo erro que mascarava a
+      # causa real (foi o que aconteceu na execução 30461227692, onde o npm ci
+      # falhou e este passo falhou em seguida por motivo derivado).
+      - name: Coverage report
+        run: npx --no-install vitest run --coverage
 
-      - name: P0 runtime guard tests
-        run: node tests/p0-runtime-guards.mjs
+      # O upload permanece com `if: always()` para preservar cobertura parcial
+      # quando o passo anterior falha. `if-no-files-found: ignore` garante que
+      # a ausência do diretório não acrescente uma falha própria.
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 14
 
-      - name: Build
-        run: npx next build
+  # ══════════════════════════════════════════════════════════════════════════
+  # GATE BLOQUEANTE — E2E sem banco e sem credenciais
+  # ══════════════════════════════════════════════════════════════════════════
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    needs: verify
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # --with-deps é necessário no runner Linux (bibliotecas de sistema).
+      # Localmente, no Windows, usa-se apenas `playwright install chromium`.
+      - name: Install Playwright browser
+        run: npx --no-install playwright install --with-deps chromium
+
+      - name: Run E2E
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # INFORMATIVO — não bloqueia o merge
+  #
+  # A linha de base é de 12 vulnerabilidades altas, todas de build-time/
+  # dev-time, em duas cadeias transitivas (brace-expansion→minimatch→eslint e
+  # postcss/sharp→next). Os "fixes" propostos pelo npm são destrutivos
+  # (next@9.3.3, eslint-config-next@0.2.4), por isso `npm audit fix` NÃO é
+  # executado — nem aqui, nem localmente.
+  #
+  # `continue-on-error` fica SOMENTE nos passos de audit, que retornam exit 1
+  # por causa das vulnerabilidades conhecidas. No nível do job ele foi
+  # removido: assim uma falha de infraestrutura (checkout, setup-node, npm ci)
+  # continua visível como falha real, em vez de ser silenciada junto com o
+  # resultado esperado do audit.
+  #
+  # Nenhum passo usa `|| true`: o código de saída real do comando é preservado
+  # e aparece no log.
+  # ══════════════════════════════════════════════════════════════════════════
+  audit:
+    name: Dependency audit (informativo)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit (high)
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+      - name: Save audit report
+        continue-on-error: true
+        run: npm audit --json > npm-audit.json
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: npm-audit
+          path: npm-audit.json
+          if-no-files-found: ignore
+          retention-days: 30
