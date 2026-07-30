@@ -90,23 +90,33 @@ Configuradas nesta fase e confirmadas por leitura da API:
 | Proteção | Valor |
 |---|---|
 | Revisor obrigatório | `gabrieltrezendeadv-lang` |
-| Prevenção de autoaprovação | **ativa** |
+| Prevenção de autoaprovação | **desativada** — ver §6.1 |
+| **Wait timer** | **15 minutos** |
 | Branches permitidas | somente `main` (política customizada) |
 | Secrets | **0** |
+| Variables | **0** |
 
 Um environment **dedicado** foi criado em vez de reusar `Production`. `Production` e `Preview` pertencem à integração do Vercel (`creator=vercel[bot]`, `task=deploy`): acrescentar revisor obrigatório a `Production` passaria a **bloquear os deploys da aplicação**, que é um efeito colateral grave e sem relação com migrations.
 
-### ⚠️ Consequência a resolver antes do primeiro uso
+### 6.1 Modo individual — decisão expressa
 
-O repositório tem **um único colaborador**. Como ele é também quem dispara o workflow, e a **prevenção de autoaprovação** impede aprovar a própria execução, **a rota está protegida mas inutilizável** enquanto não houver um segundo revisor.
+**O projeto tem um único colaborador**, `gabrieltrezendeadv-lang`, que é dono e administrador do repositório. Como ele é também quem dispara o workflow, manter a prevenção de autoaprovação tornaria a rota **protegida porém inutilizável**: não haveria ninguém para aprovar.
 
-Isso é deliberado: o padrão seguro é falhar fechado. Três saídas, em ordem de preferência:
+Diante disso, o **modo individual foi escolhido expressamente** pelo responsável pelo projeto: a prevenção de autoaprovação está **desativada**, e o mesmo usuário dispara e aprova.
 
-1. **Adicionar um segundo revisor** ao repositório e ao environment. Preserva as duas proteções intactas e é a única que mantém a separação real entre quem propõe e quem aprova.
-2. **Desligar a prevenção de autoaprovação** e compensar com um *wait timer* (10–15 min). A aprovação vira um segundo ato consciente, com registro em log, mas deixa de ser um segundo par de olhos. Enfraquece o controle — se for essa a escolha, que seja explícita.
-3. **Manter como está** e adiar a aplicação até existir um segundo revisor. Correto do ponto de vista de controle; deixa as duas migrations pendentes por mais tempo.
+**O controle compensatório é a espera de 15 minutos.** Ele não substitui um segundo par de olhos — nada substitui — mas troca a natureza do ato. Sem espera, disparar e aprovar são dois cliques seguidos, no mesmo estado de espírito, sob o mesmo impulso que motivou o disparo. Com quinze minutos de intervalo obrigatório, a aprovação vira uma **segunda decisão, tomada depois**, com tempo para reler o preflight, conferir a migration escolhida e desistir. É a diferença entre confirmar e reconsiderar.
 
-Recomendo (1). A rota inteira foi desenhada em torno de haver julgamento humano no meio; sem um segundo revisor, esse julgamento é uma formalidade.
+O que a espera de fato oferece:
+
+- **uma janela de arrependimento** — a execução pode ser cancelada antes de tocar o banco;
+- **um segundo ato deliberado**, registrado com carimbo de tempo no log de deployment;
+- **fricção proporcional ao risco** — quinze minutos são desprezíveis diante de uma migration pendente há dias, e caros o bastante para desencorajar a aplicação impulsiva.
+
+O que ela **não** oferece, e é preciso dizer: nenhuma revisão independente. Quem aprova é quem propôs, e conhece a mudança pelos mesmos olhos com que a escreveu. Um erro de julgamento não é apanhado por espera nenhuma.
+
+O que continua segurando a rota, e não depende de julgamento humano: as oito pré-condições (P1–P8), a restrição à `main`, o vínculo com o projeto de produção declarado, o `--dry-run` obrigatório, a conferência do ledger antes e depois, e a verificação independente pós-aplicação. **O revisor humano é a última camada, não a única.**
+
+> **Esta decisão deve ser revista assim que existir um segundo colaborador técnico de confiança.** Nesse momento: adicione-o como revisor do environment, reative a prevenção de autoaprovação e considere reduzir ou remover a espera — que existe para compensar a ausência dele, e deixa de ter função quando ele existir. Atualize esta seção junto, para que o repositório não continue afirmando uma restrição que já não vale.
 
 ## 7. `EXECUTE` para `PUBLIC` — agora obrigatória
 
