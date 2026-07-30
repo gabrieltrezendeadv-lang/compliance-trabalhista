@@ -292,9 +292,12 @@ test("SIM-13: a análise simulada continua igual à do workflow", () => {
 // 5. AUSÊNCIA DE VAZAMENTO DO SECRET
 // ══════════════════════════════════════════════════════════════════════════
 test("SIM-14: o parser de credencial não imprime senha, host nem URL", () => {
+  // Conexão DIRETA declarada: host `db.<ref>...` com usuário `postgres`.
+  // Misturar usuário de pooler com host direto é recusado pelo vínculo de
+  // destino — é o quarto caso de SIM-18, e não serve de fixture aqui.
   const SENHA = "s3nh4-Ultra-Secreta-XYZ";
   const HOST = "db.tvwgzpgyfdfrbdaeoqzl.supabase.co";
-  const URL = `postgresql://postgres.tvwgzpgyfdfrbdaeoqzl:${SENHA}@${HOST}:5432/postgres`;
+  const URL = `postgresql://postgres:${SENHA}@${HOST}:5432/postgres`;
 
   const envFile = path.join(tmp, "github-env.txt");
   fs.writeFileSync(envFile, "", "utf8");
@@ -349,11 +352,16 @@ test("SIM-15: o parser recusa URL sem senha, sem host ou de esquema errado", () 
     assert.equal(r.code, 1, `deveria recusar: ${JSON.stringify(url)}`);
     assert.match(r.out, /FALHA:/);
     // A mensagem pode usar a PALAVRA "senha"; o que ela não pode é ecoar o
-    // VALOR recebido.
+    // VALOR recebido. As linhas `::add-mask::` são a proteção, não o vazamento:
+    // o GitHub as consome e nunca as renderiza — mesma exclusão de SIM-14.
+    const semMascaras = r.out
+      .split("\n")
+      .filter((l) => !l.startsWith("::add-mask::"))
+      .join("\n");
     if (url !== "") {
       assert.ok(
-        !r.out.includes(url),
-        `a mensagem de erro ecoou a URL recebida:\n${r.out}`
+        !semMascaras.includes(url),
+        `a mensagem de erro ecoou a URL recebida:\n${semMascaras}`
       );
     }
     assert.ok(!r.out.includes("senha@"), "a mensagem ecoou credencial embutida");
@@ -369,6 +377,157 @@ test("SIM-16: a guarda de loopback recusa banco local na rota de produção", ()
   const ok = shell(script, { PGHOST: "db.exemplo.supabase.co" });
   assert.equal(ok.code, 0, ok.out);
   assert.doesNotMatch(ok.out, /db\.exemplo\.supabase\.co/, "o host não pode ir para o log");
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 6. DESTINO AMARRADO AO PROJETO DE PRODUÇÃO
+// ══════════════════════════════════════════════════════════════════════════
+const ALVO = JSON.parse(fs.readFileSync(path.join(raiz, "scripts/ci/production-target.json"), "utf8"));
+const REF = ALVO.project_ref;
+const SENHA = "s3nh4-Ultra-Secreta-XYZ";
+
+/** Roda o parser real e devolve {code, out, env}. */
+function parse(url) {
+  const envFile = path.join(tmp, `env-${Math.abs(hash(url))}.txt`);
+  fs.writeFileSync(envFile, "", "utf8");
+  const r = shell("node scripts/ci/parse-db-url.mjs", { DB_URL: url, GITHUB_ENV: envFile });
+  return { ...r, env: fs.readFileSync(envFile, "utf8") };
+}
+function hash(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return h;
+}
+
+const URL_DIRETA = `postgresql://postgres:${SENHA}@db.${REF}.supabase.co:5432/postgres`;
+const URL_POOLER = `postgresql://postgres.${REF}:${SENHA}@aws-0-sa-east-1.pooler.supabase.com:6543/postgres`;
+
+test("SIM-17: aceita as duas conexões declaradas do projeto de produção", () => {
+  for (const [modo, url] of [["direta", URL_DIRETA], ["pooler", URL_POOLER]]) {
+    const r = parse(url);
+    assert.equal(r.code, 0, `deveria aceitar a conexão ${modo}:\n${r.out}`);
+    assert.match(r.out, new RegExp(`projeto \\.+ ${REF}`));
+    assert.match(r.out, new RegExp(`modo \\.+ ${modo}`));
+  }
+});
+
+test("SIM-18: recusa destino de OUTRO projeto, ainda que seja Supabase válido", () => {
+  const outro = "abcdefghijklmnopqrst";
+  for (const url of [
+    `postgresql://postgres:${SENHA}@db.${outro}.supabase.co:5432/postgres`,
+    `postgresql://postgres.${outro}:${SENHA}@aws-0-sa-east-1.pooler.supabase.com:6543/postgres`,
+    `postgresql://postgres:${SENHA}@db.exemplo.com:5432/postgres`,
+    // Host correto, usuário de pooler: combinação não declarada.
+    `postgresql://postgres.${REF}:${SENHA}@db.${REF}.supabase.co:5432/postgres`,
+  ]) {
+    const r = parse(url);
+    assert.equal(r.code, 1, `deveria recusar: ${url.replace(SENHA, "***")}`);
+    assert.match(r.out, /não corresponde a nenhuma conexão declarada|não aparece nem no host nem no usuário/);
+    assert.equal(r.env.trim(), "", "não pode ter escrito PG* para destino recusado");
+  }
+});
+
+test("SIM-19: recusa sslmode disable, allow e prefer", () => {
+  for (const modo of ["disable", "allow", "prefer"]) {
+    const r = parse(`${URL_DIRETA}?sslmode=${modo}`);
+    assert.equal(r.code, 1, `deveria recusar sslmode=${modo}`);
+    assert.match(r.out, new RegExp(`sslmode="${modo}" é recusado`));
+    assert.equal(r.env.trim(), "", "não pode ter escrito PG* com sslmode fraco");
+  }
+});
+
+test("SIM-20: aceita require, verify-ca e verify-full; exige require quando ausente", () => {
+  for (const modo of ["require", "verify-ca", "verify-full"]) {
+    const r = parse(`${URL_DIRETA}?sslmode=${modo}`);
+    assert.equal(r.code, 0, `deveria aceitar sslmode=${modo}:\n${r.out}`);
+    assert.match(r.env, new RegExp(`^PGSSLMODE=${modo}$`, "m"));
+  }
+  const semSsl = parse(URL_DIRETA);
+  assert.equal(semSsl.code, 0);
+  assert.match(semSsl.env, /^PGSSLMODE=require$/m, "ausente deve virar require, não o default do libpq");
+  assert.match(semSsl.out, /exigido pela rota/);
+});
+
+test("SIM-21: recusa sslmode desconhecido — na dúvida, recusa", () => {
+  const r = parse(`${URL_DIRETA}?sslmode=talvez`);
+  assert.equal(r.code, 1);
+  assert.match(r.out, /não está na lista de aceitos/);
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 7. SANITIZAÇÃO DOS ARTEFATOS
+// ══════════════════════════════════════════════════════════════════════════
+test("SIM-22: o sanitizador remove URL, senha, usuário e host do log", () => {
+  const HOST = `db.${REF}.supabase.co`;
+  const USER = "postgres";
+  const cru = path.join(tmp, "cru.log");
+  const limpo = path.join(tmp, "limpo.log");
+
+  fs.writeFileSync(
+    cru,
+    [
+      "Connecting to remote database...",
+      `failed to connect to \`host=${HOST} user=${USER} database=postgres\`:`,
+      `dial error: ${URL_DIRETA}`,
+      `retrying with --db-url ${URL_DIRETA}`,
+      `password authentication failed for user "${USER}" (senha ${SENHA})`,
+      "Applying migration 20260730123613_revoke_public_webhook_execute.sql...",
+    ].join("\n"),
+    "utf8"
+  );
+
+  const r = shell(`node scripts/ci/sanitize-log.mjs "${cru}" "${limpo}"`, {
+    DB_URL: URL_DIRETA,
+    PGPASSWORD: SENHA,
+    PGUSER: USER,
+    PGHOST: HOST,
+  });
+  assert.equal(r.code, 0, r.out);
+
+  const texto = fs.readFileSync(limpo, "utf8");
+  for (const segredo of [URL_DIRETA, SENHA, HOST]) {
+    assert.ok(!texto.includes(segredo), `o sanitizado ainda contém ${segredo.slice(0, 14)}…`);
+  }
+  assert.ok(!/postgres(ql)?:\/\/[^«\s]*:[^«\s]*@/.test(texto), "sobrou URI com credencial");
+  // O que NÃO é sensível tem de sobreviver — senão o artefato não serve.
+  assert.match(texto, /Applying migration 20260730123613/, "a sanitização apagou informação útil");
+});
+
+test("SIM-23: o sanitizador redige credencial DESCONHECIDA, não só a esperada", () => {
+  const cru = path.join(tmp, "cru2.log");
+  const limpo = path.join(tmp, "limpo2.log");
+  const outra = "postgresql://outro_user:OutraSenha123@db.qualquercoisa.supabase.co:5432/postgres";
+  fs.writeFileSync(cru, `erro ao usar ${outra}\n`, "utf8");
+
+  // Sem nenhuma variável conhecida no ambiente: só a camada genérica age.
+  const r = shell(`node scripts/ci/sanitize-log.mjs "${cru}" "${limpo}"`, {
+    DB_URL: "",
+    PGPASSWORD: "",
+    PGUSER: "",
+    PGHOST: "",
+  });
+  assert.equal(r.code, 0, r.out);
+  const texto = fs.readFileSync(limpo, "utf8");
+  assert.ok(!texto.includes("OutraSenha123"), "credencial desconhecida não foi redigida");
+  assert.ok(!texto.includes(outra), "URI desconhecida não foi redigida");
+});
+
+test("SIM-24: log ausente vira artefato que declara a ausência, sem falhar", () => {
+  const limpo = path.join(tmp, "ausente.log");
+  const r = shell(`node scripts/ci/sanitize-log.mjs "${path.join(tmp, "nao-existe.log")}" "${limpo}"`, {});
+  assert.equal(r.code, 0, r.out);
+  assert.match(fs.readFileSync(limpo, "utf8"), /log ausente/);
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 8. VERIFICAÇÃO INDEPENDENTE PÓS-APLICAÇÃO
+// ══════════════════════════════════════════════════════════════════════════
+test("SIM-25: a rota recusa aplicar migration sem verificação independente", () => {
+  const script = runDoPasso("Verificação independente da migration aplicada", "apply");
+  // Versão inventada, sem arquivo correspondente.
+  const r = shell(script, { MIGRATION: "20260901000000_sem_verificacao.sql", PGBIN: "/usr/bin" });
+  assert.equal(r.code, 1, "deveria recusar migration sem verificação independente");
+  assert.match(r.out, /não existe verificação independente para 20260901000000/);
 });
 
 fs.rmSync(tmp, { recursive: true, force: true });

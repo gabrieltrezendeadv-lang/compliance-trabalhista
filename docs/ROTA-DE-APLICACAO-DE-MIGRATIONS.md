@@ -61,7 +61,15 @@ Um único secret, **`SUPABASE_DB_URL`**, no environment `db-production`. **Ele n
 
 `scripts/ci/parse-db-url.mjs` decompõe a URL em variáveis `PG*` e registra máscaras (`::add-mask::`) para senha, host e URL inteira **antes** de escrever qualquer coisa. Depois disso o `psql` conecta sem receber nada em `argv`.
 
+**Destino amarrado.** Recusar loopback é a guarda mais fraca — não olha *para onde* a conexão vai. `scripts/ci/production-target.json`, versionado, declara o `project_ref` de produção e as duas conexões aceitas (direta e pooler). O par (host, usuário) precisa bater com uma delas, **e** o ref precisa aparecer em pelo menos um dos dois: no modo pooler o host é compartilhado entre projetos, então o vínculo vem só do usuário. Uma credencial trocada por engano é recusada antes de qualquer conexão.
+
+**`sslmode` por lista de aceitos.** `require`, `verify-ca` e `verify-full` passam. `disable`, `allow` e `prefer` são **recusados**: `disable` garante texto claro, e os outros dois o aceitam em silêncio quando o servidor não oferece TLS. Ausente na URL vira `require` — nunca o default do libpq.
+
 **Limite declarado:** `supabase db push` exige `--db-url`. Nesse único ponto a URL passa por `argv` de um processo dentro do runner efêmero. Não há alternativa no CLI, e gravar a credencial em arquivo seria pior. Nenhum passo usa `set -x` ou `--debug`, nenhum ecoa a URL, e AP-10 reprova se alguém tentar.
+
+**Artefatos sanitizados.** Os logs crus do CLI **não são publicados** — vão para `/tmp` e passam por `scripts/ci/sanitize-log.mjs`, que redige em duas camadas: os valores conhecidos (URL, senha, usuário, host, inclusive percent-encoded) e, genericamente, qualquer URI postgres com credencial, qualquer `--db-url <algo>` e qualquer host Supabase. Se algo conhecido resistir, o script apaga a saída e falha. Antes da publicação ainda há uma varredura final sobre todo o `artifacts/`.
+
+**Actions fixadas em SHA.** As quatro Actions da rota estão presas a commits imutáveis, não a tags ou branches. `supabase/setup-cli@v1` era um **branch** — alvo móvel — e agora está em `ab05898…` (v1.7.1). AP-21 reprova qualquer `uses:` que não seja um SHA de 40 dígitos.
 
 ### Como cadastrar o secret, quando for a hora
 
@@ -110,7 +118,7 @@ O estado avaliado é *as migrations do repositório aplicadas a um banco limpo* 
 
 ## 8. O que a rota NÃO faz
 
-- **Não valida o efeito da migration no schema.** Isso é papel das pós-condições de catálogo embutidas em cada migration e do `migration-rebuild-verify`. Migration sem pós-condição própria fica com o efeito não verificado por esta rota, e o veredito diz isso em voz alta.
+- **Não testa comportamento com dados.** As verificações pós-aplicação em `scripts/ci/verify-applied/<versão>.sql` conferem o **efeito no catálogo**, são somente leitura (`BEGIN TRANSACTION READ ONLY` … `ROLLBACK`) e são **independentes** das pós-condições da própria migration — que rodam na mesma transação, escritas pela mesma pessoa e com as mesmas suposições, e por isso erram junto quando a suposição está errada (Fase 5A e TG-12C). O que elas **não** fazem é criar fixtures: fabricar usuários e memberships em produção dispara gatilhos reais (`on_auth_user_created` escreve em `public.profiles`) e consome sequências. T1–T9 vivem no banco descartável do `migration-rebuild-verify`. AP-19 exige um arquivo de verificação para cada opção do `choice` e reprova `INSERT`/`UPDATE`/`DELETE`/`CREATE TEMP`/`set_config` neles.
 - **Não aplica rollback.** Os rollbacks existem em `supabase/rollbacks/` e são aplicados à mão, com decisão humana.
 - **Não cria, lê nem altera secrets.**
 - **Não foi executada de ponta a ponta.** Ver §9.
@@ -132,7 +140,14 @@ Testado por simulação, contra o **código real** — `tests/migration-apply-si
 | ausência de vazamento do secret | SIM-14, SIM-15 |
 | recusa de destino em loopback | SIM-16 |
 
-Mais `tests/migration-apply-guard.mjs`, 15 asserções estáticas sobre as propriedades que tornam a rota segura.
+| destino amarrado ao projeto de produção | SIM-17, SIM-18 |
+| `sslmode` fraco recusado | SIM-19, SIM-20, SIM-21 |
+| sanitização dos artefatos | SIM-22, SIM-23, SIM-24 |
+| verificação independente obrigatória | SIM-25 |
+
+Mais `tests/migration-apply-guard.mjs`, 21 asserções estáticas sobre as propriedades que tornam a rota segura.
+
+Todas as defesas foram verificadas **por mutação**: remover o `pipefail` de qualquer um dos três passos, tirar o `--yes`, desfixar uma Action, publicar log cru, remover a verificação independente, aceitar `sslmode=prefer` ou declarar um destino sem o project ref — as nove reprovam.
 
 **NÃO testado, e não simulado:** a conexão ao banco, o comportamento real do `supabase db push` e o efeito das migrations. Exigem credencial e banco de produção, que esta fase não autoriza.
 

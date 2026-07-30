@@ -76,7 +76,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Confirmação explícita
         env:
@@ -103,7 +103,7 @@ jobs:
           fi
           echo "origem confere: main"
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
@@ -138,7 +138,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Somente a partir da main
         run: |
@@ -156,11 +156,11 @@ jobs:
           sudo apt-get install -y -qq postgresql-client-17
           echo "PGBIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
 
-      - uses: supabase/setup-cli@v1
+      - uses: supabase/setup-cli@ab058987d8d6c725971f6cf9d0b5c98467e30bd1 # v1.7.1
         with:
           version: 2.110.0
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
@@ -215,8 +215,18 @@ jobs:
         env:
           MIGRATION: ${{ inputs.migration }}
         run: |
+          set -o pipefail
           node scripts/ci/assert-apply-preconditions.mjs "$MIGRATION" artifacts/ledger-antes.tsv \
-            | tee artifacts/preconditions.log
+            | tee /tmp/preconditions.raw.log
+
+      # Este log não vê a credencial — o script não recebe DB_URL. Passa pela
+      # sanitização mesmo assim: a regra "nada cru vira artefato" só protege
+      # enquanto não tiver exceções para discutir caso a caso.
+      - name: Sanitizar o log das pré-condições
+        if: always()
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: node scripts/ci/sanitize-log.mjs /tmp/preconditions.raw.log artifacts/preconditions.log
 
       # ── Isolar EXATAMENTE uma ────────────────────────────────────────────
       #
@@ -245,9 +255,17 @@ jobs:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           MIGRATION: ${{ inputs.migration }}
         run: |
-          supabase db push --dry-run --db-url "$DB_URL" 2>&1 | tee artifacts/dry-run.log
+          # pipefail é obrigatório: sem ele, `cmd | tee` devolve o status do
+          # TEE, que praticamente sempre é 0. Uma falha do CLI passaria
+          # despercebida e a rota seguiria para a aplicação achando que o
+          # dry-run correu bem.
+          set -o pipefail
+          # O log CRU vai para /tmp, fora de artifacts/: o CLI recebe a URL em
+          # --db-url e nada garante que não a repita numa mensagem de erro.
+          # Só a versão sanitizada é publicada.
+          supabase db push --dry-run --db-url "$DB_URL" 2>&1 | tee /tmp/dry-run.raw.log
           VERSAO="${MIGRATION%%_*}"
-          N=$(grep -c "${VERSAO}" artifacts/dry-run.log || true)
+          N=$(grep -c "${VERSAO}" /tmp/dry-run.raw.log || true)
           echo "linhas do dry-run citando ${VERSAO}: $N"
           if [ "$N" -lt 1 ]; then
             echo "RECUSADO: o dry-run não identificou a migration selecionada."
@@ -257,7 +275,7 @@ jobs:
           # versão é `_`, que é caractere de palavra. Com \b no fim, o padrão
           # não casa com nada — e a checagem passaria em silêncio justamente
           # quando houvesse outra versão. Encontrado pela simulação (SIM-12).
-          OUTRAS=$(grep -oE '202[0-9]{11}' artifacts/dry-run.log | sort -u | grep -v "^${VERSAO}$" || true)
+          OUTRAS=$(grep -oE '202[0-9]{11}' /tmp/dry-run.raw.log | sort -u | grep -v "^${VERSAO}$" || true)
           if [ -n "$OUTRAS" ]; then
             echo "RECUSADO: o dry-run identificou versões além da selecionada:"
             echo "$OUTRAS"
@@ -265,19 +283,31 @@ jobs:
           fi
           echo "dry-run identificou exatamente uma versão: $VERSAO"
 
+      - name: Sanitizar o log do dry-run
+        if: always()
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: node scripts/ci/sanitize-log.mjs /tmp/dry-run.raw.log artifacts/dry-run.log
+
       # Sem --include-all: as forward-only são POSTERIORES à última versão do
       # ledger remoto, então o push padrão já as alcança. `--include-all` serve
       # para arrastar versões anteriores ao último registro — exatamente o que
       # esta rota recusa.
       #
-      # NÃO VERIFICADO: se esta versão do CLI pede confirmação interativa em
-      # `db push`, o passo travará até o timeout em vez de aplicar. Não foi
-      # possível confirmar sem executar contra um banco real, o que esta fase
-      # não autoriza. É o primeiro ponto a observar na estreia da rota.
+      # `--yes` fecha a porta da confirmação interativa: sem ele, se esta versão
+      # do CLI perguntar, o passo ficaria pendurado até o timeout do job.
       - name: Aplicar — exatamente uma migration
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-        run: supabase db push --db-url "$DB_URL" 2>&1 | tee artifacts/push.log
+        run: |
+          set -o pipefail
+          supabase db push --yes --db-url "$DB_URL" 2>&1 | tee /tmp/push.raw.log
+
+      - name: Sanitizar o log da aplicação
+        if: always()
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: node scripts/ci/sanitize-log.mjs /tmp/push.raw.log artifacts/push.log
 
       # ── Devolver e provar que nada mudou no repositório ──────────────────
       - name: Devolver as forward-only reservadas
@@ -326,9 +356,69 @@ jobs:
           fi
           echo "delta confere: exatamente $VERSAO"
 
+      # ── Verificação independente do EFEITO ───────────────────────────────
+      #
+      # As pós-condições embutidas em cada migration rodam dentro da transação
+      # que a aplica, escritas pela mesma pessoa e com as mesmas suposições. Se
+      # a suposição estiver errada, elas erram junto — aconteceu na Fase 5A
+      # (`||` ambíguo) e na TG-12C (`\b` como fronteira de palavra). Esta é a
+      # segunda opinião, e roda depois, por fora, contra o banco já alterado.
+      #
+      # Somente leitura, somente catálogo: cada arquivo abre
+      # `BEGIN TRANSACTION READ ONLY` e fecha com `ROLLBACK`. Nenhuma fixture é
+      # criada — teste de comportamento com dados fabricados não roda em
+      # produção; ele vive no banco descartável do migration-rebuild-verify.
+      - name: Verificação independente da migration aplicada
+        env:
+          MIGRATION: ${{ inputs.migration }}
+        run: |
+          set -o pipefail
+          VERSAO="${MIGRATION%%_*}"
+          ARQUIVO="scripts/ci/verify-applied/${VERSAO}.sql"
+          if [ ! -f "$ARQUIVO" ]; then
+            echo "FALHA: não existe verificação independente para ${VERSAO}."
+            echo "Toda migration desta rota precisa de ${ARQUIVO} (AP-19 exige)."
+            exit 1
+          fi
+          echo "executando $ARQUIVO (somente leitura)"
+          "$PGBIN/psql" -v ON_ERROR_STOP=1 -f "$ARQUIVO" 2>&1 \
+            | tee /tmp/verify-applied.raw.log
+
+      - name: Sanitizar o log da verificação
+        if: always()
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: node scripts/ci/sanitize-log.mjs /tmp/verify-applied.raw.log artifacts/verify-applied.log
+
+      # Última barreira antes da publicação: varre tudo o que vai virar
+      # artefato atrás dos componentes da credencial. Se algo escapou da
+      # sanitização, o job falha e nada é publicado.
+      - name: Guarda — nenhum artefato contém credencial
+        if: always()
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          FALHA=0
+          for NOME in DB_URL PGPASSWORD PGUSER PGHOST; do
+            VALOR="${!NOME}"
+            [ -z "$VALOR" ] && continue
+            if grep -rqF -- "$VALOR" artifacts/ 2>/dev/null; then
+              echo "FALHA: $NOME aparece em algum artefato."
+              grep -rlF -- "$VALOR" artifacts/ 2>/dev/null
+              FALHA=1
+            fi
+          done
+          if grep -rqE 'postgres(ql)?://[^«[:space:]]*:[^«[:space:]]*@' artifacts/ 2>/dev/null; then
+            echo "FALHA: URI postgres com credencial em algum artefato."
+            grep -rlE 'postgres(ql)?://[^«[:space:]]*:[^«[:space:]]*@' artifacts/ 2>/dev/null
+            FALHA=1
+          fi
+          if [ "$FALHA" -eq 0 ]; then echo "nenhum componente de credencial encontrado em artifacts/"; fi
+          exit $FALHA
+
       - name: Publicar evidências
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: migration-apply-${{ github.run_id }}
           path: artifacts/
@@ -341,8 +431,9 @@ jobs:
           echo "ledger antes .... $(wc -l < artifacts/ledger-antes.tsv) versão(ões)"
           echo "ledger depois ... $(wc -l < artifacts/ledger-depois.tsv) versão(ões)"
           echo ""
-          echo "Esta rota NÃO valida o efeito da migration no schema. As"
-          echo "pós-condições de catálogo embutidas em cada migration fazem isso"
-          echo "no momento da aplicação, e o migration-rebuild-verify prova a"
-          echo "equivalência do conjunto. Se a migration não trouxer pós-condição"
-          echo "própria, o efeito permanece não verificado por esta rota."
+          echo "O efeito foi conferido por scripts/ci/verify-applied/, somente"
+          echo "leitura e independente das pós-condições da própria migration."
+          echo ""
+          echo "NÃO verificado aqui: comportamento com dados. Testes com fixtures"
+          echo "não rodam em produção — vivem no banco descartável do"
+          echo "migration-rebuild-verify."

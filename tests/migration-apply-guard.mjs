@@ -117,7 +117,7 @@ test("AP-06: o job de aplicação exige o environment protegido, e o preflight n
 
 test("AP-07: o dry-run é obrigatório e precede a aplicação", () => {
   const iDry = wf.indexOf("--dry-run");
-  const iPush = wf.indexOf("supabase db push --db-url");
+  const iPush = wf.indexOf("supabase db push --yes");
   assert.ok(iDry > 0, "não há --dry-run");
   assert.ok(iPush > 0, "não há aplicação");
   assert.ok(iDry < iPush, "o dry-run tem de vir ANTES da aplicação");
@@ -221,6 +221,148 @@ test("AP-15: nenhum grep da rota usa \\b para delimitar versão de migration", (
     [],
     `use o padrão sem \\b — a versão é seguida de "_":\n  ${suspeitas.join("\n  ")}`
   );
+});
+
+/** Devolve o bloco `run:` de um passo, pelo nome. */
+function runDoPasso(nome) {
+  const i = wf.indexOf(`- name: ${nome}\n`);
+  assert.ok(i >= 0, `passo "${nome}" não existe`);
+  const linhas = wf.slice(i).split("\n");
+  const iRun = linhas.findIndex((l) => /^\s+run: \|\s*$/.test(l));
+  assert.ok(iRun > 0 && iRun < 12, `passo "${nome}" não tem bloco "run: |"`);
+  const recuo = linhas[iRun].match(/^(\s+)/)[1].length;
+  const corpo = [];
+  for (const linha of linhas.slice(iRun + 1)) {
+    if (linha.trim() === "") { corpo.push(""); continue; }
+    if (linha.match(/^(\s*)/)[1].length <= recuo) break;
+    corpo.push(linha.slice(recuo + 2));
+  }
+  return corpo.join("\n").trimEnd();
+}
+
+test("AP-16: dry-run e aplicação usam `set -o pipefail`", () => {
+  // Sem pipefail, `cmd | tee` devolve o status do TEE — quase sempre 0. Uma
+  // falha do CLI passaria despercebida e a rota seguiria em frente achando que
+  // tudo correu bem. É o tipo de defeito que só aparece no dia ruim.
+  for (const passo of [
+    "Dry-run obrigatório",
+    "Aplicar — exatamente uma migration",
+    "Verificação independente da migration aplicada",
+  ]) {
+    // Comentários fora antes de medir posição: o próprio comentário que
+    // explica o pipefail cita `| tee`, e mediria contra si mesmo.
+    const script = runDoPasso(passo)
+      .split("\n")
+      .filter((l) => !/^\s*#/.test(l))
+      .join("\n");
+    assert.match(script, /set -o pipefail/, `"${passo}" perdeu o set -o pipefail`);
+    const iPipefail = script.indexOf("set -o pipefail");
+    const iPipe = script.indexOf("| tee");
+    assert.ok(iPipe < 0 || iPipefail < iPipe, `"${passo}": pipefail depois do pipe não protege nada`);
+  }
+});
+
+test("AP-17: `db push` de aplicação usa --yes (sem confirmação interativa)", () => {
+  const script = runDoPasso("Aplicar — exatamente uma migration");
+  assert.match(
+    script,
+    /supabase db push --yes /,
+    "sem --yes o passo fica pendurado até o timeout se o CLI perguntar"
+  );
+});
+
+test("AP-18: o destino é amarrado ao projeto de produção declarado", () => {
+  const alvoPath = "scripts/ci/production-target.json";
+  assert.ok(fs.existsSync(path.join(raiz, alvoPath)), `${alvoPath} ausente`);
+  const alvo = JSON.parse(ler(alvoPath));
+
+  assert.match(alvo.project_ref, /^[a-z]{20}$/, "project_ref com formato inesperado");
+  assert.ok(alvo.conexoes_aceitas.length > 0, "nenhuma conexão declarada");
+
+  // Toda conexão declarada tem de amarrar o ref no host OU no usuário. É o que
+  // impede alguém de acrescentar um destino solto ao arquivo.
+  for (const c of alvo.conexoes_aceitas) {
+    const noHost = (c.host ?? c.host_padrao ?? "").includes(alvo.project_ref);
+    const noUsuario = (c.usuario ?? "").includes(alvo.project_ref);
+    assert.ok(
+      noHost || noUsuario,
+      `conexão "${c.modo}" não amarra o project ref nem no host nem no usuário`
+    );
+  }
+
+  // sslmode: os três fracos têm de estar recusados e fora dos aceitos.
+  for (const fraco of ["disable", "allow", "prefer"]) {
+    assert.ok(alvo.sslmode_recusados.includes(fraco), `sslmode "${fraco}" não está recusado`);
+    assert.ok(!alvo.sslmode_aceitos.includes(fraco), `sslmode "${fraco}" está entre os aceitos`);
+  }
+
+  const parser = ler("scripts/ci/parse-db-url.mjs");
+  assert.match(parser, /production-target\.json/, "o parser não consulta o alvo declarado");
+  assert.match(parser, /sslmode_recusados/, "o parser não aplica a lista de sslmode recusados");
+});
+
+test("AP-19: toda opção do choice tem verificação independente pós-aplicação", () => {
+  for (const opcao of opcoesDoChoice()) {
+    const versao = opcao.slice(0, 14);
+    const arquivo = `scripts/ci/verify-applied/${versao}.sql`;
+    assert.ok(fs.existsSync(path.join(raiz, arquivo)), `${arquivo} ausente para ${opcao}`);
+
+    const sql = ler(arquivo);
+    // Somente leitura, de verdade.
+    assert.match(sql, /BEGIN TRANSACTION READ ONLY;/, `${arquivo}: transação não é READ ONLY`);
+    assert.match(sql, /^ROLLBACK;$/m, `${arquivo}: não termina em ROLLBACK`);
+    assert.doesNotMatch(sql, /^\s*COMMIT;/m, `${arquivo}: contém COMMIT`);
+
+    // Sem fixtures: nada de escrever em produção para testar comportamento.
+    const executavel = sql.replace(/--[^\n]*/g, " ");
+    for (const proibido of [/\bINSERT\s+INTO\b/i, /\bUPDATE\s+\w+\s+SET\b/i, /\bDELETE\s+FROM\b/i, /\bCREATE\s+(TEMP|TEMPORARY)\b/i, /set_config\s*\(/i]) {
+      assert.doesNotMatch(executavel, proibido, `${arquivo}: cria ou altera dado em produção`);
+    }
+    // O `\b` do PostgreSQL é backspace — mesma armadilha da TG-12C.
+    assert.doesNotMatch(executavel, /\\b/, `${arquivo}: usa \\b em regex do PostgreSQL; use \\y`);
+  }
+
+  assert.match(wf, /verify-applied\/\$\{VERSAO\}\.sql/, "a rota não executa a verificação independente");
+});
+
+test("AP-20: logs crus não são publicados; só os sanitizados", () => {
+  const executavel = wf.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+  // O `tee` dos passos que veem a credencial tem de ir para fora de artifacts/.
+  for (const m of executavel.matchAll(/\| tee (\S+)/g)) {
+    assert.ok(
+      !m[1].startsWith("artifacts/"),
+      `log cru publicado diretamente: ${m[1]} — sanitize antes`
+    );
+  }
+  // E cada log cru precisa de um passo de sanitização correspondente.
+  for (const cru of [
+    "/tmp/dry-run.raw.log",
+    "/tmp/push.raw.log",
+    "/tmp/verify-applied.raw.log",
+    "/tmp/preconditions.raw.log",
+  ]) {
+    assert.ok(
+      executavel.includes(`sanitize-log.mjs ${cru} artifacts/`),
+      `${cru} não é sanitizado antes de virar artefato`
+    );
+  }
+  assert.ok(fs.existsSync(path.join(raiz, "scripts/ci/sanitize-log.mjs")), "sanitize-log.mjs ausente");
+  // E a varredura final tem de existir.
+  assert.match(executavel, /Guarda — nenhum artefato contém credencial/);
+});
+
+test("AP-21: todas as Actions da rota estão fixadas em SHA imutável", () => {
+  const usos = [...wf.matchAll(/uses:\s*(\S+)/g)].map((m) => m[1]);
+  assert.ok(usos.length >= 4, "esperava pelo menos quatro Actions na rota");
+  for (const uso of usos) {
+    const [, ref] = uso.split("@");
+    assert.ok(ref, `uses sem ref: ${uso}`);
+    assert.match(
+      ref,
+      /^[0-9a-f]{40}$/,
+      `${uso} não está fixado em SHA de 40 dígitos — tag e branch são alvos móveis`
+    );
+  }
 });
 
 console.log("");
