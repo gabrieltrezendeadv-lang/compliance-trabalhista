@@ -116,7 +116,7 @@ jobs:
       # não começa.
       - name: Guardas de congelamento e classificação
         run: |
-          node tests/verify-recovered-migrations.mjs
+          node tests/verify-recovered-migrations.mjs supabase/migrations
           node tests/migration-freeze-guard.mjs
           node tests/migration-classification-guard.mjs
           node tests/migration-apply-guard.mjs

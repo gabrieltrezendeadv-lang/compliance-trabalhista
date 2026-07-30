@@ -365,6 +365,29 @@ test("AP-21: todas as Actions da rota estão fixadas em SHA imutável", () => {
   }
 });
 
+test("AP-22: verify-recovered-migrations.mjs é chamada COM o diretório", () => {
+  // O script exige o diretório em argv[2] e sai com 2 se ele faltar. A rota
+  // nascida na Fase 6B.1 o invocava sem argumento: o preflight morria no
+  // primeiro passo de guarda, em toda execução, e a rota nunca chegava a
+  // convocar o revisor. Foi assim que a estreia falhou.
+  //
+  // AP-12 não pegou porque conferia se a rota MENCIONA as guardas, não se as
+  // INVOCA de forma que funcione. Mencionar não é executar.
+  const chamadas = wf
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .filter((l) => l.includes("verify-recovered-migrations.mjs"));
+
+  assert.ok(chamadas.length > 0, "a rota não invoca verify-recovered-migrations.mjs");
+  for (const linha of chamadas) {
+    assert.match(
+      linha,
+      /verify-recovered-migrations\.mjs\s+supabase\/migrations\b/,
+      `chamada sem o diretório — o script sai com 2: ${linha.trim()}`
+    );
+  }
+});
+
 console.log("");
 console.log(`Migration apply guard: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
