@@ -530,6 +530,28 @@ test("SIM-25: a rota recusa aplicar migration sem verificação independente", (
   assert.match(r.out, /não existe verificação independente para 20260901000000/);
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// 9. AS GUARDAS DO PREFLIGHT REALMENTE RODAM
+// ══════════════════════════════════════════════════════════════════════════
+test("SIM-26: o passo de guardas do preflight executa e passa", () => {
+  // Asserção de EXECUÇÃO, não de texto. A estreia da rota falhou porque
+  // `verify-recovered-migrations.mjs` era invocada sem o diretório e saía com
+  // 2 — o preflight morria no primeiro passo, sempre. AP-12 conferia que a
+  // rota MENCIONA as guardas; nenhuma conferia que ela consegue RODÁ-LAS.
+  //
+  // Este teste roda o bloco de shell extraído do próprio workflow. Qualquer
+  // guarda invocada de forma que não funcione — argumento faltando, caminho
+  // errado, arquivo removido — reprova aqui, e não só na estreia em produção.
+  const script = runDoPasso("Guardas de congelamento e classificação", "preflight");
+  const r = shell(script, {});
+  assert.equal(
+    r.code,
+    0,
+    `o passo de guardas do preflight falhou (exit ${r.code}):\n${r.out}`
+  );
+  assert.match(r.out, /36/, "a verificação das 36 históricas não produziu saída reconhecível");
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log("");
