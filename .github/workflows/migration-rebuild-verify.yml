@@ -1,14 +1,15 @@
 name: Migration rebuild verify
 
 # =============================================================================
-# FASE 4 — as 36 migrations canônicas, aplicadas em sequência, reproduzem o
-# baseline?
+# As migrations do repositório, aplicadas em sequência, reproduzem o baseline?
 #
-# Que os 36 arquivos de supabase/migrations/ sejam cópia fiel do SQL registrado
-# em supabase_migrations.schema_migrations está provado por md5_norm (36/36).
-# Isso NÃO prova que aplicá-los em ordem, num banco vazio, produza o schema
-# registrado em supabase/baseline/. É essa segunda afirmação que este workflow
-# testa.
+# Que os 36 arquivos históricos de supabase/migrations/ sejam cópia fiel do SQL
+# registrado em supabase_migrations.schema_migrations está provado por md5_norm
+# (36/36). Isso NÃO prova que aplicá-los em ordem, num banco vazio, produza o
+# schema registrado em supabase/baseline/. É essa segunda afirmação que este
+# workflow testa — e desde a Fase 5 ele cobre também as migrations forward-only
+# criadas depois da reconciliação, que o manifesto não registra porque não foram
+# aplicadas remotamente.
 #
 # Duas comparações, porque o snapshot tem duas metades:
 #
@@ -108,11 +109,14 @@ jobs:
           } | tee artifacts/versoes.txt
 
       # ── Preflight ───────────────────────────────────────────────────────────
-      - name: Preflight — exatamente 36 migrations
+      # Antes da primeira migration forward-only este passo exigia exatamente 36
+      # arquivos. A contagem passou a ser classificada: as 36 do manifesto
+      # continuam obrigatórias e congeladas, e migrations posteriores são
+      # permitidas apenas com versão maior que a última histórica. A guarda
+      # tests/migration-classification-guard.mjs exerce as duas metades.
+      - name: Preflight — 36 históricas congeladas + forward-only posteriores
         run: |
-          N=$(find supabase/migrations -maxdepth 1 -name '*.sql' | wc -l)
-          echo "arquivos .sql em supabase/migrations: $N"
-          [ "$N" -eq 36 ] || { echo "FALHA: esperadas 36 migrations, encontradas $N"; exit 1; }
+          node tests/migration-classification-guard.mjs
           echo "ordem de aplicação (lexicográfica = cronológica):"
           find supabase/migrations -maxdepth 1 -name '*.sql' -printf '%f\n' | sort | nl
 
@@ -233,6 +237,43 @@ jobs:
             -f scripts/ci/extract-security.sql > artifacts/rebuilt-security.txt
           wc -l artifacts/rebuilt-security.txt
 
+      # Asserção geral, sem exceção nominal: NENHUMA rotina de `public` pode
+      # conceder EXECUTE a PUBLIC. Considera proacl nulo via acldefault, porque
+      # o default do PostgreSQL para funções INCLUI PUBLIC — filtrar
+      # `proacl IS NOT NULL` deixaria passar exatamente o caso perigoso.
+      #
+      # O passo NÃO aborta o job: registra o resultado e deixa o Veredito
+      # reprovar. A asserção roda contra o banco RECONSTRUÍDO, que a fase B
+      # destrói ao restaurar o baseline — se ela abortasse aqui, o diff
+      # estrutural, o piso de ruído e a comparação de segurança nunca seriam
+      # produzidos, e uma falha da asserção levaria consigo toda a outra
+      # evidência. Foi exatamente o que aconteceu na primeira execução desta
+      # branch, por um erro de tipo na própria consulta.
+      - name: Asserção — nenhuma rotina de public concede EXECUTE a PUBLIC
+        id: publicexec
+        run: |
+          set -o pipefail
+          if "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
+               -f scripts/ci/assert-no-public-execute.sql 2>&1 \
+               | tee artifacts/assert-public-execute.log; then
+            echo "resultado=ok" >> "$GITHUB_OUTPUT"
+            echo "asserção aprovada"
+          else
+            echo "resultado=reprovada" >> "$GITHUB_OUTPUT"
+            echo "ASSERÇÃO REPROVADA — o Veredito falhará. Log preservado como artifact."
+          fi
+
+      # ACL concreta da função corrigida, registrada como evidência do efeito da
+      # migration forward-only. Consulta de leitura; não altera privilégio algum.
+      - name: ACL de fn_process_webhook_event após a correção
+        run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -q -A -t -c "
+            SELECT p.oid::regprocedure::text || '  ->  ' ||
+                   COALESCE(p.proacl, acldefault('f', p.proowner))::text
+              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'public' AND p.proname = 'fn_process_webhook_event'
+             ORDER BY 1;" | tee artifacts/acl-webhook.txt
+
       # ── Piso de ruído: restaurar o baseline no MESMO descartável ────────────
       #
       # A partir daqui o schema `public` reconstruído é destruído. Tudo que
@@ -288,15 +329,52 @@ jobs:
           echo "normalizado=$NORM" >> "$GITHUB_OUTPUT"
           [ "$NORM" -eq 0 ] || { echo "--- diff estrutural normalizado (primeiras 400 linhas) ---"; head -400 artifacts/diff-estrutural-normalizado.diff; }
 
-      - name: Diff — segurança (extração × extração)
+      # O diff de segurança é classificado por categoria, e não tratado como um
+      # número só. A Fase 4C documentou três categorias divergentes por motivo
+      # conhecido — ACL de tabela (ambiente), default-acl e schema-acl (não
+      # comparáveis por causa do DROP SCHEMA da fase B). Elas são apresentadas,
+      # nunca ocultadas, e não bloqueiam.
+      #
+      # As categorias que DEVEM ser idênticas — RLS/dono de tabela, propriedades
+      # de função, ACL de função e policies — bloqueiam. É em `funcao-acl` que o
+      # efeito desta correção aparece.
+      - name: Diff — segurança (extração × extração), por categoria
         id: seguranca
         run: |
           diff -u artifacts/baseline-security.txt artifacts/rebuilt-security.txt \
             > artifacts/diff-seguranca.diff || true
-          N=$(wc -l < artifacts/diff-seguranca.diff)
-          echo "diff de segurança: $N linha(s)"
-          echo "linhas=$N" >> "$GITHUB_OUTPUT"
-          [ "$N" -eq 0 ] || { echo "--- diff de segurança (primeiras 400 linhas) ---"; head -400 artifacts/diff-seguranca.diff; }
+          TOTAL=$(wc -l < artifacts/diff-seguranca.diff)
+          echo "diff de segurança, total: $TOTAL linha(s)"
+
+          conta() { grep -cE "^[+-]$1\|" artifacts/diff-seguranca.diff || true; }
+          C1=$(conta 1); C2=$(conta 2); C3=$(conta 3)
+          C4=$(conta 4); C5=$(conta 5); C6=$(conta 6); C7=$(conta 7)
+
+          {
+            echo "categoria                        linhas   bloqueia?"
+            echo "1 schema-acl .................. $C1        não (documentada, Fase 4C §6.3)"
+            echo "2 default-acl ................. $C2        não (não comparável, Fase 4C §6.3)"
+            echo "4 tabela-acl .................. $C4        não (ambiente, Fase 4C §6.2)"
+            echo "3 tabela (RLS/force/dono) ..... $C3        SIM"
+            echo "5 funcao (secdef/search_path) . $C5        SIM"
+            echo "6 funcao-acl .................. $C6        SIM"
+            echo "7 policy ...................... $C7        SIM"
+          } | tee artifacts/diff-seguranca-categorias.txt
+
+          BLOQUEIA=$((C3 + C5 + C6 + C7))
+          echo "bloqueia=$BLOQUEIA" >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+          grep -E "^[+-][3567]\|" artifacts/diff-seguranca.diff \
+            > artifacts/diff-seguranca-bloqueante.diff || true
+          if [ "$BLOQUEIA" -ne 0 ]; then
+            echo "--- divergências BLOQUEANTES ---"
+            head -200 artifacts/diff-seguranca-bloqueante.diff
+          fi
+          grep -E "^[+-][124]\|" artifacts/diff-seguranca.diff \
+            > artifacts/diff-seguranca-documentado.diff || true
+          echo "--- amostra das categorias documentadas (20 linhas) ---"
+          head -20 artifacts/diff-seguranca-documentado.diff
 
       - name: Guarda — nenhuma credencial ou vínculo surgiu durante o job
         if: always()
@@ -319,15 +397,28 @@ jobs:
         run: |
           PISO="${{ steps.piso.outputs.linhas }}"
           NORM="${{ steps.estrutura.outputs.normalizado }}"
-          SEG="${{ steps.seguranca.outputs.linhas }}"
-          echo "piso de ruído ............ $PISO linha(s) de diff"
-          echo "estrutura normalizada .... $NORM linha(s) de diff"
-          echo "segurança ................ $SEG linha(s) de diff"
+          SEG_BLOQ="${{ steps.seguranca.outputs.bloqueia }}"
+          SEG_TOTAL="${{ steps.seguranca.outputs.total }}"
+          PUBEXEC="${{ steps.publicexec.outputs.resultado }}"
+          echo "piso de ruído ................... $PISO linha(s) de diff"
+          echo "estrutura normalizada ........... $NORM linha(s) de diff"
+          echo "segurança, bloqueante ........... $SEG_BLOQ linha(s)"
+          echo "segurança, total ................ $SEG_TOTAL linha(s) (inclui categorias documentadas)"
+          echo "EXECUTE para PUBLIC ............. $PUBEXEC"
           FALHA=0
+          [ "$PUBEXEC" = "ok" ] || { echo "REPROVADO: a asserção de EXECUTE para PUBLIC não passou — ver artifacts/assert-public-execute.log"; FALHA=1; }
           [ "$NORM" -eq 0 ] || { echo "REPROVADO: a estrutura reconstruída difere do snapshot"; FALHA=1; }
-          [ "$SEG" -eq 0 ] || { echo "REPROVADO: as propriedades de segurança diferem do baseline"; FALHA=1; }
+          [ "$SEG_BLOQ" -eq 0 ] || { echo "REPROVADO: divergência de segurança em categoria que deve ser idêntica (RLS, propriedades de função, ACL de função ou policy)"; FALHA=1; }
           [ "$PISO" -eq 0 ] || echo "ATENÇÃO: o piso de ruído não é vazio — parte do diff acima pode ser round-trip do pg_dump, e não defeito de migration. Classificar antes de concluir."
-          [ "$FALHA" -eq 0 ] && echo "APROVADO: as 36 migrations reproduzem estrutura e segurança do baseline."
+          if [ "$SEG_TOTAL" -ne "$SEG_BLOQ" ]; then
+            echo ""
+            echo "NÃO BLOQUEANTE, e não ocultado: permanecem as divergências de ACL de"
+            echo "tabela, default privileges e schema ACL já documentadas na Fase 4C"
+            echo "(supabase/baseline/PHASE-4C-REBUILD-REPORT.md §6.2 e §6.3). Elas exigem"
+            echo "decisão própria e não foram tratadas aqui. Ver"
+            echo "artifacts/diff-seguranca-categorias.txt."
+          fi
+          [ "$FALHA" -eq 0 ] && echo "APROVADO: a reconstrução reproduz a estrutura do snapshot e as categorias de segurança que devem ser idênticas."
           exit $FALHA
 
       - name: Derrubar a stack

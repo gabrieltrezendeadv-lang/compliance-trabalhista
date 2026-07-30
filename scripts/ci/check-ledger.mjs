@@ -72,18 +72,32 @@ for (const [version, n] of contagem) {
   if (n > 1) problemas.push(`versão duplicada no ledger: ${version} (${n}×)`);
 }
 
-// ── Ausência e excesso ──────────────────────────────────────────────────────
+// ── Ausência, e classificação do excedente ──────────────────────────────────
+//
+// Antes da primeira migration forward-only, qualquer versão fora do manifesto
+// era violação. Agora o ledger legitimamente contém as 36 históricas MAIS as
+// forward-only aplicadas na reconstrução. A distinção é por faixa: versão
+// posterior à última histórica é forward-only; versão fora do manifesto e
+// dentro ou antes da faixa congelada é intercalação, e continua reprovada.
 const esperadasPorVersao = new Map(esperadas.map((e) => [e.version, e]));
 const obtidasPorVersao = new Map(obtidas.map((o) => [o.version, o]));
+const limiteCongelado = esperadas.map((e) => e.version).sort().at(-1);
+const forwardOnly = [];
 
 for (const e of esperadas) {
   if (!obtidasPorVersao.has(e.version)) {
-    problemas.push(`versão AUSENTE do ledger: ${e.version} ${e.name}`);
+    problemas.push(`versão histórica AUSENTE do ledger: ${e.version} ${e.name}`);
   }
 }
 for (const o of obtidas) {
-  if (!esperadasPorVersao.has(o.version)) {
-    problemas.push(`versão ADICIONAL no ledger, fora do histórico: ${o.version} ${o.name}`);
+  if (esperadasPorVersao.has(o.version)) continue;
+  if (o.version > limiteCongelado) {
+    forwardOnly.push(o);
+  } else {
+    problemas.push(
+      `versão ${o.version} (${o.name}) não consta do manifesto e não é posterior ` +
+        `à última histórica ${limiteCongelado} — intercalada na faixa congelada`
+    );
   }
 }
 
@@ -96,8 +110,11 @@ for (const e of esperadas) {
 }
 
 // ── Contagem e ordem ────────────────────────────────────────────────────────
-if (obtidas.length !== esperadas.length) {
-  problemas.push(`ledger tem ${obtidas.length} versão(ões), esperadas ${esperadas.length}`);
+if (obtidas.length !== esperadas.length + forwardOnly.length) {
+  problemas.push(
+    `ledger tem ${obtidas.length} versão(ões); esperadas ` +
+      `${esperadas.length} históricas + ${forwardOnly.length} forward-only`
+  );
 }
 
 const ordenadas = [...obtidas].sort((a, b) => a.version.localeCompare(b.version));
@@ -109,15 +126,18 @@ if (obtidas.map((o) => o.version).join(",") !== ordenadas.map((o) => o.version).
 console.log("LEDGER LOCAL — supabase_migrations.schema_migrations");
 console.log("");
 console.log("  #   version          statements  name");
+const foSet = new Set(forwardOnly.map((o) => o.version));
 obtidas.forEach((o, i) => {
-  const marca = esperadasPorVersao.has(o.version) ? " " : "!";
+  const marca = esperadasPorVersao.has(o.version) ? " " : foSet.has(o.version) ? "+" : "!";
   console.log(
     `${marca} ${String(i + 1).padStart(2)}  ${o.version}  ${String(o.statements).padStart(10)}  ${o.name}`
   );
 });
 console.log("");
-console.log(`  versões no ledger .... ${obtidas.length}`);
-console.log(`  versões no manifesto . ${esperadas.length}`);
+console.log("  legenda: (espaço) histórica congelada · + forward-only · ! não classificada");
+console.log(`  históricas verificadas ... ${esperadas.length - problemas.filter((p) => p.includes("AUSENTE")).length}/${esperadas.length}`);
+console.log(`  forward-only ............. ${forwardOnly.length}`);
+console.log(`  total no ledger .......... ${obtidas.length}`);
 
 if (problemas.length > 0) {
   console.error("");
@@ -127,5 +147,9 @@ if (problemas.length > 0) {
 }
 
 console.log("");
-console.log(`✓ ledger confere: as ${esperadas.length} versões do histórico, sem ausência,`);
-console.log("  sem duplicidade, sem versão adicional, em ordem crescente.");
+console.log(
+  `✓ ledger confere: as ${esperadas.length} versões históricas, sem ausência, sem ` +
+    `duplicidade e sem intercalação, mais ${forwardOnly.length} forward-only, em ` +
+    `ordem crescente.`
+);
+for (const f of forwardOnly) console.log(`    forward-only: ${f.version} ${f.name}`);

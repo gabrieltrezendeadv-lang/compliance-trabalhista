@@ -126,5 +126,35 @@ de verdade (`supabase/.temp/project-ref`) tem de continuar ausente.
 | `assert-local-only.sh` | guarda de execução local; seções `pre`, `config`, `dburl`, `post` |
 | `remote-access-denylist.txt` | padrões proibidos, como dado |
 | `extract-security.sql` | extração somente leitura de ACL, RLS, propriedades de função e policies |
+| `assert-no-public-execute.sql` | asserção geral: nenhuma rotina de `public` concede `EXECUTE` a `PUBLIC` |
 | `normalize-schema-dump.mjs` | normalização auditável de dump estrutural |
-| `check-ledger.mjs` | conferência do ledger local contra `applied-migrations.tsv` |
+| `check-ledger.mjs` | conferência do ledger local: 36 históricas + forward-only |
+
+## A asserção de `EXECUTE` para `PUBLIC`
+
+[`assert-no-public-execute.sql`](assert-no-public-execute.sql) roda contra o banco
+reconstruído, depois de todas as migrations, e reprova se **qualquer** rotina de
+`public` conceder `EXECUTE` a `PUBLIC`.
+
+Três decisões que a tornam útil em vez de decorativa:
+
+**Sem exceção nominal.** Nenhuma allowlist, nenhum nome citado, nenhum
+`WHERE proname <> …`. `fn_process_webhook_event` não é tratada de forma especial:
+se voltar a conceder, a asserção reprova como reprovaria qualquer outra.
+
+**`COALESCE(proacl, acldefault('f', proowner))`.** `proacl` nulo não significa
+"sem privilégios" — significa "privilégios default do PostgreSQL", e o default
+para funções **inclui `EXECUTE` para `PUBLIC`**. Uma consulta que filtrasse
+`proacl IS NOT NULL` deixaria passar exatamente o caso perigoso: a função
+recém-criada que ninguém tocou.
+
+**Cobre todas as rotinas executáveis**, sem filtro de `prokind`: funções,
+procedures, agregados e window functions. A falha lista schema, nome, tipo,
+assinatura obtida por `pg_get_function_identity_arguments` e a ACL encontrada.
+
+Por que ela vive aqui e não em `supabase/checks/`: aquela pasta é reservada às
+consultas de auditoria transpostas dos 13 arquivos pré-reconciliação, e **MF-17**
+exige que seja estritamente leitura — a mensagem de erro desta asserção contém a
+palavra `REVOKE` como orientação de correção, o que reprovaria MF-17. Trocar a
+mensagem para agradar a guarda seria piorar a mensagem; o lugar certo é ao lado
+do restante do ferramental de CI.

@@ -18,6 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseManifest } from "./lib/manifest.mjs";
+import { classificarMigrations, resumo } from "./lib/migrations.mjs";
 import { sqlFingerprint } from "./lib/normalize-sql.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -54,44 +55,42 @@ const falha = (msg) => {
   erros += 1;
 };
 
-// ── VR-01: quantidade exata ──────────────────────────────────────────────────
-
-console.log(`esperadas: ${esperadas.length} · recuperadas: ${arquivos.length}`);
+// ── VR-01: as 36 históricas, mais as forward-only posteriores ────────────────
+//
+// Antes da primeira migration forward-only isto exigia exatamente 36 arquivos.
+// A classificação vive agora em ./lib/migrations.mjs, que separa as 36
+// congeladas das posteriores e reprova versão intercalada na faixa histórica.
+// As 36 continuam obrigatórias e conferidas por hash, uma a uma.
 
 if (esperadas.length !== 36) {
   falha(`o manifesto deveria listar 36 versões, lista ${esperadas.length}`);
 }
-if (arquivos.length !== 36) {
-  falha(`esperados 36 arquivos .sql, encontrados ${arquivos.length}`);
+
+const classificacao = classificarMigrations(dir, esperadas.map((e) => e.version));
+
+console.log(`manifesto: ${esperadas.length} versão(ões) históricas`);
+console.log(`diretório: ${resumo(classificacao)}`);
+if (classificacao.forwardOnly.length > 0) {
+  for (const f of classificacao.forwardOnly) {
+    console.log(`  forward-only: ${f.arquivo}`);
+  }
 }
 
-// ── VR-02: nome de arquivo válido e timestamp único ──────────────────────────
+for (const problema of classificacao.problemas) falha(problema);
+
+if (classificacao.historicas.length !== 36) {
+  falha(
+    `esperadas 36 migrations históricas no diretório, encontradas ` +
+      `${classificacao.historicas.length}`
+  );
+}
+
+// ── VR-02 / VR-03: nome, duplicidade e correspondência com o manifesto ───────
+//
+// Cobertos pela classificação acima: padrão de nome, versão duplicada, versão
+// histórica ausente e versão intercalada já entram em `problemas`.
 
 const PADRAO = /^(\d{14})_(.+)\.sql$/;
-const vistos = new Set();
-
-for (const arquivo of arquivos) {
-  const m = arquivo.match(PADRAO);
-  if (!m) {
-    falha(`nome inválido, esperado <14 dígitos>_<nome>.sql: ${arquivo}`);
-    continue;
-  }
-  const [, version] = m;
-  if (vistos.has(version)) {
-    falha(`timestamp duplicado: ${version}`);
-  }
-  vistos.add(version);
-}
-
-// ── VR-03: conjunto de versões idêntico ao manifesto ─────────────────────────
-
-const esperadasSet = new Set(esperadas.map((e) => e.version));
-
-const faltando = [...esperadasSet].filter((v) => !vistos.has(v)).sort();
-const sobrando = [...vistos].filter((v) => !esperadasSet.has(v)).sort();
-
-if (faltando.length) falha(`versões ausentes: ${faltando.join(", ")}`);
-if (sobrando.length) falha(`versões inesperadas: ${sobrando.join(", ")}`);
 
 // ── VR-04: conteúdo não vazio e assinatura correspondente ────────────────────
 
@@ -155,4 +154,7 @@ if (erros > 0) {
   console.error(`Validação da recuperação: ${erros} falha(s)`);
   process.exit(1);
 }
-console.log("Validação da recuperação: OK — 36 versões, assinaturas conferidas");
+console.log(
+  `Validação da recuperação: OK — ${conferidas} histórica(s) conferida(s) por ` +
+    `md5_norm, ${classificacao.forwardOnly.length} forward-only`
+);
