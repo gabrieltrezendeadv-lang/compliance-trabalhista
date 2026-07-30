@@ -62,9 +62,24 @@ SELECT valor, '00000000-0000-0000-0000-000000000000', 'authenticated',
        'authenticated', rotulo || '@tg12.test'
   FROM tg12_ids WHERE rotulo LIKE 'user_%';
 
+-- O INSERT acima em `auth.users` JÁ criou estes profiles: a migration
+-- 20260724123308 instala o gatilho `on_auth_user_created` (AFTER INSERT ON
+-- auth.users), que chama `public.fn_handle_new_user()` e insere em
+-- `public.profiles`. Sem `ON CONFLICT`, este statement colidia em
+-- `profiles_pkey` e abortava a transação ANTES de T1 — foi assim que a segunda
+-- execução da TG-12C reprovou.
+--
+-- Convergir com o gatilho em vez de competir com ele: o próprio
+-- `fn_handle_new_user` usa `ON CONFLICT (id) DO UPDATE`. Manter o statement
+-- (em vez de removê-lo) preserva os nomes determinísticos que os testes usam e
+-- continua correto se o gatilho um dia deixar de existir.
 INSERT INTO public.profiles (id, full_name, email)
 SELECT valor, rotulo, rotulo || '@tg12.test'
-  FROM tg12_ids WHERE rotulo LIKE 'user_%';
+  FROM tg12_ids
+ WHERE rotulo LIKE 'user_%'
+ON CONFLICT (id) DO UPDATE
+  SET full_name = EXCLUDED.full_name,
+      email = EXCLUDED.email;
 
 INSERT INTO public.organizations (id, name, slug)
 SELECT valor, rotulo, rotulo
