@@ -17,6 +17,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { parseManifest } from "./lib/manifest.mjs";
 import { sqlFingerprint } from "./lib/normalize-sql.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -30,14 +31,10 @@ if (!dir) {
 
 // ── Matriz esperada ──────────────────────────────────────────────────────────
 
-const esperadas = fs
-  .readFileSync(MANIFEST, "utf8")
-  .split("\n")
-  .filter((l) => l.trim() && !l.startsWith("#") && !l.startsWith("version\t"))
-  .map((l) => {
-    const [version, name, len, md5] = l.split("\t");
-    return { version, name, len: Number(len), md5 };
-  });
+// O parser vive em ./lib/manifest.mjs e faz trim por campo: sem isso, o CRLF
+// do checkout Windows contamina o md5_norm e TODAS as 36 linhas divergem, com
+// "esperado" e "obtido" idênticos na mensagem. Ver o cabeçalho daquele módulo.
+const esperadas = parseManifest(fs.readFileSync(MANIFEST, "utf8"));
 
 // ── Arquivos recuperados ─────────────────────────────────────────────────────
 

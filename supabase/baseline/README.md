@@ -51,6 +51,13 @@ preview separado, o banco é tratado **preventivamente como produção**.
 | `security.sql` | 15.162 | `ce07cdc41f5c1ce6714335ca43b931706be040c9e312bf1c9e9515124de5ce78` |
 | `verify.sql` | 12.811 | `a05916c10bce32ada9a8e3e471d34eac13296e03bdc5145e23e373a706b21084` |
 
+Os três acima são o snapshot e não mudam. Acompanham a pasta, sem hash fixo
+porque são documentação viva: [`README.md`](README.md),
+[`applied-migrations.tsv`](applied-migrations.tsv) — a matriz das 36 versões
+aplicadas — e
+[`PHASE-4C-REBUILD-REPORT.md`](PHASE-4C-REBUILD-REPORT.md) — o resultado do teste
+de reconstrução sequencial.
+
 Conferência:
 
 ```bash
@@ -82,6 +89,12 @@ divergência.
 > estruturalmente correto e **sem permissão alguma** para `anon`,
 > `authenticated` ou `service_role`. Os dois arquivos são obrigatórios, nesta
 > ordem.
+>
+> A Fase 4C não mudou isso. A estrutura passou a ter uma segunda via de
+> reconstrução — as 36 migrations —, mas **`security.sql` continua necessário**
+> para reconstrução completa pelo baseline, e é o único lugar do repositório
+> onde as permissões observadas em produção estão registradas. Ver
+> [`PHASE-4C-REBUILD-REPORT.md`](PHASE-4C-REBUILD-REPORT.md).
 
 ---
 
@@ -193,7 +206,14 @@ histórico.
 
 ## Estado do R1 e reconciliação futura
 
-O R1 tem duas metades, e só uma está resolvida.
+> **Atualização de 30/07/2026.** As duas metades descritas abaixo foram
+> resolvidas: o histórico foi reconciliado na Fase 3 e a reconstrução sequencial
+> foi validada por hash na Fase 4C. O que permanece aberto do R1 é a metade de
+> **permissões**, não a de estrutura. As subseções seguintes preservam o registro
+> do diagnóstico original — com as consequências já marcadas como superadas onde
+> for o caso — porque a cronologia é parte da evidência.
+
+O R1 tinha duas metades, e no diagnóstico original só uma estava resolvida.
 
 **✅ Estruturalmente resolvido.** O schema é reconstruível a partir do
 repositório e a reconstrução foi validada por restauração em ambiente
@@ -201,8 +221,8 @@ descartável. As 19 tabelas e 7 funções antes marcadas como "lacuna" nos
 documentos de baseline **existem** e estão capturadas aqui — incluindo
 `fn_resolve_tenant_id`, usada por 31 policies em 15 tabelas.
 
-**❌ Não totalmente resolvido.** O histórico de migrations **não está
-reconciliado**. Persiste uma divergência real:
+**❌ Não totalmente resolvido — à época.** O histórico de migrations **não estava
+reconciliado**. Havia então uma divergência real:
 
 - o banco registra **36 versões** aplicadas;
 - o repositório tem **13 arquivos** em `supabase/migrations/`, que cobrem **15**
@@ -225,19 +245,32 @@ Sete correspondências estão **provadas** por MD5 de SQL normalizado: três
 arquivos do repositório e quatro das seis migrations `sec001`–`sec006`
 preservadas na branch `origin/security/block1-deploy` (commit `9f99a92`).
 
-Consequência prática: um banco criado a partir de `supabase/migrations/`
-continua incompleto. Este snapshot contorna o problema para fins de
-reconstrução e teste, mas **não o resolve**.
+Consequência prática **até a Fase 3**: um banco criado a partir de
+`supabase/migrations/` era incompleto, e o snapshot contornava o problema sem
+resolvê-lo.
 
-### Risco imediato — migrations congeladas
+**Superado.** Depois da reconciliação (Fase 3) e da validação por reconstrução
+sequencial (Fase 4C), um banco criado a partir de `supabase/migrations/` tem o
+schema `public` **estruturalmente completo** — provado por igualdade de SHA-256
+contra este snapshot. O que continua incompleto nesse banco são as
+**permissões**: ver as pendências da Fase 4C acima e
+[`PHASE-4C-REBUILD-REPORT.md`](PHASE-4C-REBUILD-REPORT.md).
 
-Os 13 arquivos têm prefixos de versão **ausentes** do histórico remoto
-(interseção vazia). Como o CLI compara por timestamp, para ele os 13 estão
+### Risco resolvido na Fase 3 — divergência de histórico
+
+Os 13 arquivos tinham prefixos de versão **ausentes** do histórico remoto
+(interseção vazia). Como o CLI compara por timestamp, para ele os 13 estavam
 pendentes, e um `supabase db push` tentaria aplicá-los contra um banco onde o
 DDL equivalente já existe.
 
-As migrations estão **congeladas**, com guarda automática em
-`tests/migration-freeze-guard.mjs` executada pelo `verify`. Ver
+**Reconciliado.** `supabase/migrations/` passou a conter as 36 versões
+aplicadas, com prefixos idênticos aos do banco; a interseção, antes vazia, é
+total. Os 13 anteriores estão preservados em
+[`supabase/history/pre-reconciliation/`](../history/pre-reconciliation/README.md).
+
+A guarda `tests/migration-freeze-guard.mjs` continua em vigor e as proibições
+não foram relaxadas — `db push`, `migration up`, `migration repair` e
+`migration fetch` seguem bloqueados, agora sem nenhuma exceção nominal. Ver
 [`supabase/migrations/README.md`](../migrations/README.md).
 
 ### Estratégia aprovada para a reconciliação
@@ -245,25 +278,104 @@ As migrations estão **congeladas**, com guarda automática em
 Fonte de verdade: **o histórico registrado no banco**.
 
 1. **Fase 1 — congelamento.** Bloquear `db push` por documentação e guarda de
-   CI. Sem alteração de banco.
-2. **Fase 2 — recuperação.** `supabase migration fetch --linked` em ambiente
-   descartável, recuperando as 36 com os timestamps remotos. Operação de
-   leitura no banco.
-3. **Fase 3 — reconciliação.** Os 13 arquivos atuais migram para
+   CI. Sem alteração de banco. ✅ concluída
+2. **Fase 2 — recuperação.** Recuperar as 36 versões com os timestamps remotos,
+   por leitura de `supabase_migrations.schema_migrations`. ✅ concluída.
+
+   O plano original previa `supabase migration fetch` num ambiente descartável.
+   O workflow correspondente **falhou nas três tentativas**, sempre no mesmo
+   passo e sem escrever nada — `failed to connect to postgres`, antes mesmo da
+   validação de credencial. A recuperação saiu pelo plano B: leitura da coluna
+   `statements` pelo conector já autenticado, sem CLI, sem secret e sem conexão
+   direta ao banco.
+
+   Fidelidade provada por `md5_norm`: 36/36 contra
+   [`applied-migrations.tsv`](applied-migrations.tsv). O workflow temporário foi
+   removido na Fase 3, e com ele a exceção que permitia `migration fetch`.
+3. **Fase 3 — reconciliação.** Os 13 arquivos migram para
    `supabase/history/pre-reconciliation/` como evidência histórica — contêm
    comentários e queries de verificação que não foram aplicados — e
    `supabase/migrations/` passa a conter apenas o histórico canônico das 36.
-4. **Fase 4 — validação.** Aplicar as 36 em banco descartável e comparar com
-   `schema.sql`. Critério de sucesso: diff estrutural vazio.
+   ✅ concluída
+4. **Fase 4 — validação.** Aplicar as 36 em banco descartável e comparar com o
+   snapshot. Executada em 30/07/2026 pelo workflow manual
+   [`migration-rebuild-verify.yml`](../../.github/workflows/migration-rebuild-verify.yml);
+   ferramental e limites em [`scripts/ci/README.md`](../../scripts/ci/README.md);
+   resultado integral em
+   [`PHASE-4C-REBUILD-REPORT.md`](PHASE-4C-REBUILD-REPORT.md).
+
+   O critério tem **duas metades**, porque o snapshot também tem, e elas
+   terminaram em estados diferentes:
+
+   - **✅ Estrutural — APROVADA.** As 36 migrations, aplicadas em sequência num
+     banco vazio, reproduzem `schema.sql` com **igualdade de SHA-256**:
+     snapshot, banco reconstruído e banco restaurado do snapshot produzem dumps
+     normalizados byte-idênticos
+     (`1f938ed09ed834290729697e4db5e3e02c045d06ccda9d187ec7c4287d1c3c0c`). Diff
+     estrutural normalizado vazio, piso de ruído vazio, 36/36 aplicadas sem
+     falha, ledger com exatamente as 36 versões.
+   - **❌ Segurança / ACLs — NÃO APROVADA.** Uma divergência material, uma de
+     ambiente pendente de decisão, e duas categorias que ficaram não
+     comparáveis por limitação do procedimento.
+
+**O schema `public` é reconstruível pelas 36 migrations do repositório, e a
+equivalência estrutural não depende mais exclusivamente deste snapshot.** Para
+estrutura há agora duas vias independentes que provaram concordar. Para
+permissões continua havendo uma só: `security.sql`.
+
+### Pendências abertas pela Fase 4C
+
+**`fn_process_webhook_event` — exige migration forward-only separada.** A função
+`public.fn_process_webhook_event(text, …, timestamptz, jsonb)`, que é
+`SECURITY DEFINER`, fica executável por **`PUBLIC`** — e portanto por `anon` —
+num banco reconstruído a partir das 36 migrations. Nos extratos de segurança
+usados no teste, o baseline mostra a função executável apenas por `postgres` e
+`service_role`; nenhuma consulta ao banco de produção foi feita nessa
+verificação.
+
+A causa é preexistente e está no histórico já aplicado: `sec001` revoga de
+`PUBLIC` apenas as funções **existentes** e registra
+`ALTER DEFAULT PRIVILEGES skipped — requires superuser`, delegando a cada
+migration posterior o seu próprio `REVOKE`. Sete das oito migrations que criam
+função depois disso cumprem; `sec006_webhook_transactional_idempotent` não tem
+nenhum `REVOKE`. Em produção a lacuna não se manifesta porque SEC-005 foi
+aplicado manualmente pelo dashboard, fora das migrations — está em
+[`../manual/`](../manual/), e `tests/reconciliation-guards.mjs` exige que não
+esteja em `../migrations/`.
+
+**Default privileges e ACLs de tabela — exigem decisão explícita posterior.**
+Nenhuma das 36 migrations concede DML de tabela (exceção única:
+`priv_001_…_fns2_grants`, sobre `assessment_dispatches`). Em produção esses
+privilégios vieram dos *default privileges* da plataforma hospedada. O fato a
+decidir é que **as ACLs de tabela de produção não estão no repositório**: ou
+passam a ser parte do histórico versionado, ou se declara formalmente que a
+contenção é a RLS — reproduzida com exatidão, 39/39 tabelas e 78/78 policies — e
+que os grants de tabela são responsabilidade da plataforma. Não é diferença
+cosmética, e não foi tratada no PR da reconciliação.
+
+**`schema.sql` não contém privilégios.** Consequência do `--no-privileges`: 0
+`GRANT`, 0 `REVOKE`. Restaurar só o `schema.sql` produz banco sem permissão
+alguma para as roles de API.
+
+Que as 36 reproduzam fielmente o SQL aplicado nunca provou que aplicá-las em
+sequência produzisse o mesmo schema — e é justamente isso que a Fase 4C provou,
+para a estrutura, por hash.
 
 Também a corrigir na Fase 3: o cabeçalho de
 `20260728154500_sec_002_retire_plan_limit.sql` diz "PROPOSTA: não executada
 automaticamente", mas a migration **está aplicada** (versão `20260728191311`).
 
-Enquanto as quatro fases não se completarem, **o R1 permanece parcialmente
-aberto** e os testes de RLS/ACL que dependem de reconstrução a partir das
-migrations continuam bloqueados. Ver
-[`tests/db/README-R1.md`](../../tests/db/README-R1.md).
+**Estado do R1 após a Fase 4C.** A metade estrutural está fechada: as quatro
+fases se completaram e a reconstrução a partir de `../migrations/` é
+byte-equivalente a este snapshot. Os testes de RLS que dependem de reconstrução
+a partir das migrations **deixam de estar bloqueados** — RLS e policies foram
+reproduzidas com exatidão, 39/39 tabelas e 78/78 policies.
+
+Os testes de **ACL** continuam bloqueados, e agora por motivo conhecido e
+documentado, não por incógnita: os grants de tabela de produção não estão no
+repositório, e a decisão sobre isso está pendente (§ pendências da Fase 4C). Ver
+[`tests/db/README-R1.md`](../../tests/db/README-R1.md) e
+[`PHASE-4C-REBUILD-REPORT.md`](PHASE-4C-REBUILD-REPORT.md).
 
 ### Item separado — ausência de rollbacks
 

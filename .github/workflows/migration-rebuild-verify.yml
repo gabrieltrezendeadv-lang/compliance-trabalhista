@@ -1,0 +1,335 @@
+name: Migration rebuild verify
+
+# =============================================================================
+# FASE 4 — as 36 migrations canônicas, aplicadas em sequência, reproduzem o
+# baseline?
+#
+# Que os 36 arquivos de supabase/migrations/ sejam cópia fiel do SQL registrado
+# em supabase_migrations.schema_migrations está provado por md5_norm (36/36).
+# Isso NÃO prova que aplicá-los em ordem, num banco vazio, produza o schema
+# registrado em supabase/baseline/. É essa segunda afirmação que este workflow
+# testa.
+#
+# Duas comparações, porque o snapshot tem duas metades:
+#
+#   ESTRUTURA  pg_dump do banco reconstruído × supabase/baseline/schema.sql.
+#              Mesmas opções de dump, cliente da mesma linha de versão.
+#
+#   SEGURANÇA  schema.sql foi gerado com --no-privileges: contém 0 GRANT e
+#              0 REVOKE. A metade de segurança vive em security.sql, que não é
+#              dump e sim arquivo redigido à mão. A comparação, portanto, não é
+#              de texto: o mesmo extrator de catálogo roda contra o banco
+#              reconstruído e contra o banco restaurado de schema.sql +
+#              security.sql, e as duas extrações são comparadas.
+#
+# Há ainda uma terceira medida, o PISO DE RUÍDO: o dump do banco restaurado a
+# partir de schema.sql, comparado com schema.sql. Toda diferença aí é, por
+# construção, ruído de round-trip do pg_dump — não defeito de migration. Ela
+# calibra empiricamente o que a normalização pode remover, em vez de deixar
+# isso por conta de asserção.
+#
+# NUNCA se conecta ao projeto remoto. Não usa secret. Não usa `supabase db
+# push`, `migration up`, `migration repair` nem `migration fetch`. Toda
+# operação acontece contra o Postgres efêmero do runner, descartado ao final.
+# As guardas estão em scripts/ci/assert-local-only.sh e correm ANTES de
+# qualquer ferramenta ser instalada.
+#
+# Disparo exclusivamente manual — nunca em push, nunca em pull_request.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: migration-rebuild-verify-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    name: Reconstruir e comparar
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # ── Guardas, antes de qualquer ferramenta ───────────────────────────────
+      - name: Guarda — ambiente exclusivamente local
+        run: bash scripts/ci/assert-local-only.sh pre
+
+      - name: Preparar diretório de evidências
+        run: mkdir -p artifacts
+
+      # ── Ferramentas ─────────────────────────────────────────────────────────
+      #
+      # O snapshot foi gerado por pg_dump 17.10 contra servidor 17.6. Usar a
+      # mesma versão de cliente elimina uma fonte de diferença de formatação
+      # que se confundiria com diferença estrutural. A fixação é best-effort:
+      # se a versão exata saiu do repositório PGDG, cai para o mais recente da
+      # linha 17 e a versão efetiva é registrada como evidência — o piso de
+      # ruído mede a consequência.
+      - name: Instalar postgresql-client-17
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          ALVO="17.10-1.pgdg$(lsb_release -rs)+1"
+          if sudo apt-get install -y -qq --allow-downgrades \
+               "postgresql-client-17=$ALVO" "postgresql-client-common"; then
+            echo "pin de versão: aplicado ($ALVO)"
+          else
+            echo "pin de versão: INDISPONÍVEL — instalando o mais recente da linha 17"
+            sudo apt-get install -y -qq postgresql-client-17
+          fi
+          echo "PGBIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Registrar versões das ferramentas
+        run: |
+          {
+            echo "== versões =="
+            echo "runner        : $(lsb_release -ds)"
+            echo "supabase cli  : $(supabase --version)"
+            echo "pg_dump       : $("$PGBIN/pg_dump" --version)"
+            echo "psql          : $("$PGBIN/psql" --version)"
+            echo "node          : $(node --version)"
+            echo "docker        : $(docker --version)"
+            echo "commit        : $GITHUB_SHA"
+          } | tee artifacts/versoes.txt
+
+      # ── Preflight ───────────────────────────────────────────────────────────
+      - name: Preflight — exatamente 36 migrations
+        run: |
+          N=$(find supabase/migrations -maxdepth 1 -name '*.sql' | wc -l)
+          echo "arquivos .sql em supabase/migrations: $N"
+          [ "$N" -eq 36 ] || { echo "FALHA: esperadas 36 migrations, encontradas $N"; exit 1; }
+          echo "ordem de aplicação (lexicográfica = cronológica):"
+          find supabase/migrations -maxdepth 1 -name '*.sql' -printf '%f\n' | sort | nl
+
+      - name: Preflight — 36/36 hashes contra applied-migrations.tsv
+        run: node tests/verify-recovered-migrations.mjs supabase/migrations
+
+      - name: Preflight — guardas do repositório continuam aprovadas
+        run: npm run test:reconciliation
+
+      # ── Stack local e descartável ───────────────────────────────────────────
+      - name: Inicializar projeto local descartável
+        run: |
+          supabase init --force
+          bash scripts/ci/assert-local-only.sh config
+
+      # `supabase init` pode tocar arquivos de conveniência (um .gitignore, por
+      # exemplo). O que não pode, de forma alguma, é tocar as ENTRADAS do teste:
+      # as migrations, o baseline e os scripts de comparação. A distinção está
+      # aqui em vez de um `git diff --exit-code` cru para não reprovar por
+      # cosmético e, ao mesmo tempo, reprovar de verdade o que importa.
+      - name: Conferir que as entradas do teste não foram alteradas
+        run: |
+          echo "== alterações em arquivo versionado =="
+          git diff --stat || true
+          CRITICO=$(git diff --name-only -- \
+            supabase/migrations supabase/baseline scripts/ci tests .github/workflows)
+          if [ -n "$CRITICO" ]; then
+            echo "FALHA: entrada do teste foi alterada em tempo de execução:"
+            echo "$CRITICO"
+            exit 1
+          fi
+          echo "nenhuma entrada do teste alterada"
+          echo "== não rastreados (esperado: config.toml gerado e artifacts/) =="
+          git status --porcelain
+
+      # `supabase start` aplica as migrations ao subir a stack — o CLI não
+      # oferece forma de subir sem aplicar. Essa primeira aplicação não é a
+      # evidência: a evidência é o `db reset` do passo seguinte, que recria o
+      # banco do zero e produz o log por migration e o ledger.
+      - name: Subir stack local descartável
+        run: |
+          set -o pipefail
+          supabase start --exclude realtime,storage-api,imgproxy,studio,edge-runtime,logflare,vector,supavisor \
+            2>&1 | tee artifacts/start.log
+          echo "DB_URL=$(supabase status -o env | grep '^DB_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+
+      - name: Guarda — a conexão aponta para loopback
+        run: bash scripts/ci/assert-local-only.sh dburl
+
+      - name: Conferir pré-requisitos de plataforma da stack
+        run: |
+          {
+            echo "== servidor =="
+            "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -At -c "SHOW server_version;"
+            echo "== objetos de plataforma que as 36 migrations assumem =="
+            "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -At -c \
+              "SELECT 'auth.'||proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='auth' AND proname IN ('uid','role') ORDER BY 1;"
+            "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -At -c \
+              "SELECT 'role '||rolname FROM pg_roles WHERE rolname IN ('anon','authenticated','service_role') ORDER BY 1;"
+            "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -At -c \
+              "SELECT 'extensão '||extname FROM pg_extension ORDER BY 1;"
+          } | tee artifacts/plataforma.txt
+          MAJOR=$("$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -At -c "SELECT current_setting('server_version_num')::int / 10000;")
+          [ "$MAJOR" -eq 17 ] || { echo "FALHA: servidor local é PostgreSQL $MAJOR; o snapshot é de 17"; exit 1; }
+
+      # ── Aplicação das 36 em ordem canônica ──────────────────────────────────
+      - name: Aplicar as 36 migrations do zero, em ordem
+        run: |
+          set -o pipefail
+          supabase db reset --no-seed 2>&1 | tee artifacts/reset.log
+
+      # Leitura do log do CLI: evidência DIRETA da ordem de aplicação. É
+      # deliberadamente tolerante a mudança de formato de mensagem do CLI — se
+      # o padrão deixar de casar, avisa e segue, porque o gate autoritativo é o
+      # ledger do passo seguinte, que vem de consulta SQL e não de texto de log.
+      - name: Resultado migration por migration (log do CLI)
+        run: |
+          grep -aoE '[0-9]{14}_[A-Za-z0-9_]+\.sql' artifacts/reset.log \
+            > artifacts/aplicadas.txt || true
+          N=$(wc -l < artifacts/aplicadas.txt)
+          echo "aplicações registradas no log: $N"
+          nl artifacts/aplicadas.txt || true
+          find supabase/migrations -maxdepth 1 -name '*.sql' -printf '%f\n' \
+            | sort > artifacts/esperadas.txt
+          if [ "$N" -eq 0 ]; then
+            echo "AVISO: o formato de mensagem do CLI não casou com o padrão."
+            echo "       A ordem será conferida pelo ledger. Log preservado como evidência."
+          elif diff -u artifacts/esperadas.txt artifacts/aplicadas.txt; then
+            echo "conjunto e ordem de aplicação conferem com os 36 arquivos"
+          else
+            echo "FALHA: o conjunto ou a ordem de aplicação divergiu dos 36 arquivos"
+            exit 1
+          fi
+
+      - name: Conferir o ledger local
+        run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -At -F'|' -c \
+            "SELECT version, name, coalesce(array_length(statements,1),0)
+               FROM supabase_migrations.schema_migrations ORDER BY version;" \
+            > artifacts/ledger.tsv
+          node scripts/ci/check-ledger.mjs artifacts/ledger.tsv | tee artifacts/ledger.txt
+
+      # ── Extração do banco reconstruído ──────────────────────────────────────
+      - name: Dump estrutural do banco reconstruído
+        run: |
+          "$PGBIN/pg_dump" "$DB_URL" \
+            --schema-only \
+            --schema=public \
+            --no-owner \
+            --no-privileges \
+            --no-tablespaces \
+            -f artifacts/rebuilt-schema.sql
+          wc -c artifacts/rebuilt-schema.sql
+
+      - name: Extração de segurança do banco reconstruído
+        run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -q -A -t \
+            -f scripts/ci/extract-security.sql > artifacts/rebuilt-security.txt
+          wc -l artifacts/rebuilt-security.txt
+
+      # ── Piso de ruído: restaurar o baseline no MESMO descartável ────────────
+      #
+      # A partir daqui o schema `public` reconstruído é destruído. Tudo que
+      # dele importa já está capturado acima.
+      - name: Restaurar o baseline no mesmo descartável
+        run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS public CASCADE;"
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/baseline/schema.sql
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/baseline/security.sql
+
+      - name: Dump e extração de segurança do baseline restaurado
+        run: |
+          "$PGBIN/pg_dump" "$DB_URL" \
+            --schema-only \
+            --schema=public \
+            --no-owner \
+            --no-privileges \
+            --no-tablespaces \
+            -f artifacts/baseline-roundtrip.sql
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -q -A -t \
+            -f scripts/ci/extract-security.sql > artifacts/baseline-security.txt
+          wc -c artifacts/baseline-roundtrip.sql
+          wc -l artifacts/baseline-security.txt
+
+      # ── Comparações ─────────────────────────────────────────────────────────
+      - name: Normalizar os três dumps
+        run: |
+          node scripts/ci/normalize-schema-dump.mjs supabase/baseline/schema.sql artifacts/snapshot.norm.sql
+          node scripts/ci/normalize-schema-dump.mjs artifacts/rebuilt-schema.sql artifacts/rebuilt-schema.norm.sql
+          node scripts/ci/normalize-schema-dump.mjs artifacts/baseline-roundtrip.sql artifacts/baseline-roundtrip.norm.sql
+
+      - name: Diff — piso de ruído (round-trip do pg_dump)
+        id: piso
+        run: |
+          diff -u artifacts/snapshot.norm.sql artifacts/baseline-roundtrip.norm.sql \
+            > artifacts/diff-piso-de-ruido.diff || true
+          N=$(wc -l < artifacts/diff-piso-de-ruido.diff)
+          echo "linhas de diff no piso de ruído: $N"
+          echo "linhas=$N" >> "$GITHUB_OUTPUT"
+          [ "$N" -eq 0 ] || { echo "--- piso de ruído (primeiras 200 linhas) ---"; head -200 artifacts/diff-piso-de-ruido.diff; }
+
+      - name: Diff — estrutura, bruto e normalizado
+        id: estrutura
+        run: |
+          diff -u supabase/baseline/schema.sql artifacts/rebuilt-schema.sql \
+            > artifacts/diff-estrutural-bruto.diff || true
+          diff -u artifacts/snapshot.norm.sql artifacts/rebuilt-schema.norm.sql \
+            > artifacts/diff-estrutural-normalizado.diff || true
+          BRUTO=$(wc -l < artifacts/diff-estrutural-bruto.diff)
+          NORM=$(wc -l < artifacts/diff-estrutural-normalizado.diff)
+          echo "diff bruto ......... $BRUTO linha(s)"
+          echo "diff normalizado ... $NORM linha(s)"
+          echo "normalizado=$NORM" >> "$GITHUB_OUTPUT"
+          [ "$NORM" -eq 0 ] || { echo "--- diff estrutural normalizado (primeiras 400 linhas) ---"; head -400 artifacts/diff-estrutural-normalizado.diff; }
+
+      - name: Diff — segurança (extração × extração)
+        id: seguranca
+        run: |
+          diff -u artifacts/baseline-security.txt artifacts/rebuilt-security.txt \
+            > artifacts/diff-seguranca.diff || true
+          N=$(wc -l < artifacts/diff-seguranca.diff)
+          echo "diff de segurança: $N linha(s)"
+          echo "linhas=$N" >> "$GITHUB_OUTPUT"
+          [ "$N" -eq 0 ] || { echo "--- diff de segurança (primeiras 400 linhas) ---"; head -400 artifacts/diff-seguranca.diff; }
+
+      - name: Guarda — nenhuma credencial ou vínculo surgiu durante o job
+        if: always()
+        run: bash scripts/ci/assert-local-only.sh post
+
+      - name: Hashes das evidências
+        if: always()
+        run: |
+          cd artifacts && sha256sum ./* | tee sha256.txt
+
+      - name: Publicar evidências
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-rebuild-evidence
+          path: artifacts/
+          retention-days: 30
+
+      - name: Veredito
+        run: |
+          PISO="${{ steps.piso.outputs.linhas }}"
+          NORM="${{ steps.estrutura.outputs.normalizado }}"
+          SEG="${{ steps.seguranca.outputs.linhas }}"
+          echo "piso de ruído ............ $PISO linha(s) de diff"
+          echo "estrutura normalizada .... $NORM linha(s) de diff"
+          echo "segurança ................ $SEG linha(s) de diff"
+          FALHA=0
+          [ "$NORM" -eq 0 ] || { echo "REPROVADO: a estrutura reconstruída difere do snapshot"; FALHA=1; }
+          [ "$SEG" -eq 0 ] || { echo "REPROVADO: as propriedades de segurança diferem do baseline"; FALHA=1; }
+          [ "$PISO" -eq 0 ] || echo "ATENÇÃO: o piso de ruído não é vazio — parte do diff acima pode ser round-trip do pg_dump, e não defeito de migration. Classificar antes de concluir."
+          [ "$FALHA" -eq 0 ] && echo "APROVADO: as 36 migrations reproduzem estrutura e segurança do baseline."
+          exit $FALHA
+
+      - name: Derrubar a stack
+        if: always()
+        run: supabase stop --no-backup || true

@@ -1,29 +1,42 @@
 /**
- * GUARDA DO CONGELAMENTO DE MIGRATIONS
+ * GUARDA DO HISTÓRICO DE MIGRATIONS
  *
  * Impede que uma execução automática de `supabase db push` — ou de qualquer
- * outro comando que escreva no histórico de migrations — seja introduzida em
- * workflow, script ou package.json enquanto o congelamento estiver em vigor.
+ * outro comando que escreva no histórico de migrations, ou que abra conexão
+ * direta ao banco remoto — seja introduzida em workflow, script ou
+ * package.json.
  *
- * CONTEXTO: os 13 arquivos de supabase/migrations/ têm prefixos de versão que
- * não existem no histórico do banco. O Supabase CLI compara por timestamp,
- * então para ele todos os 13 estão pendentes. Um `db push` tentaria aplicá-los
- * contra um banco onde o DDL equivalente já existe.
- * Ver supabase/migrations/README.md.
+ * CONTEXTO (atualizado na Fase 3): supabase/migrations/ agora contém as 36
+ * versões efetivamente aplicadas, com prefixos idênticos aos do histórico
+ * remoto. A divergência que existia — 13 arquivos com versões ausentes do
+ * banco — foi reconciliada. Ver supabase/migrations/README.md e
+ * supabase/history/pre-reconciliation/README.md.
+ *
+ * A reconciliação NÃO relaxa as proibições. Ela remove a divergência que
+ * existia; não estabelece que aplicar migration automaticamente passou a ser
+ * seguro. `db push`, `migration repair`, `migration up` e `migration fetch`
+ * seguem proibidos, e agora sem nenhuma exceção nominal — a da Fase 2 foi
+ * removida junto com o workflow temporário que a justificava.
  *
  * Executado por `npm run test:reconciliation`, portanto por `npm run verify`,
  * portanto pelo check obrigatório `Verify` da branch main.
  *
- * Esta guarda inspeciona texto de configuração de automação — não é
- * substituto de teste de comportamento. É o único meio disponível: o que se
- * quer proibir é a *existência* de um comando em arquivo de automação, não um
- * efeito observável em runtime.
+ * ── LIMITE DESTA GUARDA ─────────────────────────────────────────────────────
+ *
+ * Ela inspeciona texto de configuração de automação e nomes de arquivo. Não é
+ * substituto de teste de comportamento, e não torna a reintrodução do risco
+ * impossível: alguém pode alterar manifesto e arquivos na mesma mudança, ou
+ * aplicar migration por fora do repositório — foi assim, aliás, que as 36
+ * originais entraram no banco. O que ela garante é que a reintrodução seja
+ * detectável e ruidosa.
  */
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { parseManifest } from "./lib/manifest.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -117,20 +130,26 @@ test("MF-03: nenhuma automação executa `supabase migration up`", () => {
   assert.deepEqual(hits, [], `migration up encontrado:\n  ${hits.join("\n  ")}`);
 });
 
-// ── MF-04: `migration fetch` — exceção única e delimitada ────────────────────
+// ── MF-04: `migration fetch`, `--linked` e senha em URI — sem exceção ────────
 //
-// A Fase 2 (recuperação canônica das 36 migrations) precisa de exatamente uma
-// invocação de `supabase migration fetch`. A exceção é estreita de propósito:
-// vale só para o workflow da Fase 2, só com `--db-url`, só em disparo manual.
+// A Fase 2 abrira uma exceção nominal para um workflow temporário, que precisava
+// de exatamente uma invocação de `supabase migration fetch`. Aquele workflow
+// falhou nas três tentativas; a recuperação das 36 migrations saiu por leitura
+// de `supabase_migrations.schema_migrations` via conector, sem CLI e sem secret.
 //
-// `--linked` continua proibido em qualquer lugar: ele exige `supabase link` e
-// um access token, ampliando o alcance da credencial muito além de uma leitura.
-
-/** Caminho do único arquivo autorizado a invocar `migration fetch`. */
-const FETCH_AUTORIZADO = ".github/workflows/recover-migrations-temp.yml";
+// Cumprida a função — ou, no caso, dispensada —, o workflow foi removido na
+// Fase 3 e a exceção com ele. Deixá-lo seria manter no repositório um caminho de
+// conexão direta ao banco de produção sem finalidade.
+//
+// Três regras, todas válidas em qualquer arquivo de automação:
+//   1. `supabase migration fetch` — proibido;
+//   2. `--linked` — proibido (exige `supabase link` e access token, ampliando o
+//      alcance da credencial muito além de uma leitura);
+//   3. senha embutida em URI postgres — proibida. Esta regra ficava dentro do
+//      ramo autorizado de fetch; agora vale por si, para qualquer linha.
 
 /**
- * Avalia invocações de `migration fetch` e devolve as violações.
+ * Avalia conexão direta ao banco em automação e devolve as violações.
  *
  * Recebe entradas sintéticas — `[{ file, content }]` — para poder ser exercida
  * por testes negativos sem tocar no sistema de arquivos.
@@ -147,34 +166,15 @@ export function violacoesDeFetch(entradas) {
         return t !== "" && !t.startsWith("#") && !t.startsWith("//");
       });
 
-    // `--linked` é proibido em qualquer arquivo, com ou sem fetch.
     for (const { n, text } of linhas) {
+      if (/supabase\s+migration\s+fetch/.test(text)) {
+        violacoes.push(
+          `${file}:${n} invoca migration fetch (proibido — a exceção da Fase 2 foi removida)`
+        );
+      }
       if (/--linked\b/.test(text)) {
         violacoes.push(`${file}:${n} usa --linked (proibido)`);
       }
-    }
-
-    const normalizado = file.split("\\").join("/");
-    const fetches = linhas.filter(({ text }) =>
-      /supabase\s+migration\s+fetch/.test(text)
-    );
-    if (fetches.length === 0) continue;
-
-    if (normalizado !== FETCH_AUTORIZADO) {
-      for (const { n } of fetches) {
-        violacoes.push(
-          `${file}:${n} invoca migration fetch fora de ${FETCH_AUTORIZADO}`
-        );
-      }
-      continue;
-    }
-
-    // No arquivo autorizado: exigir --db-url e disparo manual.
-    for (const { n, text } of fetches) {
-      if (!/--db-url\b/.test(text)) {
-        violacoes.push(`${file}:${n} invoca migration fetch sem --db-url`);
-      }
-      // A URI não pode conter senha. A senha vai só em SUPABASE_DB_PASSWORD.
       // `postgresql://usuario:senha@host` → proibido.
       // `postgresql://usuario@host`       → permitido.
       if (/postgres(ql)?:\/\/[^:/@\s"']+:[^@\s"']+@/.test(text)) {
@@ -183,15 +183,12 @@ export function violacoesDeFetch(entradas) {
         );
       }
     }
-    if (!/workflow_dispatch/.test(content)) {
-      violacoes.push(`${file} invoca migration fetch sem workflow_dispatch`);
-    }
   }
 
   return violacoes;
 }
 
-test("MF-04: `migration fetch` só no workflow da Fase 2, com --db-url e manual", () => {
+test("MF-04: nenhuma automação invoca migration fetch, --linked ou URI com senha", () => {
   const entradas = FILES.map((file) => ({
     file,
     content: fs.readFileSync(path.join(root, file), "utf8"),
@@ -201,7 +198,19 @@ test("MF-04: `migration fetch` só no workflow da Fase 2, com --db-url e manual"
   assert.deepEqual(
     violacoes,
     [],
-    `uso indevido de migration fetch ou --linked:\n  ${violacoes.join("\n  ")}`
+    `conexão direta ao banco em automação:\n  ${violacoes.join("\n  ")}`
+  );
+});
+
+test("MF-04b: o workflow temporário da Fase 2 não existe mais", () => {
+  const temporario = path.join(
+    root,
+    ".github/workflows/recover-migrations-temp.yml"
+  );
+  assert.equal(
+    fs.existsSync(temporario),
+    false,
+    "recover-migrations-temp.yml deveria ter sido removido na Fase 3"
   );
 });
 
@@ -239,45 +248,209 @@ test("MF-06: todo `supabase db reset` opera em stack local, nunca no remoto", ()
 
 // ── Integridade do congelamento ──────────────────────────────────────────────
 
-test("MF-07: o aviso de congelamento existe e proíbe db push", () => {
+test("MF-07: o README documenta a reconciliação e mantém db push proibido", () => {
   const readme = path.join(root, "supabase/migrations/README.md");
   assert.ok(fs.existsSync(readme), "supabase/migrations/README.md ausente");
 
   const content = fs.readFileSync(readme, "utf8");
-  assert.match(content, /MIGRATIONS CONGELADAS/);
+  // O congelamento da Fase 1 deu lugar ao histórico reconciliado.
+  assert.match(content, /reconciliad/i, "o README deve descrever a reconciliação");
+  assert.match(content, /36/, "o README deve declarar as 36 versões");
+  // As proibições permanecem, e o README precisa dizê-lo.
   assert.match(content, /supabase db push/);
+  assert.match(
+    content,
+    /Continuam proibidos/,
+    "o README deve deixar explícito que a reconciliação não relaxa as proibições"
+  );
+
+  // O README anterior apontava para os 13 arquivos; agora precisa apontar para
+  // onde eles foram preservados.
+  const historico = path.join(
+    root,
+    "supabase/history/pre-reconciliation/README.md"
+  );
+  assert.ok(fs.existsSync(historico), "README da pasta histórica ausente");
 });
 
-test("MF-08: o conjunto de migrations não mudou durante o congelamento", () => {
-  const dir = path.join(root, "supabase/migrations");
+// ── Conjunto canônico de arquivos ────────────────────────────────────────────
+//
+// Três asserções com propósitos distintos e deliberadamente redundantes:
+//   MF-08 — lista literal: pega remoção e renomeação;
+//   MF-18 — propriedade de prefixo: pega arquivo novo com versão inventada;
+//   MF-19 — bijeção com o manifesto: pega ausência e duplicidade.
+//
+// MF-18 e MF-19 verificam propriedade em vez de lista, então sobrevivem a
+// mudanças legítimas do conjunto. MF-08 não sobrevive — e é essa rigidez que a
+// torna útil: alterar o conjunto exige alterar a lista de forma explícita.
+
+/** Os 36 arquivos canônicos: `<version>_<name>.sql` conforme gravado no banco. */
+const CANONICOS = [
+  "20260724013538_foundation.sql",
+  "20260724014530_onboarding_function.sql",
+  "20260724120859_create_evidence_tables.sql",
+  "20260724121010_evidence_security_definer_functions.sql",
+  "20260724121902_create_complaint_tables.sql",
+  "20260724122001_complaint_security_definer_functions.sql",
+  "20260724122058_create_campaign_tables.sql",
+  "20260724122324_campaign_security_definer_functions.sql",
+  "20260724123308_create_profiles_table.sql",
+  "20260724123926_assessment_tables.sql",
+  "20260724124015_assessment_functions.sql",
+  "20260724130400_migrate_pin_to_bcrypt.sql",
+  "20260724133019_fix_rls_recursion_complaint_investigators.sql",
+  "20260724134828_create_risk_inventory_tables.sql",
+  "20260724134918_risk_inventory_functions.sql",
+  "20260724160830_create_webhook_events_table.sql",
+  "20260724161323_add_trialing_to_subscription_status.sql",
+  "20260724161707_create_billing_tables_only.sql",
+  "20260724161734_create_billing_functions.sql",
+  "20260726004007_sec001_revoke_public_execute_regrant.sql",
+  "20260726004028_sec002_check_plan_limit_derive_tenant.sql",
+  "20260726004116_sec003_complaint_pin_bcrypt_ratelimit.sql",
+  "20260726004137_sec004_remove_member_rpc.sql",
+  "20260726004204_sec005_campaign_employee_profiles.sql",
+  "20260726004230_sec006_webhook_transactional_idempotent.sql",
+  "20260728005535_sec_block1_expand.sql",
+  "20260728010455_sec_block1_contract.sql",
+  "20260728190937_20260728150000_fix_001_evidence_reports.sql",
+  "20260728191019_20260728151000_fix_003_reverse_scoring.sql",
+  "20260728191046_20260728152000_fix_004_assessment_submission.sql",
+  "20260728191110_20260728152500_priv_001_anonymous_assessments_ddl.sql",
+  "20260728191144_20260728152500_priv_001_anonymous_assessments_fns1.sql",
+  "20260728191241_20260728152500_priv_001_anonymous_assessments_fns2_grants.sql",
+  "20260728191255_20260728153000_sec_006_table_privileges.sql",
+  "20260728191311_20260728154500_sec_002_retire_plan_limit.sql",
+  "20260728191324_20260728155000_fix_005_close_expired_cycles.sql",
+];
+
+/** Arquivos `.sql` de supabase/migrations, ordenados. */
+function migrationsNoDisco() {
+  return fs
+    .readdirSync(path.join(root, "supabase/migrations"))
+    .filter((f) => f.endsWith(".sql"))
+    .sort();
+}
+
+/** Versões registradas no manifesto versionado. */
+function versoesDoManifesto() {
+  const tsv = path.join(root, "supabase/baseline/applied-migrations.tsv");
+  return parseManifest(fs.readFileSync(tsv, "utf8")).map((r) => r.version);
+}
+
+test("MF-08: o conjunto de migrations é exatamente o histórico canônico das 36", () => {
+  assert.deepEqual(
+    migrationsNoDisco(),
+    CANONICOS,
+    "o conjunto de migrations mudou — ver supabase/migrations/README.md"
+  );
+});
+
+test("MF-18: todo prefixo de arquivo em supabase/migrations existe no manifesto", () => {
+  const doManifesto = new Set(versoesDoManifesto());
+  const forasteiros = [];
+
+  for (const arquivo of migrationsNoDisco()) {
+    const m = arquivo.match(/^(\d{14})_/);
+    if (!m) {
+      forasteiros.push(`${arquivo}: nome não começa com 14 dígitos`);
+      continue;
+    }
+    if (!doManifesto.has(m[1])) {
+      forasteiros.push(
+        `${arquivo}: versão ${m[1]} não consta de applied-migrations.tsv`
+      );
+    }
+  }
+
+  assert.deepEqual(
+    forasteiros,
+    [],
+    `migration com versão ausente do histórico aplicado — era exatamente esta ` +
+      `condição que tornava db push perigoso:\n  ${forasteiros.join("\n  ")}`
+  );
+});
+
+test("MF-19: cada versão do manifesto tem exatamente um arquivo", () => {
+  const arquivos = migrationsNoDisco();
+  const problemas = [];
+
+  for (const version of versoesDoManifesto()) {
+    const correspondentes = arquivos.filter((f) => f.startsWith(`${version}_`));
+    if (correspondentes.length !== 1) {
+      problemas.push(
+        `${version}: ${correspondentes.length} arquivo(s)` +
+          (correspondentes.length ? ` → ${correspondentes.join(", ")}` : "")
+      );
+    }
+  }
+
+  assert.deepEqual(
+    problemas,
+    [],
+    `correspondência manifesto ↔ arquivo quebrada:\n  ${problemas.join("\n  ")}`
+  );
+
+  assert.equal(
+    arquivos.length,
+    versoesDoManifesto().length,
+    "há arquivo em supabase/migrations sem versão correspondente no manifesto"
+  );
+});
+
+test("MF-17: supabase/checks contém apenas leitura", () => {
+  const dir = path.join(root, "supabase/checks");
+  assert.ok(fs.existsSync(dir), "supabase/checks ausente");
+
+  const escrita =
+    /\b(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM|DROP\s+|CREATE\s+|ALTER\s+|GRANT\s+|REVOKE\s+|TRUNCATE\s+)/i;
+  const violacoes = [];
+
+  const sql = fs.readdirSync(dir).filter((f) => f.endsWith(".sql"));
+  assert.ok(sql.length > 0, "supabase/checks não tem nenhum .sql");
+
+  for (const arquivo of sql) {
+    const conteudo = fs.readFileSync(path.join(dir, arquivo), "utf8");
+    // Remove comentários antes de avaliar: o cabeçalho de cada arquivo cita a
+    // migration de origem e pode conter palavras de DDL em prosa.
+    const semComentario = conteudo
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/--[^\n]*/g, " ");
+
+    if (escrita.test(semComentario)) {
+      violacoes.push(`${arquivo}: contém comando de escrita`);
+    }
+    if (!/\bSELECT\b/i.test(semComentario)) {
+      violacoes.push(`${arquivo}: nenhum SELECT — arquivo sem propósito aqui`);
+    }
+  }
+
+  assert.deepEqual(
+    violacoes,
+    [],
+    `supabase/checks deve ser somente leitura:\n  ${violacoes.join("\n  ")}`
+  );
+  console.log(`       (${sql.length} arquivo(s) de verificação, todos leitura)`);
+});
+
+test("MF-20: os 13 arquivos anteriores estão preservados fora de migrations", () => {
+  const dir = path.join(root, "supabase/history/pre-reconciliation");
   const sql = fs
     .readdirSync(dir)
     .filter((f) => f.endsWith(".sql"))
     .sort();
 
-  // Congelado em 13 arquivos. Adicionar ou remover exige levantar o
-  // congelamento de forma explícita, atualizando esta lista.
-  const esperados = [
-    "20260724130000_create_complaint_tables.sql",
-    "20260724140000_complaint_security_definer_functions.sql",
-    "20260724150000_create_campaign_tables.sql",
-    "20260724160000_campaign_functions.sql",
-    "20260727100000_sec_block1_expand.sql",
-    "20260727200000_sec_block1_contract.sql",
-    "20260728150000_fix_001_evidence_reports.sql",
-    "20260728151000_fix_003_reverse_scoring.sql",
-    "20260728152000_fix_004_assessment_submission.sql",
-    "20260728152500_priv_001_anonymous_assessments.sql",
-    "20260728153000_sec_006_table_privileges.sql",
-    "20260728154500_sec_002_retire_plan_limit.sql",
-    "20260728155000_fix_005_close_expired_cycles.sql",
-  ];
+  assert.equal(sql.length, 13, `esperados 13 arquivos preservados, ${sql.length}`);
 
-  assert.deepEqual(
-    sql,
-    esperados,
-    "o conjunto de migrations mudou — ver supabase/migrations/README.md"
-  );
+  // Nenhum deles deve ter voltado para supabase/migrations.
+  const emMigrations = new Set(migrationsNoDisco());
+  for (const arquivo of sql) {
+    assert.equal(
+      emMigrations.has(arquivo),
+      false,
+      `${arquivo} reapareceu em supabase/migrations`
+    );
+  }
 });
 
 // ── Testes negativos da própria guarda ───────────────────────────────────────
@@ -286,98 +459,130 @@ test("MF-08: o conjunto de migrations não mudou durante o congelamento", () => 
 // casos abaixo alimentam `violacoesDeFetch` com entradas sintéticas e exigem
 // que ela ACUSE a violação. Nada é escrito no disco.
 
-const WF_OK = `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "postgresql://user@host:5432/postgres"\n`;
+/** Envelope de workflow: só para deixar as fixtures legíveis. */
+const wf = (run, gatilho = "on:\n  workflow_dispatch:\n") =>
+  `${gatilho}jobs:\n  x:\n    steps:\n      - run: ${run}\n`;
 
-test("MF-09: fetch com --linked é reprovado, mesmo no workflow autorizado", () => {
+test("MF-09: fetch com --linked é reprovado, e por dois motivos", () => {
   const v = violacoesDeFetch([
-    {
-      file: FETCH_AUTORIZADO,
-      content: `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --linked\n`,
-    },
+    { file: ".github/workflows/qualquer.yml", content: wf("supabase migration fetch --linked") },
   ]);
-  assert.ok(v.length > 0, "deveria acusar --linked");
   assert.ok(
     v.some((m) => m.includes("--linked")),
-    `mensagem deveria citar --linked: ${JSON.stringify(v)}`
+    `deveria citar --linked: ${JSON.stringify(v)}`
   );
-});
-
-test("MF-10: fetch fora do workflow autorizado é reprovado", () => {
-  const v = violacoesDeFetch([
-    { file: ".github/workflows/ci.yml", content: WF_OK },
-  ]);
-  assert.ok(v.length > 0, "deveria acusar fetch em arquivo não autorizado");
   assert.ok(
-    v.some((m) => m.includes("fora de")),
-    `mensagem deveria dizer que está fora do arquivo autorizado: ${JSON.stringify(v)}`
+    v.some((m) => m.includes("migration fetch")),
+    `deveria citar migration fetch: ${JSON.stringify(v)}`
   );
 });
 
-test("MF-11: fetch sem --db-url é reprovado", () => {
+test("MF-10: fetch é reprovado em qualquer arquivo, sem exceção nominal", () => {
+  // Antes da Fase 3 havia um arquivo autorizado. Não há mais: o caminho que
+  // era exceção agora deve ser reprovado como qualquer outro.
   const v = violacoesDeFetch([
     {
-      file: FETCH_AUTORIZADO,
-      content: `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch\n`,
+      file: ".github/workflows/recover-migrations-temp.yml",
+      content: wf(`supabase migration fetch --db-url "postgresql://user@host:5432/postgres"`),
     },
   ]);
   assert.ok(
-    v.some((m) => m.includes("sem --db-url")),
-    `deveria exigir --db-url: ${JSON.stringify(v)}`
+    v.some((m) => m.includes("migration fetch")),
+    `o antigo arquivo autorizado deveria ser reprovado agora: ${JSON.stringify(v)}`
   );
 });
 
-test("MF-12: fetch sem workflow_dispatch é reprovado", () => {
+test("MF-11: fetch com --db-url não escapa da proibição", () => {
   const v = violacoesDeFetch([
     {
-      file: FETCH_AUTORIZADO,
-      content: `on:\n  push:\n    branches: [main]\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "$X"\n`,
+      file: ".github/workflows/ci.yml",
+      content: wf(`supabase migration fetch --db-url "$DB"`),
     },
   ]);
   assert.ok(
-    v.some((m) => m.includes("workflow_dispatch")),
-    `deveria exigir workflow_dispatch: ${JSON.stringify(v)}`
+    v.some((m) => m.includes("migration fetch")),
+    `--db-url não deveria absolver o fetch: ${JSON.stringify(v)}`
   );
 });
 
-test("MF-13: o caso legítimo da Fase 2 é aprovado", () => {
-  const v = violacoesDeFetch([{ file: FETCH_AUTORIZADO, content: WF_OK }]);
-  assert.deepEqual(v, [], `não deveria acusar o caso válido: ${JSON.stringify(v)}`);
+test("MF-12: fetch com workflow_dispatch não escapa da proibição", () => {
+  const manual = violacoesDeFetch([
+    { file: ".github/workflows/a.yml", content: wf("supabase migration fetch") },
+  ]);
+  const automatico = violacoesDeFetch([
+    {
+      file: ".github/workflows/b.yml",
+      content: wf("supabase migration fetch", "on:\n  push:\n    branches: [main]\n"),
+    },
+  ]);
+  assert.ok(manual.length > 0, "disparo manual não deveria absolver o fetch");
+  assert.ok(automatico.length > 0, "disparo automático deveria ser reprovado");
 });
 
-test("MF-15: URI com senha embutida é reprovada", () => {
+test("MF-13: automação sem fetch, sem --linked e sem senha é aprovada", () => {
   const v = violacoesDeFetch([
     {
-      file: FETCH_AUTORIZADO,
-      content: `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "postgresql://postgres.abc:senha123@host:5432/postgres"\n`,
+      file: ".github/workflows/baseline-verify.yml",
+      content: wf('psql "$DB_URL" -f supabase/baseline/schema.sql'),
+    },
+  ]);
+  assert.deepEqual(v, [], `caso legítimo não deveria ser acusado: ${JSON.stringify(v)}`);
+});
+
+test("MF-14: --linked é reprovado mesmo sem fetch na linha", () => {
+  const v = violacoesDeFetch([
+    { file: ".github/workflows/ci.yml", content: wf("supabase db reset --linked") },
+  ]);
+  assert.ok(
+    v.some((m) => m.includes("--linked")),
+    `deveria acusar --linked isolado: ${JSON.stringify(v)}`
+  );
+});
+
+test("MF-15: senha em URI é reprovada mesmo sem fetch na linha", () => {
+  // Esta regra ficava dentro do ramo autorizado de fetch. Agora vale por si:
+  // qualquer linha de automação que embuta senha numa URI postgres é violação.
+  const v = violacoesDeFetch([
+    {
+      file: ".github/workflows/ci.yml",
+      content: wf('psql "postgresql://postgres.abc:senha123@host:5432/postgres" -c "select 1"'),
     },
   ]);
   assert.ok(
     v.some((m) => m.includes("embute senha na URI")),
-    `deveria acusar senha na URI: ${JSON.stringify(v)}`
+    `deveria acusar senha na URI fora de fetch: ${JSON.stringify(v)}`
   );
 });
 
 test("MF-16: URI sem senha é aprovada", () => {
   const v = violacoesDeFetch([
     {
-      file: FETCH_AUTORIZADO,
-      content: `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "postgresql://postgres.abc@host:5432/postgres"\n`,
+      file: ".github/workflows/ci.yml",
+      content: wf('psql "postgresql://postgres.abc@host:5432/postgres" -c "select 1"'),
     },
   ]);
   assert.deepEqual(v, [], `URI sem senha não deveria ser acusada: ${JSON.stringify(v)}`);
 });
 
-test("MF-14: --linked é reprovado em qualquer arquivo, mesmo sem fetch", () => {
-  const v = violacoesDeFetch([
-    {
-      file: ".github/workflows/ci.yml",
-      content: `jobs:\n  x:\n    steps:\n      - run: supabase db reset --linked\n`,
-    },
+test("MF-21: MF-18 acusa versão inventada — testado sem tocar no disco", () => {
+  // Prova que a propriedade de prefixo tem dente. A lógica é replicada aqui
+  // sobre entradas sintéticas porque MF-18 lê o diretório real.
+  const doManifesto = new Set(["20260724013538", "20260724014530"]);
+  const candidatos = [
+    "20260724013538_foundation.sql",
+    "20260729999999_migration_inventada.sql",
+    "sem_prefixo.sql",
+  ];
+
+  const forasteiros = candidatos.filter((arquivo) => {
+    const m = arquivo.match(/^(\d{14})_/);
+    return !m || !doManifesto.has(m[1]);
+  });
+
+  assert.deepEqual(forasteiros, [
+    "20260729999999_migration_inventada.sql",
+    "sem_prefixo.sql",
   ]);
-  assert.ok(
-    v.some((m) => m.includes("--linked")),
-    `deveria acusar --linked isolado: ${JSON.stringify(v)}`
-  );
 });
 
 // ── Resumo ───────────────────────────────────────────────────────────────────

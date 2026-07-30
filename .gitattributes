@@ -1,0 +1,19 @@
+# Normalização de fim de linha.
+#
+# O manifesto supabase/baseline/applied-migrations.tsv é comparado campo a campo
+# contra hashes calculados. Em checkout Windows sem esta regra, cada linha chega
+# com CRLF e o `\r` contamina o último campo (md5_norm), reprovando as 36
+# migrations com "esperado" e "obtido" idênticos na mensagem de erro.
+#
+# A regra ataca a causa. O parser em tests/lib/manifest.mjs permanece robusto a
+# CRLF de todo modo — arquivo gerado fora do Git, checkout antigo ou remoção
+# desta regra não devem reintroduzir o defeito. Ver tests/manifest-parser-guard.mjs.
+*.tsv text eol=lf
+
+# Migrations e dumps são comparados por hash de conteúdo normalizado; manter LF
+# evita divergência entre plataformas.
+*.sql text eol=lf
+
+# Script de shell com CRLF falha no runner Linux com `bad interpreter`. A regra
+# vale para os scripts de CI em scripts/ci/.
+*.sh text eol=lf
