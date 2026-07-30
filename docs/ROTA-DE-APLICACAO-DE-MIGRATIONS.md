@@ -2,9 +2,9 @@
 
 **Fase 6B.1** · workflow `.github/workflows/migration-apply.yml` · environment `db-production`
 
-Até aqui não existia rota nenhuma. As duas migrations forward-only — `20260730123613` e `20260731094500` — estão corretas no repositório e **ausentes do banco**, e não havia caminho autorizado entre uma coisa e outra. Este documento descreve o caminho que passa a existir.
+Quando esta rota foi escrita não existia caminho nenhum entre o repositório e o banco: as duas migrations forward-only estavam corretas em `supabase/migrations/` e ausentes de produção. Este documento descreve o caminho que passou a existir — e, na §11, registra o encerramento da fase.
 
-**Nada foi aplicado nesta fase.** O ledger remoto continua com as 36 históricas.
+> **Estado atual: fase encerrada.** As duas migrations foram aplicadas pela rota, cada uma em sua execução, ambas auditadas. **Ledger remoto em 38/38, nenhuma migration pendente.** Detalhes, IDs e limites de cobertura na [§11](#11-encerramento-da-fase).
 
 ---
 
@@ -47,7 +47,18 @@ O `preflight` roda **sem** environment de propósito. Ele decide se a aplicaçã
 
 ## 3. Como "exatamente uma" é garantido
 
-`supabase db push` aplica **todas** as pendentes; o CLI não tem flag para aplicar uma só. A rota resolve isso reservando temporariamente as demais forward-only fora de `supabase/migrations/`, exatamente como a âncora A do `migration-rebuild-verify` já faz e onde a técnica se provou. O CLI passa a enxergar uma única pendente — então o `--dry-run` tem de listar uma, e o push aplica uma.
+`supabase db push` aplica **todas** as pendentes; o CLI não tem flag para aplicar uma só. A rota resolve isso reservando temporariamente as demais fora de `supabase/migrations/`, como a âncora A do `migration-rebuild-verify` já faz. O CLI passa a enxergar uma única pendente — então o `--dry-run` tem de listar uma, e o push aplica uma.
+
+**A reserva é orientada pelo ledger**, e essa distinção é o que faz a técnica funcionar a partir da segunda migration (`scripts/ci/reserve-forward-only.mjs`, PR #17):
+
+| | |
+|---|---|
+| **Permanecem** | todas as históricas · **toda versão presente no ledger remoto** · a migration selecionada |
+| **Reservadas** | só forward-only que **ainda não constam do ledger** e não são a selecionada |
+
+Reservar por "toda forward-only diferente da selecionada" funciona enquanto nenhuma estiver aplicada e quebra na segunda: o CLI compara o histórico remoto com o diretório local e recusa quando uma versão registrada no banco não tem arquivo — `Remote migration versions not found in local migrations directory`. Foi assim que a execução nº 5 falhou, antes de aplicar coisa alguma.
+
+Nada é decidido por nome fixo: a fonte é o ledger lido do banco naquela execução. **Fail-closed:** se qualquer versão do ledger não tiver arquivo local, a rota reprova com diagnóstico **antes** de chamar o CLI.
 
 Ao final os arquivos voltam e `git diff --exit-code` prova que o diretório ficou intacto. O passo de devolução tem `if: always()`: mesmo com falha no meio, o repositório do runner não fica mutilado.
 
@@ -57,7 +68,7 @@ A migration é um input `choice` com lista fixa. **Não existe campo de SQL, que
 
 ## 5. Credencial
 
-Um único secret, **`SUPABASE_DB_URL`**, no environment `db-production`. **Ele não existe ainda** — por decisão desta fase, a credencial só entra depois de as proteções estarem confirmadas. Sem ele, o workflow falha limpo no passo que o exige, sem tocar em nada.
+Um único secret, **`SUPABASE_DB_URL`**, no environment `db-production`. Por decisão desta fase ele só foi cadastrado **depois** de as proteções do environment estarem confirmadas; hoje existe, e é o único. Sem ele, o workflow falha limpo no passo que o exige, sem tocar em nada.
 
 `scripts/ci/parse-db-url.mjs` decompõe a URL em variáveis `PG*` e registra máscaras (`::add-mask::`) para senha, host e URL inteira **antes** de escrever qualquer coisa. Depois disso o `psql` conecta sem receber nada em `argv`.
 
@@ -149,16 +160,73 @@ Testado por simulação, contra o **código real** — `tests/migration-apply-si
 | dry-run identificando exatamente uma versão | SIM-12, SIM-13 |
 | ausência de vazamento do secret | SIM-14, SIM-15 |
 | recusa de destino em loopback | SIM-16 |
-
 | destino amarrado ao projeto de produção | SIM-17, SIM-18 |
 | `sslmode` fraco recusado | SIM-19, SIM-20, SIM-21 |
 | sanitização dos artefatos | SIM-22, SIM-23, SIM-24 |
 | verificação independente obrigatória | SIM-25 |
+| reserva orientada pelo ledger | RES-01 a RES-10 |
+| passo de reserva no cenário real da 2ª migration | SIM-36 |
 
-Mais `tests/migration-apply-guard.mjs`, 21 asserções estáticas sobre as propriedades que tornam a rota segura.
+Mais `tests/migration-apply-guard.mjs`, 26 asserções estáticas sobre as propriedades que tornam a rota segura, e `tests/reserve-forward-only-guard.mjs`, 10 sobre a decisão de reserva.
 
-Todas as defesas foram verificadas **por mutação**: remover o `pipefail` de qualquer um dos três passos, tirar o `--yes`, desfixar uma Action, publicar log cru, remover a verificação independente, aceitar `sslmode=prefer` ou declarar um destino sem o project ref — as nove reprovam.
+Todas as defesas foram verificadas **por mutação**: remover o `pipefail` de qualquer um dos três passos, tirar o `--yes`, desfixar uma Action, publicar log cru, remover a verificação independente, aceitar `sslmode=prefer`, declarar um destino sem o project ref, voltar a reservar toda forward-only diferente da selecionada, ou remover a conferência ledger × arquivos locais — todas reprovam.
 
-**NÃO testado, e não simulado:** a conexão ao banco, o comportamento real do `supabase db push` e o efeito das migrations. Exigem credencial e banco de produção, que esta fase não autoriza.
+**Resolvido na estreia:** a dúvida sobre o CLI pedir confirmação interativa em `db push` foi respondida pela primeira aplicação real. Ele **pede** — o `push.log` mostra `Do you want to push these migrations…? [Y/n] y` — e o `--yes` responde automaticamente. Sem a flag, o passo teria ficado pendurado até o timeout.
 
-**Ponto específico a observar na estreia:** não foi possível confirmar se esta versão do CLI pede confirmação interativa em `db push`. Se pedir, o passo travará até o timeout em vez de aplicar. É falha segura — trava, não aplica errado — mas é o primeiro ponto a verificar.
+---
+
+## 11. Encerramento da fase
+
+**Fase encerrada.** A rota cumpriu integralmente aquilo para que foi construída: levar do repositório ao banco as duas migrations forward-only, uma por execução, com aprovação humana, verificação independente e evidência auditável.
+
+### As duas migrations aplicadas
+
+| Execução | ID | SHA executado | Migration | Ledger |
+|---|---|---|---|---|
+| **nº 4** | [`30572720665`](https://github.com/gabrieltrezendeadv-lang/compliance-trabalhista/actions/runs/30572720665) | `f199575b0689f264a3e0c4063e45147fc7e5617e` | `20260730123613_revoke_public_webhook_execute` | 36 → **37** |
+| **nº 6** | [`30585425232`](https://github.com/gabrieltrezendeadv-lang/compliance-trabalhista/actions/runs/30585425232) | `905e026cac907535d735257de4238be437884914` | `20260731094500_make_tenant_resolution_deterministic` | 37 → **38** |
+
+Ambas `success`, `attempt=1`, disparadas da `main`, com aprovação humana e o *wait timer* de 15 minutos cumprido integralmente (15 min 47 s e 15 min 14 s). Cada uma acrescentou **exatamente uma** linha ao ledger; nenhuma versão foi removida ou modificada.
+
+**Continuidade comprovada entre as execuções:** o `ledger-antes.tsv` da nº 6 é byte a byte idêntico ao `ledger-depois.tsv` da nº 4 (SHA-256 `9f34704b97…`). Nada mexeu no banco entre uma e outra.
+
+### Estado final
+
+**Ledger remoto em 38/38.** As 36 históricas congeladas mais as duas forward-only. **Nenhuma migration pendente** — a correspondência entre `supabase/migrations/*.sql` e o ledger é exata nos dois sentidos: nenhum arquivo sem registro, nenhum registro sem arquivo.
+
+### As falhas anteriores foram do ferramental
+
+Quatro execuções falharam antes. **Nenhuma aplicou nada, nem parcialmente** — todas morreram antes do `db push`, e o ledger só mudou nas execuções nº 4 e nº 6.
+
+| Execução | Onde parou | Causa | Corrigido em |
+|---|---|---|---|
+| nº 1 `30565821726` | 1º passo de guarda do preflight | `verify-recovered-migrations.mjs` invocada sem o diretório — saía com código 2 | **PR #15** |
+| nº 2 `30567425801` | `Conferir o ledger ANTES` | ainda o mesmo defeito de leitura do ledger | **PR #16** |
+| nº 3 `30569343187` | `Conferir o ledger ANTES` | `BEGIN`/`ROLLBACK` do psql entravam no TSV — 38 linhas para 36 registros | **PR #16** |
+| nº 5 `30579297584` | `Dry-run obrigatório` | a reserva removia `20260730123613`, já aplicada | **PR #17** |
+
+O desenho segurou onde devia. O preflight roda **sem credencial e sem environment**, então falha ali não toca produção nem consome a atenção do revisor; e as que passaram do preflight morreram em passos de **leitura**, antes de qualquer escrita.
+
+### Os três hotfixes
+
+- **[PR #15](https://github.com/gabrieltrezendeadv-lang/compliance-trabalhista/pull/15)** — passar o diretório para `verify-recovered-migrations.mjs`. Guardas: **AP-22** (estática) e **SIM-26**, que *executa* o passo de guardas do preflight e pega a família inteira do defeito.
+- **[PR #16](https://github.com/gabrieltrezendeadv-lang/compliance-trabalhista/pull/16)** — leitura do ledger sem tags de status, com validação estrita por **lista de permitidos**. Sessão somente leitura via `PGOPTIONS` em vez de bloco `BEGIN`/`ROLLBACK`; fechou também o *fail-open* que classificava `BEGIN` e `ROLLBACK` como forward-only. Exercitada contra psql real no `Verify`.
+- **[PR #17](https://github.com/gabrieltrezendeadv-lang/compliance-trabalhista/pull/17)** — reserva orientada pelo ledger (§3). Guardas **RES-01 a RES-10** e **SIM-36**, com o ledger real da execução nº 5 como fixture.
+
+### Limites de cobertura — o que a rota NÃO prova
+
+Registrado aqui porque um encerramento que só lista sucessos engana quem vier depois.
+
+1. **O verificador independente da segunda migration não assere literalmente `ASC`, a qualificação por schema (`public.organization_members`) nem o alias (`om.`).** Ele prova que **ambos** os critérios `created_at` e `id` estão dentro do `ORDER BY` — critério total e determinístico —, mas não o texto exato da cláusula. Qualificação e alias estão na migration aplicada e no estado esperado da âncora B do `migration-rebuild-verify`; simplesmente não são cobertos por *este* verificador.
+
+2. **T1–T9, os testes de comportamento com dados, rodaram somente no banco descartável** (`migration-rebuild-verify`, run `30556763063`). Em produção eles não rodam por decisão explícita: fabricar usuários e memberships dispararia gatilhos reais — `on_auth_user_created` escreve em `public.profiles` — e consumiria sequências. O que se afirma a partir de produção é o que o catálogo sustenta.
+
+3. **O aviso `Node.js 20 is deprecated`, da action `supabase/setup-cli`, é informativo e permanece.** É da plataforma GitHub sobre o runtime da action, não do código nem das migrations; a action roda em Node 24 e o CLI funciona. Nas duas execuções bem-sucedidas: `##[error]` = 0. Quando a action publicar versão em Node 24, vale reavaliar o SHA fixado.
+
+O que o verificador independente **prova**, em cada aplicação, por consulta de catálogo somente leitura: existência da função, `ORDER BY` presente e com critério total, filtro `deleted_at IS NULL`, linguagem, `STABLE`, `SECURITY DEFINER`, proprietário, tipo de retorno, `search_path`, ACL (`PUBLIC` e `anon` sem `EXECUTE`; `authenticated` e `service_role` com) e as 31 policies dependentes.
+
+### Nenhuma nova aplicação deve ser disparada
+
+**Não há o que aplicar.** Com o ledger em 38/38 e nenhuma pendente, um `workflow_dispatch` hoje seria recusado pela pré-condição **P6** (versão já consta do ledger) — a rota falha fechada, mas gastaria a espera de 15 minutos e uma aprovação à toa.
+
+A rota só deve ser acionada de novo quando existir uma **nova migration forward-only aprovada e mergeada na `main`**, com sua opção acrescentada ao `choice` do workflow (AP-03 reprova se a lista divergir) e seu arquivo em `scripts/ci/verify-applied/<versão>.sql` (AP-19 exige um para cada opção).
