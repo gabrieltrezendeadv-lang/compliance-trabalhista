@@ -1,9 +1,40 @@
 # Histórico canônico de migrations — reconciliado
 
 **Reconciliado em:** 29/07/2026 (Fase 3)
-**Conteúdo:** as **36 versões** efetivamente aplicadas no banco, e nada além
+**Conteúdo:** as **36 versões históricas** efetivamente aplicadas no banco, mais
+as migrations **forward-only** criadas depois da reconciliação
 **Estado anterior:** 13 arquivos com prefixos ausentes do histórico remoto — ver
 [`supabase/history/pre-reconciliation/`](../history/pre-reconciliation/README.md)
+
+---
+
+## Duas populações, com regras diferentes
+
+| | Históricas | Forward-only |
+|---|---|---|
+| Quantas | **36**, congeladas | as criadas após a reconciliação |
+| Constam de `applied-migrations.tsv` | **sim** | **não**, e não devem |
+| Aplicadas no banco remoto | sim | **não** |
+| Conteúdo conferido por `md5_norm` | **sim, obrigatoriamente** | não há hash de referência |
+| Faixa de versão permitida | as 36 exatas | **estritamente maior** que `20260728191324` |
+
+`applied-migrations.tsv` registra **o que o banco remoto aplicou**. Acrescentar
+ali uma migration só porque ela existe no repositório seria afirmar uma aplicação
+que não ocorreu, e o `md5_norm` daquela linha viraria ficção. **MF-22** reprova
+isso.
+
+A separação é implementada em
+[`tests/lib/migrations.mjs`](../../tests/lib/migrations.mjs) e exercida por
+[`tests/migration-classification-guard.mjs`](../../tests/migration-classification-guard.mjs),
+que reprova migration **intercalada** na faixa congelada — a condição que tornava
+`db push` perigoso — além de versão duplicada, regressiva, ausente ou fora do
+padrão de nome.
+
+### Migrations forward-only nesta pasta
+
+| Versão | Arquivo | O que faz |
+|---|---|---|
+| `20260730123613` | `20260730123613_revoke_public_webhook_execute.sql` | retira `EXECUTE` de `PUBLIC` em `fn_process_webhook_event`; corrige a lacuna achada na Fase 4C |
 
 ---
 
@@ -116,10 +147,17 @@ psql "$DB_URL" -f supabase/baseline/verify.sql
 
 Ver [`supabase/baseline/README.md`](../baseline/README.md).
 
-**Ainda não foi provado** que aplicar as 36 em sequência produz um schema
-equivalente ao do snapshot. Essa é a Fase 4, com critério de sucesso definido:
-diff estrutural vazio contra `supabase/baseline/schema.sql`. Até que ela passe,
-o snapshot é a única via de reconstrução com garantia.
+**Provado na Fase 4C, para a estrutura.** Aplicar as 36 em sequência num banco
+vazio produz um dump normalizado com o **mesmo SHA-256** do snapshot —
+`1f938ed09ed834290729697e4db5e3e02c045d06ccda9d187ec7c4287d1c3c0c` —, com diff
+estrutural vazio e piso de ruído vazio. Ver
+[`supabase/baseline/PHASE-4C-REBUILD-REPORT.md`](../baseline/PHASE-4C-REBUILD-REPORT.md).
+
+**Não provado para as permissões.** A mesma execução mostrou que as ACLs de
+tabela e os *default privileges* de produção não estão no repositório, e revelou
+que `fn_process_webhook_event` ficava executável por `PUBLIC` numa reconstrução
+limpa — corrigido pela migration forward-only `20260730123613`. As demais
+divergências de ACL seguem abertas e exigem decisão própria.
 
 ---
 

@@ -37,6 +37,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseManifest } from "./lib/manifest.mjs";
+import { classificarMigrations, resumo } from "./lib/migrations.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -338,16 +339,53 @@ function versoesDoManifesto() {
   return parseManifest(fs.readFileSync(tsv, "utf8")).map((r) => r.version);
 }
 
-test("MF-08: o conjunto de migrations é exatamente o histórico canônico das 36", () => {
+/** Classificação em históricas congeladas × forward-only. */
+function classificacao() {
+  return classificarMigrations(
+    path.join(root, "supabase/migrations"),
+    versoesDoManifesto()
+  );
+}
+
+test("MF-08: as 36 históricas são exatamente o conjunto canônico", () => {
+  // A lista literal permanece, e continua sendo a asserção rígida: alterar o
+  // conjunto histórico exige alterar esta lista de forma explícita. O que mudou
+  // é que ela é comparada contra as HISTÓRICAS, e não contra o diretório todo —
+  // do contrário nenhuma migration forward-only poderia mais ser criada.
+  const c = classificacao();
   assert.deepEqual(
-    migrationsNoDisco(),
+    c.historicas.map((h) => h.arquivo),
     CANONICOS,
-    "o conjunto de migrations mudou — ver supabase/migrations/README.md"
+    "o conjunto histórico mudou — ver supabase/migrations/README.md"
+  );
+  console.log(`       (${resumo(c)})`);
+});
+
+test("MF-08b: nenhuma migration forward-only invade a faixa congelada", () => {
+  const c = classificacao();
+  assert.deepEqual(
+    c.problemas,
+    [],
+    `classificação das migrations reprovada:\n  ${c.problemas.join("\n  ")}`
+  );
+  for (const f of c.forwardOnly) {
+    assert.ok(
+      f.version > c.limiteCongelado,
+      `${f.arquivo}: versão ${f.version} não é posterior à última histórica ${c.limiteCongelado}`
+    );
+  }
+  console.log(
+    `       (${c.forwardOnly.length} forward-only, todas depois de ${c.limiteCongelado})`
   );
 });
 
-test("MF-18: todo prefixo de arquivo em supabase/migrations existe no manifesto", () => {
+test("MF-18: todo prefixo em supabase/migrations é histórico OU posterior à faixa congelada", () => {
+  // Regra anterior: "nenhuma versão fora do manifesto". Insustentável a partir
+  // da primeira migration forward-only. Regra atual: nenhuma versão fora do
+  // manifesto DENTRO OU ANTES da faixa congelada — que é a condição que tornava
+  // `db push` perigoso, e continua reprovada.
   const doManifesto = new Set(versoesDoManifesto());
+  const limite = [...doManifesto].sort().at(-1);
   const forasteiros = [];
 
   for (const arquivo of migrationsNoDisco()) {
@@ -356,9 +394,10 @@ test("MF-18: todo prefixo de arquivo em supabase/migrations existe no manifesto"
       forasteiros.push(`${arquivo}: nome não começa com 14 dígitos`);
       continue;
     }
-    if (!doManifesto.has(m[1])) {
+    if (!doManifesto.has(m[1]) && m[1] <= limite) {
       forasteiros.push(
-        `${arquivo}: versão ${m[1]} não consta de applied-migrations.tsv`
+        `${arquivo}: versão ${m[1]} não consta de applied-migrations.tsv e não é ` +
+          `posterior à última histórica ${limite} — intercalada na faixa congelada`
       );
     }
   }
@@ -366,7 +405,7 @@ test("MF-18: todo prefixo de arquivo em supabase/migrations existe no manifesto"
   assert.deepEqual(
     forasteiros,
     [],
-    `migration com versão ausente do histórico aplicado — era exatamente esta ` +
+    `migration intercalada no histórico aplicado — era exatamente esta ` +
       `condição que tornava db push perigoso:\n  ${forasteiros.join("\n  ")}`
   );
 });
@@ -391,11 +430,34 @@ test("MF-19: cada versão do manifesto tem exatamente um arquivo", () => {
     `correspondência manifesto ↔ arquivo quebrada:\n  ${problemas.join("\n  ")}`
   );
 
+  const c = classificacao();
+  assert.equal(
+    c.historicas.length,
+    versoesDoManifesto().length,
+    "o número de migrations históricas divergiu do manifesto"
+  );
   assert.equal(
     arquivos.length,
-    versoesDoManifesto().length,
-    "há arquivo em supabase/migrations sem versão correspondente no manifesto"
+    c.historicas.length + c.forwardOnly.length,
+    "há arquivo em supabase/migrations que não é histórico nem forward-only"
   );
+});
+
+test("MF-22: o manifesto NÃO registra as migrations forward-only", () => {
+  // applied-migrations.tsv é o que o banco remoto aplicou. Acrescentar ali uma
+  // migration só porque ela existe no repositório seria afirmar uma aplicação
+  // que não ocorreu — e o md5_norm dessa linha viraria ficção.
+  const c = classificacao();
+  const doManifesto = new Set(versoesDoManifesto());
+  for (const f of c.forwardOnly) {
+    assert.equal(
+      doManifesto.has(f.version),
+      false,
+      `${f.arquivo} é forward-only mas consta de applied-migrations.tsv — o ` +
+        `manifesto passou a afirmar uma aplicação remota que não ocorreu`
+    );
+  }
+  assert.equal(doManifesto.size, 36, "o manifesto deixou de ter 36 versões");
 });
 
 test("MF-17: supabase/checks contém apenas leitura", () => {
@@ -564,23 +626,37 @@ test("MF-16: URI sem senha é aprovada", () => {
   assert.deepEqual(v, [], `URI sem senha não deveria ser acusada: ${JSON.stringify(v)}`);
 });
 
-test("MF-21: MF-18 acusa versão inventada — testado sem tocar no disco", () => {
-  // Prova que a propriedade de prefixo tem dente. A lógica é replicada aqui
-  // sobre entradas sintéticas porque MF-18 lê o diretório real.
-  const doManifesto = new Set(["20260724013538", "20260724014530"]);
+test("MF-21: MF-18 acusa intercalação e absolve forward-only — sem tocar no disco", () => {
+  // Prova que a propriedade de prefixo tem dente, e que tem o dente CERTO.
+  //
+  // A regra mudou na Fase 5: antes era "nenhuma versão fora do manifesto", o
+  // que impediria qualquer migration nova. Agora é "nenhuma versão fora do
+  // manifesto dentro ou antes da faixa congelada". Este teste replica a lógica
+  // exata de MF-18 sobre entradas sintéticas — MF-18 lê o diretório real — e
+  // exige que ela reprove a intercalação E aprove a forward-only legítima.
+  //
+  // Aprovar a forward-only é metade do teste: uma regra que reprovasse tudo
+  // passaria numa verificação que só procura reprovações.
+  const doManifesto = new Set(["20260724013538", "20260728191324"]);
+  const limite = [...doManifesto].sort().at(-1);
   const candidatos = [
-    "20260724013538_foundation.sql",
-    "20260729999999_migration_inventada.sql",
-    "sem_prefixo.sql",
+    "20260724013538_foundation.sql", // histórica
+    "20260728191324_fix_005.sql", // histórica, a última da faixa
+    "20260730123613_forward_only.sql", // posterior à faixa → legítima
+    "20260727000000_intercalada.sql", // dentro da faixa, fora do manifesto → violação
+    "20260101000000_anterior.sql", // antes da faixa, fora do manifesto → violação
+    "sem_prefixo.sql", // nome inválido → violação
   ];
 
   const forasteiros = candidatos.filter((arquivo) => {
     const m = arquivo.match(/^(\d{14})_/);
-    return !m || !doManifesto.has(m[1]);
+    if (!m) return true;
+    return !doManifesto.has(m[1]) && m[1] <= limite;
   });
 
   assert.deepEqual(forasteiros, [
-    "20260729999999_migration_inventada.sql",
+    "20260727000000_intercalada.sql",
+    "20260101000000_anterior.sql",
     "sem_prefixo.sql",
   ]);
 });
