@@ -117,11 +117,84 @@ test("MF-03: nenhuma automação executa `supabase migration up`", () => {
   assert.deepEqual(hits, [], `migration up encontrado:\n  ${hits.join("\n  ")}`);
 });
 
-test("MF-04: nenhuma automação executa `supabase migration fetch`", () => {
-  // Proibido até a Fase 2 ser autorizada. Quando for, esta asserção deve ser
-  // afrouxada de forma explícita e revisada, nunca removida em silêncio.
-  const hits = findInAutomation(/supabase\s+migration\s+fetch/);
-  assert.deepEqual(hits, [], `migration fetch encontrado:\n  ${hits.join("\n  ")}`);
+// ── MF-04: `migration fetch` — exceção única e delimitada ────────────────────
+//
+// A Fase 2 (recuperação canônica das 36 migrations) precisa de exatamente uma
+// invocação de `supabase migration fetch`. A exceção é estreita de propósito:
+// vale só para o workflow da Fase 2, só com `--db-url`, só em disparo manual.
+//
+// `--linked` continua proibido em qualquer lugar: ele exige `supabase link` e
+// um access token, ampliando o alcance da credencial muito além de uma leitura.
+
+/** Caminho do único arquivo autorizado a invocar `migration fetch`. */
+const FETCH_AUTORIZADO = ".github/workflows/recover-migrations-temp.yml";
+
+/**
+ * Avalia invocações de `migration fetch` e devolve as violações.
+ *
+ * Recebe entradas sintéticas — `[{ file, content }]` — para poder ser exercida
+ * por testes negativos sem tocar no sistema de arquivos.
+ */
+export function violacoesDeFetch(entradas) {
+  const violacoes = [];
+
+  for (const { file, content } of entradas) {
+    const linhas = content
+      .split("\n")
+      .map((text, i) => ({ n: i + 1, text }))
+      .filter(({ text }) => {
+        const t = text.trim();
+        return t !== "" && !t.startsWith("#") && !t.startsWith("//");
+      });
+
+    // `--linked` é proibido em qualquer arquivo, com ou sem fetch.
+    for (const { n, text } of linhas) {
+      if (/--linked\b/.test(text)) {
+        violacoes.push(`${file}:${n} usa --linked (proibido)`);
+      }
+    }
+
+    const normalizado = file.split("\\").join("/");
+    const fetches = linhas.filter(({ text }) =>
+      /supabase\s+migration\s+fetch/.test(text)
+    );
+    if (fetches.length === 0) continue;
+
+    if (normalizado !== FETCH_AUTORIZADO) {
+      for (const { n } of fetches) {
+        violacoes.push(
+          `${file}:${n} invoca migration fetch fora de ${FETCH_AUTORIZADO}`
+        );
+      }
+      continue;
+    }
+
+    // No arquivo autorizado: exigir --db-url e disparo manual.
+    for (const { n, text } of fetches) {
+      if (!/--db-url\b/.test(text)) {
+        violacoes.push(`${file}:${n} invoca migration fetch sem --db-url`);
+      }
+    }
+    if (!/workflow_dispatch/.test(content)) {
+      violacoes.push(`${file} invoca migration fetch sem workflow_dispatch`);
+    }
+  }
+
+  return violacoes;
+}
+
+test("MF-04: `migration fetch` só no workflow da Fase 2, com --db-url e manual", () => {
+  const entradas = FILES.map((file) => ({
+    file,
+    content: fs.readFileSync(path.join(root, file), "utf8"),
+  }));
+
+  const violacoes = violacoesDeFetch(entradas);
+  assert.deepEqual(
+    violacoes,
+    [],
+    `uso indevido de migration fetch ou --linked:\n  ${violacoes.join("\n  ")}`
+  );
 });
 
 test("MF-05: nenhuma automação executa `supabase link`", () => {
@@ -196,6 +269,83 @@ test("MF-08: o conjunto de migrations não mudou durante o congelamento", () => 
     sql,
     esperados,
     "o conjunto de migrations mudou — ver supabase/migrations/README.md"
+  );
+});
+
+// ── Testes negativos da própria guarda ───────────────────────────────────────
+//
+// Uma guarda que nunca reprova nada é indistinguível de guarda ausente. Os
+// casos abaixo alimentam `violacoesDeFetch` com entradas sintéticas e exigem
+// que ela ACUSE a violação. Nada é escrito no disco.
+
+const WF_OK = `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "$SUPABASE_DB_URL_FETCH"\n`;
+
+test("MF-09: fetch com --linked é reprovado, mesmo no workflow autorizado", () => {
+  const v = violacoesDeFetch([
+    {
+      file: FETCH_AUTORIZADO,
+      content: `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --linked\n`,
+    },
+  ]);
+  assert.ok(v.length > 0, "deveria acusar --linked");
+  assert.ok(
+    v.some((m) => m.includes("--linked")),
+    `mensagem deveria citar --linked: ${JSON.stringify(v)}`
+  );
+});
+
+test("MF-10: fetch fora do workflow autorizado é reprovado", () => {
+  const v = violacoesDeFetch([
+    { file: ".github/workflows/ci.yml", content: WF_OK },
+  ]);
+  assert.ok(v.length > 0, "deveria acusar fetch em arquivo não autorizado");
+  assert.ok(
+    v.some((m) => m.includes("fora de")),
+    `mensagem deveria dizer que está fora do arquivo autorizado: ${JSON.stringify(v)}`
+  );
+});
+
+test("MF-11: fetch sem --db-url é reprovado", () => {
+  const v = violacoesDeFetch([
+    {
+      file: FETCH_AUTORIZADO,
+      content: `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch\n`,
+    },
+  ]);
+  assert.ok(
+    v.some((m) => m.includes("sem --db-url")),
+    `deveria exigir --db-url: ${JSON.stringify(v)}`
+  );
+});
+
+test("MF-12: fetch sem workflow_dispatch é reprovado", () => {
+  const v = violacoesDeFetch([
+    {
+      file: FETCH_AUTORIZADO,
+      content: `on:\n  push:\n    branches: [main]\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "$X"\n`,
+    },
+  ]);
+  assert.ok(
+    v.some((m) => m.includes("workflow_dispatch")),
+    `deveria exigir workflow_dispatch: ${JSON.stringify(v)}`
+  );
+});
+
+test("MF-13: o caso legítimo da Fase 2 é aprovado", () => {
+  const v = violacoesDeFetch([{ file: FETCH_AUTORIZADO, content: WF_OK }]);
+  assert.deepEqual(v, [], `não deveria acusar o caso válido: ${JSON.stringify(v)}`);
+});
+
+test("MF-14: --linked é reprovado em qualquer arquivo, mesmo sem fetch", () => {
+  const v = violacoesDeFetch([
+    {
+      file: ".github/workflows/ci.yml",
+      content: `jobs:\n  x:\n    steps:\n      - run: supabase db reset --linked\n`,
+    },
+  ]);
+  assert.ok(
+    v.some((m) => m.includes("--linked")),
+    `deveria acusar --linked isolado: ${JSON.stringify(v)}`
   );
 });
 

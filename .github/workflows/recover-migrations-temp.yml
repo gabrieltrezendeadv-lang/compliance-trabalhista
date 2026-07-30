@@ -1,0 +1,169 @@
+name: Recover migrations (TEMPORÁRIO — Fase 2)
+
+# =============================================================================
+# WORKFLOW TEMPORÁRIO — REMOVER AO FIM DA FASE 3
+#
+# Recupera o histórico canônico das 36 migrations a partir de
+# supabase_migrations.schema_migrations, onde o SQL original está preservado na
+# coluna `statements`.
+#
+# ── GARANTIAS ────────────────────────────────────────────────────────────────
+#   · manual apenas (workflow_dispatch) — nunca dispara por push ou PR
+#   · permissions: contents: read
+#   · CLI do Supabase em versão FIXADA
+#   · `migration fetch` é operação de LEITURA no banco
+#   · o secret entra somente por `env:`; nunca é interpolado em `run:`,
+#     nunca é impresso, nunca é gravado em arquivo
+#   · trabalha em diretório descartável (/tmp) — NÃO escreve sobre
+#     supabase/migrations do repositório
+#   · não commita, não publica branch, não abre PR
+#   · artifact privado, retenção curta
+#
+# ── EXPLICITAMENTE NÃO USADO ─────────────────────────────────────────────────
+#   supabase link · --linked · SUPABASE_ACCESS_TOKEN · db push
+#   migration repair · migration up · db pull · db reset · deploy
+#
+# Nada aqui é capaz de alterar o banco remoto.
+#
+# ── SEQUÊNCIA DE AUTORIZAÇÃO ─────────────────────────────────────────────────
+#
+# 1. ESTE WORKFLOW NÃO PODE SER EXECUTADO ENQUANTO EXISTIR APENAS NA BRANCH.
+#    O GitHub só oferece `workflow_dispatch` para workflows presentes na branch
+#    default. Enquanto este arquivo estiver apenas em
+#    `chore/recover-supabase-migrations`, ele não aparece em Actions e não há
+#    como dispará-lo — nem por engano.
+#
+# 2. Depois do merge na `main`, é necessária AUTORIZAÇÃO SEPARADA para
+#    cadastrar o secret `SUPABASE_DB_URL_FETCH` e realizar UMA ÚNICA execução.
+#    O merge deste PR não constitui essa autorização.
+#
+# 3. Concluída a recuperação e baixado o artefato, o secret é EXCLUÍDO
+#    IMEDIATAMENTE (`gh secret delete SUPABASE_DB_URL_FETCH`), com
+#    `gh secret list` confirmando a remoção.
+#
+# 4. A REMOÇÃO DESTE WORKFLOW TEMPORÁRIO acontece em PR POSTERIOR, junto da
+#    Fase 3 (reconciliação). Ele não deve permanecer no repositório depois de
+#    cumprida a sua função única.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmacao:
+        description: 'Digite RECUPERAR para confirmar (operação de leitura no banco)'
+        required: true
+        type: string
+
+concurrency:
+  group: recover-migrations
+  cancel-in-progress: false
+
+env:
+  # Versão fixada — não usar "latest".
+  SUPABASE_CLI_VERSION: 2.110.0
+  WORKDIR: /tmp/recover
+
+jobs:
+  recover:
+    name: Recuperar 36 migrations
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Exigir confirmação explícita
+        run: |
+          if [ "${{ inputs.confirmacao }}" != "RECUPERAR" ]; then
+            echo "Confirmação ausente ou incorreta. Digite RECUPERAR para prosseguir."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: ${{ env.SUPABASE_CLI_VERSION }}
+
+      - name: Registrar versão do CLI
+        run: supabase --version
+
+      - name: Preparar projeto descartável
+        run: |
+          mkdir -p "$WORKDIR"
+          cd "$WORKDIR"
+          supabase init --force
+          # Diretório de migrations do projeto descartável, vazio neste ponto.
+          mkdir -p "$WORKDIR/supabase/migrations"
+          echo "arquivos antes do fetch: $(ls -1 "$WORKDIR/supabase/migrations" | wc -l)"
+
+      # `--db-url` conecta direto, sem `supabase link` e sem access token.
+      # O secret é lido do ambiente pelo próprio processo; não aparece na linha
+      # de comando renderizada no log.
+      - name: Recuperar migrations do histórico remoto
+        working-directory: /tmp/recover
+        env:
+          SUPABASE_DB_URL_FETCH: ${{ secrets.SUPABASE_DB_URL_FETCH }}
+        run: |
+          if [ -z "$SUPABASE_DB_URL_FETCH" ]; then
+            echo "FALHA: secret SUPABASE_DB_URL_FETCH ausente ou vazio"
+            exit 1
+          fi
+          supabase migration fetch --db-url "$SUPABASE_DB_URL_FETCH"
+          echo "arquivos após o fetch: $(ls -1 supabase/migrations/*.sql 2>/dev/null | wc -l)"
+
+      - name: Conferir que nada foi escrito em supabase/migrations do repositório
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          if ! git diff --quiet -- supabase/migrations; then
+            echo "FALHA: supabase/migrations do repositório foi alterado"
+            git diff --stat -- supabase/migrations
+            exit 1
+          fi
+          echo "OK — supabase/migrations do repositório intacto"
+
+      - name: Validar recuperação contra a matriz remota
+        run: |
+          node "$GITHUB_WORKSPACE/tests/verify-recovered-migrations.mjs" \
+            "$WORKDIR/supabase/migrations"
+
+      - name: Gerar manifesto (sem credenciais)
+        run: |
+          cd "$WORKDIR/supabase/migrations"
+          {
+            echo "# Manifesto da recuperação — Fase 2"
+            echo "# gerado em: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "# CLI: $(supabase --version 2>/dev/null | head -1)"
+            echo "# run: ${{ github.run_id }} · commit: ${{ github.sha }}"
+            echo "#"
+            echo "# Nenhuma credencial, connection string ou dado de tabela consta aqui."
+            echo ""
+            printf "%s\t%s\t%s\n" "sha256" "bytes" "arquivo"
+            for f in *.sql; do
+              printf "%s\t%s\t%s\n" "$(sha256sum "$f" | cut -d' ' -f1)" "$(wc -c < "$f")" "$f"
+            done
+          } > "$WORKDIR/MANIFEST.tsv"
+          echo "--- manifesto ---"
+          head -12 "$WORKDIR/MANIFEST.tsv"
+
+      - name: Conferir que o manifesto não contém credenciais
+        run: |
+          if grep -qE 'eyJ[A-Za-z0-9_-]{20,}|postgres(ql)?://[^ ]*:[^ ]*@|aact_|whsec_' "$WORKDIR/MANIFEST.tsv"; then
+            echo "FALHA: manifesto contém padrão de credencial"
+            exit 1
+          fi
+          echo "OK — manifesto limpo"
+
+      - name: Reunir artefato
+        run: |
+          mkdir -p /tmp/artifact
+          cp "$WORKDIR"/supabase/migrations/*.sql /tmp/artifact/
+          cp "$WORKDIR/MANIFEST.tsv" /tmp/artifact/
+          echo "arquivos no artefato: $(ls -1 /tmp/artifact | wc -l) (36 SQL + manifesto)"
+
+      - name: Publicar artefato privado
+        uses: actions/upload-artifact@v6
+        with:
+          name: recovered-migrations
+          path: /tmp/artifact/
+          if-no-files-found: error
+          retention-days: 3

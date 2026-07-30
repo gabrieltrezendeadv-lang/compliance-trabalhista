@@ -1,0 +1,57 @@
+# Matriz das migrations aplicadas no banco tvwgzpgyfdfrbdaeoqzl
+#
+# Extraída em 29/07/2026 por consulta somente leitura a
+# supabase_migrations.schema_migrations. Nenhum dado de tabela de negócio.
+#
+# len_norm / md5_norm referem-se ao SQL de statements[1] após normalização:
+#   1. remove blocos /* ... */
+#   2. remove comentários -- até fim de linha
+#   3. colapsa espaços em branco
+#   4. minúsculas
+#   5. trim
+#
+# Servem como assinatura de integridade: um arquivo recuperado por
+# `supabase migration fetch` deve reproduzir exatamente o md5_norm da sua
+# versão. Divergência indica recuperação incorreta ou evolução do banco.
+#
+# Reproduzir a normalização: tests/lib/normalize-sql.mjs
+#
+# ⚠️ Este arquivo NÃO é migration e não deve ser aplicado em banco algum.
+#
+version	name	len_norm	md5_norm
+20260724013538	foundation	7445	8eb5442f54b25c5c37361472c5421b76
+20260724014530	onboarding_function	940	74bd89e78a8e85f539646afe73e5bdb4
+20260724120859	create_evidence_tables	10363	5457917e30d619a65ae2a0a1eec8f9e8
+20260724121010	evidence_security_definer_functions	13132	fb3fd4f39158dfc3ea086ec530deecb0
+20260724121902	create_complaint_tables	8776	68f7a76b0a4df9af3ae6d28fcd36da46
+20260724122001	complaint_security_definer_functions	12089	96a04f1cd59c77ada9921c7879484885
+20260724122058	create_campaign_tables	10154	b33ef68474bb4c5c62d6d022d272a751
+20260724122324	campaign_security_definer_functions	7242	a2b99eea6d665f0b7239e87a2a6bc54c
+20260724123308	create_profiles_table	2439	5e830868066abe53adccd19f3d3832af
+20260724123926	assessment_tables	7005	dec09a8e5a0bfa0ccfbfe883b507228b
+20260724124015	assessment_functions	9487	42524579074a8c5df10d68b6f692307c
+20260724130400	migrate_pin_to_bcrypt	5204	f1746f92c4348f868a8c7da0dd0da8e0
+20260724133019	fix_rls_recursion_complaint_investigators	2492	949d9860ed6caeb2e337ca4d43bf0513
+20260724134828	create_risk_inventory_tables	8574	28627f59975e1e65e12c5033ff63c7a1
+20260724134918	risk_inventory_functions	8466	fa148a7610cf47f3a073aa4f933b7c93
+20260724160830	create_webhook_events_table	980	5e5e086bc7e72d24bfd79bc4224d888e
+20260724161323	add_trialing_to_subscription_status	89	825397e39079393d7ccb19bc6003883c
+20260724161707	create_billing_tables_only	6123	384fc749825dd42b983c7159b579b792
+20260724161734	create_billing_functions	4351	256aa0a5fa1c4f3fe5b929e822997ca5
+20260726004007	sec001_revoke_public_execute_regrant	5236	bef8330a4a4f5708a89dd832a5c7d87a
+20260726004028	sec002_check_plan_limit_derive_tenant	2837	3fd4e6f73a19899f168656100902bb36
+20260726004116	sec003_complaint_pin_bcrypt_ratelimit	9396	79f6945a6beef3356f38f59a048eb802
+20260726004137	sec004_remove_member_rpc	3376	1a3536ac73ed1986021204210860cba2
+20260726004204	sec005_campaign_employee_profiles	4703	1527a3da7b49111aa20962e709523f04
+20260726004230	sec006_webhook_transactional_idempotent	3718	30909b7167d724a6bf71b86dc75ff931
+20260728005535	sec_block1_expand	26253	b0ac312f465e1a50faa71b9bbbe26212
+20260728010455	sec_block1_contract	7321	04b1564c6eec314407cf4f76adec455e
+20260728190937	20260728150000_fix_001_evidence_reports	5366	2c1eb0a04b549ee74192bb566a61a75f
+20260728191019	20260728151000_fix_003_reverse_scoring	8609	c08a005e26e23be3293216b3a82539a4
+20260728191046	20260728152000_fix_004_assessment_submission	4227	6775949b01618da5752d946790aad705
+20260728191110	20260728152500_priv_001_anonymous_assessments_ddl	3430	d2ccfc6c31f667a10c987eac9325e9c2
+20260728191144	20260728152500_priv_001_anonymous_assessments_fns1	6294	f21b39794d148178cd244d46928febbb
+20260728191241	20260728152500_priv_001_anonymous_assessments_fns2_grants	12617	94c66bad1875c0bb77f2f6c03a075477
+20260728191255	20260728153000_sec_006_table_privileges	199	f22bcc325725287f9a2dc5c47f897033
+20260728191311	20260728154500_sec_002_retire_plan_limit	215	0b6cb60abb0b4788dbd070c22966ea6e
+20260728191324	20260728155000_fix_005_close_expired_cycles	681	cdd6bfff6231250e196906b1c619d8c0
