@@ -168,16 +168,39 @@ test("AP-11: as evidências publicadas não incluem a credencial", () => {
 });
 
 test("AP-12: a rota reusa as guardas existentes em vez de reimplementá-las", () => {
+  // Invocadas diretamente pelo workflow.
   for (const guarda of [
     "tests/verify-recovered-migrations.mjs",
     "tests/migration-freeze-guard.mjs",
     "tests/migration-classification-guard.mjs",
     "scripts/ci/check-ledger.mjs",
-    "scripts/ci/list-forward-only.mjs",
+    "scripts/ci/reserve-forward-only.mjs",
   ]) {
     assert.ok(wf.includes(guarda), `a rota não invoca ${guarda}`);
     assert.ok(fs.existsSync(path.join(raiz, guarda)), `${guarda} não existe`);
   }
+
+  // `list-forward-only.mjs` deixou de ser invocado pelo workflow quando a
+  // reserva passou a ser orientada pelo ledger: a decisão precisa de mais do
+  // que a lista de forward-only. Mas a CLASSIFICAÇÃO continua tendo de vir da
+  // biblioteca compartilhada — reimplementá-la dentro do script de reserva
+  // criaria duas definições de "o que é histórica" que poderiam divergir.
+  const reserva = ler("scripts/ci/reserve-forward-only.mjs");
+  assert.match(
+    reserva,
+    /from "\.\.\/\.\.\/tests\/lib\/migrations\.mjs"/,
+    "a reserva tem de usar a classificação compartilhada"
+  );
+  assert.match(
+    reserva,
+    /from "\.\.\/\.\.\/tests\/lib\/manifest\.mjs"/,
+    "a reserva tem de ler o manifesto pelo parser compartilhado"
+  );
+  assert.doesNotMatch(
+    reserva,
+    /applied-migrations\.tsv["'][\s\S]{0,200}split\(/,
+    "a reserva não pode reimplementar o parser do manifesto"
+  );
 });
 
 test("AP-13: a asserção de EXECUTE para PUBLIC é obrigatória no Verify", () => {
