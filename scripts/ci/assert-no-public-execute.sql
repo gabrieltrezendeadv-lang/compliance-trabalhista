@@ -58,13 +58,18 @@ BEGIN
   FOR r IN
     SELECT n.nspname AS schema_nome,
            p.proname AS rotina,
+           -- `prokind` é do tipo "char". Concatenar com literal `unknown` deixa
+           -- o operador `||` ambíguo e o PostgreSQL recusa a consulta inteira,
+           -- em tempo de execução. Por isso o mapeamento é fechado e o valor
+           -- bruto é exposto em coluna própria, já convertido, sem concatenação.
            CASE p.prokind
              WHEN 'f' THEN 'function'
              WHEN 'p' THEN 'procedure'
              WHEN 'a' THEN 'aggregate'
              WHEN 'w' THEN 'window'
-             ELSE 'desconhecido(' || p.prokind || ')'
+             ELSE 'outro'
            END AS tipo,
+           p.prokind::text AS prokind_bruto,
            pg_get_function_identity_arguments(p.oid) AS assinatura,
            COALESCE(p.proacl, acldefault('f', p.proowner))::text AS acl
       FROM pg_proc p
@@ -80,8 +85,9 @@ BEGIN
   LOOP
     v_total := v_total + 1;
     v_lista := v_lista
-      || format(E'\n  %s. %s.%s(%s)\n       tipo: %s\n       ACL : %s',
-                v_total, r.schema_nome, r.rotina, r.assinatura, r.tipo, r.acl);
+      || format(E'\n  %s. %s.%s(%s)\n       tipo: %s (prokind=%s)\n       ACL : %s',
+                v_total, r.schema_nome, r.rotina, r.assinatura,
+                r.tipo, r.prokind_bruto, r.acl);
   END LOOP;
 
   IF v_total > 0 THEN
