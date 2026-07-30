@@ -110,6 +110,63 @@ jobs:
       - name: Nenhuma rotina de public concede EXECUTE a PUBLIC
         run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-no-public-execute.sql'
 
+      # ────────────────────────────────────────────────────────────────────
+      # LEITURA DO LEDGER — contra psql de verdade
+      #
+      # A estreia da rota de aplicação falhou porque o passo de leitura do
+      # ledger recebia `BEGIN` e `ROLLBACK` junto com os registros: eram os
+      # tags de status que o psql imprime para cada comando do bloco
+      # `BEGIN ... ROLLBACK`. Nenhuma fixture teria previsto isso — só o psql
+      # sabe o que o psql imprime.
+      #
+      # Por isso a mesma implementação usada pela rota roda aqui, contra a
+      # stack descartável que este job já sobe. Uma fixture que reproduz a
+      # expectativa provaria apenas que o autor e o teste concordam.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Leitura do ledger — implementação da rota, contra psql real
+        run: |
+          set -o pipefail
+          # Conexão local descartável, decomposta em PG* como a rota faz.
+          # `parse-db-url.mjs` não serve aqui: ele exige o alvo de produção.
+          export PGHOST=$(printf '%s' "$DB_URL" | sed -E 's#^[^@]*@([^:/]+).*#\1#')
+          export PGPORT=$(printf '%s' "$DB_URL" | sed -E 's#^.*:([0-9]+)/.*#\1#')
+          export PGUSER=$(printf '%s' "$DB_URL" | sed -E 's#^postgres(ql)?://([^:]+):.*#\2#')
+          export PGPASSWORD=$(printf '%s' "$DB_URL" | sed -E 's#^postgres(ql)?://[^:]+:([^@]*)@.*#\2#')
+          export PGDATABASE=postgres
+          case "$PGHOST" in
+            localhost|127.0.0.1|::1) ;;
+            *) echo "FALHA: este passo só roda contra o descartável local"; exit 1 ;;
+          esac
+
+          bash scripts/ci/read-remote-ledger.sh /tmp/ledger-local.tsv
+
+          echo "== conteúdo lido =="
+          cat /tmp/ledger-local.tsv
+
+          # O que o defeito produzia, e que não pode voltar.
+          if grep -qE '^(BEGIN|ROLLBACK|COMMIT|SET)$' /tmp/ledger-local.tsv; then
+            echo "FALHA: tag de status do psql entrou no arquivo do ledger"
+            exit 1
+          fi
+
+          # Toda linha no formato exigido, e a contagem tem de bater com o
+          # número de migrations do repositório — aqui todas estão aplicadas.
+          if grep -qvE '^[0-9]{14}\|.+$' /tmp/ledger-local.tsv; then
+            echo "FALHA: linha fora do formato <14 dígitos>|<nome>"
+            grep -nvE '^[0-9]{14}\|.+$' /tmp/ledger-local.tsv
+            exit 1
+          fi
+          LIDAS=$(wc -l < /tmp/ledger-local.tsv)
+          ESPERADAS=$(ls -1 supabase/migrations/*.sql | wc -l)
+          echo "lidas=$LIDAS  migrations no repositório=$ESPERADAS"
+          [ "$LIDAS" -eq "$ESPERADAS" ] || {
+            echo "FALHA: o ledger local devia ter uma linha por migration aplicada"; exit 1; }
+
+          # E o validador estrito tem de aprovar o mesmo arquivo.
+          node scripts/ci/assert-ledger-format.mjs /tmp/ledger-local.tsv /tmp/ledger-local.ok.tsv
+          cmp /tmp/ledger-local.tsv /tmp/ledger-local.ok.tsv
+          echo "leitura do ledger confere contra psql real"
+
       - name: Derrubar a stack
         if: always()
         run: supabase stop --no-backup || true

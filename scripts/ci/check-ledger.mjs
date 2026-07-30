@@ -63,6 +63,28 @@ const obtidas = linhas.map((linha) => {
 
 const problemas = [];
 
+// ── Formato: version tem de ser 14 dígitos ──────────────────────────────────
+//
+// Isto fecha um fail-open descoberto na estreia da rota de aplicação. O
+// arquivo chegou com `BEGIN` na primeira linha e `ROLLBACK` na última — tags
+// de status do psql. Como a classificação por faixa é textual, e `'B' > '2'`,
+// ambas ordenaram DEPOIS da última histórica e foram contadas como
+// forward-only: o log diz "forward-only ... 2". A execução só reprovou porque
+// a ordenação ficou inconsistente, por acidente. Com tags que ordenassem
+// antes, o ledger corrompido teria passado.
+//
+// A leitura já é validada em assert-ledger-format.mjs; esta verificação existe
+// para que QUALQUER chamador — inclusive o migration-rebuild-verify — reprove
+// entrada malformada, e não só o caminho novo.
+for (const o of obtidas) {
+  if (!/^\d{14}$/.test(o.version)) {
+    problemas.push(
+      `version fora do formato de 14 dígitos: ${JSON.stringify(o.version)} — ` +
+        `linha inteira: ${JSON.stringify([o.version, o.name, o.statements].join("|"))}`
+    );
+  }
+}
+
 // ── Duplicidade ─────────────────────────────────────────────────────────────
 const contagem = new Map();
 for (const { version } of obtidas) {
