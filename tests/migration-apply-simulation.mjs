@@ -650,6 +650,95 @@ test("SIM-35: check-ledger também reprova version malformada", () => {
   assert.match(r.out, /version fora do formato de 14 dígitos/);
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// 11. O BLOCO DE RESERVA, EXTRAÍDO DO WORKFLOW, NO CENÁRIO REAL
+// ══════════════════════════════════════════════════════════════════════════
+test("SIM-36: o passo de reserva executa o cenário real da SEGUNDA migration", () => {
+  // Executa o shell do próprio workflow — não uma cópia — com o ledger REAL de
+  // 37 registros lido do banco na execução nº 5, e a segunda migration
+  // selecionada. É exatamente a combinação que fez a nº 5 falhar.
+  //
+  // O diretório de migrations do repositório NÃO é tocado:
+  // RESERVA_DIR_MIGRATIONS aponta para uma cópia temporária.
+  const script = runDoPasso("Reservar as demais forward-only (orientado pelo ledger)", "apply");
+
+  const dirCopia = path.join(tmp, "migrations-copia");
+  fs.mkdirSync(dirCopia, { recursive: true });
+  for (const f of fs.readdirSync(path.join(raiz, "supabase/migrations"))) {
+    if (f.endsWith(".sql")) {
+      fs.copyFileSync(path.join(raiz, "supabase/migrations", f), path.join(dirCopia, f));
+    }
+  }
+
+  const ledgerReal = path.join(raiz, "tests/fixtures/ledger-run5-37.tsv");
+  const registros = fs
+    .readFileSync(ledgerReal, "utf8")
+    .split(/\r?\n/)
+    .filter((l) => l.trim() !== "");
+  assert.equal(registros.length, 37, "a fixture deve ser o ledger de 37 da execução nº 5");
+
+  // O passo lê `artifacts/ledger-antes.tsv` relativo ao workspace, como no CI.
+  const artefatos = path.join(raiz, "artifacts");
+  const jaExistia = fs.existsSync(artefatos);
+  const alvo = path.join(artefatos, "ledger-antes.tsv");
+  fs.mkdirSync(artefatos, { recursive: true });
+  fs.copyFileSync(ledgerReal, alvo);
+
+  // Rede de proteção do próprio teste. O bloco extraído do workflow é shell
+  // real: se um dia alguém o reescrever de forma a NÃO respeitar
+  // RESERVA_DIR_MIGRATIONS, ele mexeria no diretório de verdade. Aconteceu ao
+  // exercitar a mutação "voltar ao laço antigo": o laço movia
+  // `supabase/migrations/$F` diretamente e levou um arquivo real embora.
+  //
+  // Guardar a lista antes e conferir depois transforma esse dano silencioso
+  // numa falha alta — e o `finally` devolve o que tiver saído.
+  const dirReal = path.join(raiz, "supabase/migrations");
+  const antesReal = fs.readdirSync(dirReal).sort();
+
+  try {
+    const selecionada = fs
+      .readdirSync(dirCopia)
+      .filter((f) => f.endsWith(".sql"))
+      .find((f) => !registros.some((r) => r.startsWith(f.slice(0, 14))));
+    assert.ok(selecionada, "deveria haver exatamente uma pendente no cenário real");
+
+    const r = shell(script, {
+      MIGRATION: selecionada,
+      RESERVA_DIR_MIGRATIONS: dirCopia,
+    });
+    assert.equal(r.code, 0, `o passo de reserva falhou:\n${r.out}`);
+    assert.match(r.out, /exatamente uma pendente no diretório/);
+
+    // Toda versão do ledger continua presente — é o que a nº 5 quebrou.
+    for (const linha of registros) {
+      const versao = linha.slice(0, 14);
+      assert.ok(
+        fs.readdirSync(dirCopia).some((f) => f.startsWith(versao)),
+        `a versão ${versao}, aplicada remotamente, foi removida do diretório`
+      );
+    }
+  } finally {
+    fs.rmSync(alvo, { force: true });
+    if (!jaExistia) fs.rmSync(artefatos, { recursive: true, force: true });
+
+    // Devolve o que o bloco porventura tenha tirado do diretório real, e só
+    // então reprova — restaurar primeiro evita deixar o repositório mutilado
+    // por causa de um teste.
+    const depoisReal = fs.readdirSync(dirReal).sort();
+    if (JSON.stringify(depoisReal) !== JSON.stringify(antesReal)) {
+      const sumiram = antesReal.filter((f) => !depoisReal.includes(f));
+      for (const f of sumiram) {
+        const reservado = path.join("/tmp/reservadas", f);
+        if (fs.existsSync(reservado)) fs.renameSync(reservado, path.join(dirReal, f));
+      }
+      assert.fail(
+        `o passo de reserva alterou supabase/migrations — o bloco não respeitou ` +
+          `RESERVA_DIR_MIGRATIONS. Faltavam: ${sumiram.join(", ")} (restauradas)`
+      );
+    }
+  }
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log("");

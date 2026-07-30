@@ -235,19 +235,23 @@ jobs:
       # temporariamente as demais forward-only fora do diretório. O CLI passa a
       # enxergar exatamente uma pendente — então o --dry-run tem de listar uma,
       # e o push aplica uma.
-      - name: Reservar as demais forward-only
+      # A decisão de o que reservar é ORIENTADA PELO LEDGER, não por "toda
+      # forward-only diferente da selecionada". A regra antiga funcionou
+      # enquanto nenhuma forward-only estava aplicada; na execução nº 5, com
+      # 20260730123613 já no ledger, ela removeu a migration aplicada do
+      # diretório e o CLI recusou — corretamente — com "Remote migration
+      # versions not found in local migrations directory".
+      #
+      # Permanecem: as históricas, TODA versão do ledger, e a selecionada.
+      # Reservadas: só forward-only pendentes que não sejam a selecionada.
+      # Fail-closed: versão do ledger sem arquivo local reprova ANTES do CLI.
+      - name: Reservar as demais forward-only (orientado pelo ledger)
         env:
           MIGRATION: ${{ inputs.migration }}
         run: |
-          mkdir -p /tmp/reservadas
-          for F in $(node scripts/ci/list-forward-only.mjs); do
-            if [ "$F" != "$MIGRATION" ]; then
-              mv "supabase/migrations/$F" /tmp/reservadas/
-              echo "reservada: $F"
-            fi
-          done
-          echo "presentes agora:"
-          node scripts/ci/list-forward-only.mjs
+          set -o pipefail
+          node scripts/ci/reserve-forward-only.mjs \
+            "$MIGRATION" artifacts/ledger-antes.tsv /tmp/reservadas
 
       - name: Dry-run obrigatório
         env:
