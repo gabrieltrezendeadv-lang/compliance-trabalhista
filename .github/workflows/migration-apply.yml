@@ -1,0 +1,348 @@
+name: Migration apply (produção)
+
+# =============================================================================
+# ROTA ÚNICA E PROTEGIDA DE APLICAÇÃO DE MIGRATIONS EM PRODUÇÃO
+#
+# Até aqui não existia rota nenhuma: sem CLI disponível, sem credencial
+# acessível e com as duas migrations forward-only corretas no repositório e
+# ausentes do banco. Este workflow é essa rota — e é deliberadamente estreito.
+#
+# ── O QUE ELE NÃO ACEITA ────────────────────────────────────────────────────
+#
+#   * SQL arbitrário. A entrada é `choice`, com a lista fechada de migrations
+#     forward-only. Acrescentar uma opção exige editar ESTE arquivo, o que
+#     passa por PR e revisão. `tests/migration-apply-guard.mjs` reprova se a
+#     lista divergir do que existe em supabase/migrations/.
+#   * execução fora da main;
+#   * qualquer versão da faixa histórica congelada;
+#   * versão já aplicada;
+#   * aplicação fora de ordem;
+#   * mais de uma migration por execução.
+#
+# ── COMO A APROVAÇÃO HUMANA ENTRA ───────────────────────────────────────────
+#
+# O job `preflight` roda SEM credencial e SEM environment: ele decide se a
+# aplicação é sequer legítima. Só depois disso o job `apply` pede o
+# environment `db-production`, que tem revisor obrigatório. Assim o revisor é
+# chamado para julgar uma proposta já validada, não para conferir sintaxe.
+#
+# ── CREDENCIAL ──────────────────────────────────────────────────────────────
+#
+# Um único secret, `SUPABASE_DB_URL`, no environment `db-production`. Ele NÃO
+# existe ainda: por decisão da Fase 6B.1, a credencial só é cadastrada depois
+# que as proteções do environment estiverem confirmadas. Enquanto não existir,
+# este workflow falha no passo que a exige — falha limpa, sem tocar em nada.
+#
+# LIMITE DECLARADO: as leituras usam psql por variáveis PG* (a senha nunca
+# aparece em argv). O `supabase db push` exige `--db-url` e, nesse único ponto,
+# a URL passa por argv do processo dentro do runner efêmero. Não há alternativa
+# no CLI, e escrever a credencial em arquivo seria pior. Nenhum passo usa
+# `set -x`, nenhum ecoa a URL, e o GitHub mascara o secret no log.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      migration:
+        description: 'Migration forward-only a aplicar (exatamente uma)'
+        required: true
+        type: choice
+        options:
+          - 20260730123613_revoke_public_webhook_execute.sql
+          - 20260731094500_make_tenant_resolution_deterministic.sql
+      confirmacao:
+        description: 'Digite APLICAR para confirmar. Qualquer outro valor aborta.'
+        required: true
+        type: string
+
+# Sem cancel-in-progress: cancelar uma aplicação em andamento é a forma mais
+# rápida de produzir um banco em estado indeterminado. Execuções concorrentes
+# ficam na fila.
+concurrency:
+  group: migration-apply-producao
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════════
+  # 1. PREFLIGHT — sem credencial, sem environment, sem rede até o banco
+  # ══════════════════════════════════════════════════════════════════════════
+  preflight:
+    name: Preflight (sem credencial)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Confirmação explícita
+        env:
+          CONFIRMACAO: ${{ inputs.confirmacao }}
+        run: |
+          if [ "$CONFIRMACAO" != "APLICAR" ]; then
+            echo "ABORTADO: confirmação ausente ou incorreta."
+            echo "Para aplicar, o campo de confirmação deve conter exatamente APLICAR."
+            exit 1
+          fi
+          echo "confirmação aceita"
+
+      # A restrição de branch também existe no environment (deployment branch
+      # policy). Aqui ela é repetida de propósito: o preflight roda ANTES do
+      # environment, e uma execução fora da main deve morrer sem sequer
+      # convocar o revisor.
+      - name: Somente a partir da main
+        run: |
+          echo "ref .......... $GITHUB_REF"
+          echo "sha .......... $GITHUB_SHA"
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "RECUSADO: esta rota só executa a partir de refs/heads/main."
+            exit 1
+          fi
+          echo "origem confere: main"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Reuso, não reescrita: são as mesmas guardas que protegem o repositório
+      # desde a Fase 5. Se o congelamento das 36 estiver violado, a aplicação
+      # não começa.
+      - name: Guardas de congelamento e classificação
+        run: |
+          node tests/verify-recovered-migrations.mjs
+          node tests/migration-freeze-guard.mjs
+          node tests/migration-classification-guard.mjs
+          node tests/migration-apply-guard.mjs
+
+      - name: Pré-condições da migration escolhida (sem ledger)
+        env:
+          MIGRATION: ${{ inputs.migration }}
+        run: node scripts/ci/assert-apply-preconditions.mjs "$MIGRATION"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2. APPLY — exige aprovação humana pelo environment db-production
+  # ══════════════════════════════════════════════════════════════════════════
+  apply:
+    name: Aplicar (requer aprovação)
+    runs-on: ubuntu-latest
+    needs: preflight
+    environment: db-production
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Somente a partir da main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "RECUSADO: esta rota só executa a partir de refs/heads/main."
+            exit 1
+          fi
+
+      - name: Instalar postgresql-client-17
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo "PGBIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.110.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Preparar diretório de evidências
+        run: mkdir -p artifacts
+
+      # ── Credencial ───────────────────────────────────────────────────────
+      #
+      # A URL é decomposta em variáveis PG* e gravada em $GITHUB_ENV. O parser
+      # é Node lendo de variável de ambiente: a URL nunca aparece em argv nem
+      # em echo. Cada componente é registrado como secret do próprio job, para
+      # que o mascaramento do GitHub cubra também a senha isolada.
+      - name: Configurar conexão (sem expor credencial)
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          if [ -z "${DB_URL:-}" ]; then
+            echo "FALHA: o secret SUPABASE_DB_URL não está definido no environment db-production."
+            echo "Cadastre-o apenas DEPOIS de confirmar as proteções do environment."
+            exit 1
+          fi
+          node scripts/ci/parse-db-url.mjs
+
+      - name: Conferir que a conexão NÃO é loopback
+        run: |
+          if [ -z "${PGHOST:-}" ]; then echo "FALHA: PGHOST vazio"; exit 1; fi
+          case "$PGHOST" in
+            localhost|127.0.0.1|::1|0.0.0.0)
+              echo "FALHA: a rota de produção aponta para loopback ($PGHOST)."
+              exit 1 ;;
+          esac
+          echo "host de destino confere (valor omitido do log)"
+
+      # ── Ledger ANTES ─────────────────────────────────────────────────────
+      - name: Ledger remoto ANTES (somente leitura)
+        run: |
+          "$PGBIN/psql" -v ON_ERROR_STOP=1 -A -t -F '|' \
+            -c "BEGIN TRANSACTION READ ONLY;
+                SELECT version, name FROM supabase_migrations.schema_migrations ORDER BY version;
+                ROLLBACK;" \
+            > artifacts/ledger-antes.tsv
+          echo "versões no ledger antes: $(wc -l < artifacts/ledger-antes.tsv)"
+
+      - name: Conferir o ledger ANTES contra o manifesto
+        run: node scripts/ci/check-ledger.mjs artifacts/ledger-antes.tsv
+
+      - name: Pré-condições da migration escolhida (com ledger)
+        env:
+          MIGRATION: ${{ inputs.migration }}
+        run: |
+          node scripts/ci/assert-apply-preconditions.mjs "$MIGRATION" artifacts/ledger-antes.tsv \
+            | tee artifacts/preconditions.log
+
+      # ── Isolar EXATAMENTE uma ────────────────────────────────────────────
+      #
+      # `supabase db push` aplica TODAS as pendentes; não existe flag para
+      # aplicar uma só. A solução é a mesma que a âncora A do
+      # migration-rebuild-verify já usa e que ali se provou: reservar
+      # temporariamente as demais forward-only fora do diretório. O CLI passa a
+      # enxergar exatamente uma pendente — então o --dry-run tem de listar uma,
+      # e o push aplica uma.
+      - name: Reservar as demais forward-only
+        env:
+          MIGRATION: ${{ inputs.migration }}
+        run: |
+          mkdir -p /tmp/reservadas
+          for F in $(node scripts/ci/list-forward-only.mjs); do
+            if [ "$F" != "$MIGRATION" ]; then
+              mv "supabase/migrations/$F" /tmp/reservadas/
+              echo "reservada: $F"
+            fi
+          done
+          echo "presentes agora:"
+          node scripts/ci/list-forward-only.mjs
+
+      - name: Dry-run obrigatório
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          MIGRATION: ${{ inputs.migration }}
+        run: |
+          supabase db push --dry-run --db-url "$DB_URL" 2>&1 | tee artifacts/dry-run.log
+          VERSAO="${MIGRATION%%_*}"
+          N=$(grep -c "${VERSAO}" artifacts/dry-run.log || true)
+          echo "linhas do dry-run citando ${VERSAO}: $N"
+          if [ "$N" -lt 1 ]; then
+            echo "RECUSADO: o dry-run não identificou a migration selecionada."
+            exit 1
+          fi
+          # Sem \b: a saída do CLI cita NOMES DE ARQUIVO, e o caractere após a
+          # versão é `_`, que é caractere de palavra. Com \b no fim, o padrão
+          # não casa com nada — e a checagem passaria em silêncio justamente
+          # quando houvesse outra versão. Encontrado pela simulação (SIM-12).
+          OUTRAS=$(grep -oE '202[0-9]{11}' artifacts/dry-run.log | sort -u | grep -v "^${VERSAO}$" || true)
+          if [ -n "$OUTRAS" ]; then
+            echo "RECUSADO: o dry-run identificou versões além da selecionada:"
+            echo "$OUTRAS"
+            exit 1
+          fi
+          echo "dry-run identificou exatamente uma versão: $VERSAO"
+
+      # Sem --include-all: as forward-only são POSTERIORES à última versão do
+      # ledger remoto, então o push padrão já as alcança. `--include-all` serve
+      # para arrastar versões anteriores ao último registro — exatamente o que
+      # esta rota recusa.
+      #
+      # NÃO VERIFICADO: se esta versão do CLI pede confirmação interativa em
+      # `db push`, o passo travará até o timeout em vez de aplicar. Não foi
+      # possível confirmar sem executar contra um banco real, o que esta fase
+      # não autoriza. É o primeiro ponto a observar na estreia da rota.
+      - name: Aplicar — exatamente uma migration
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: supabase db push --db-url "$DB_URL" 2>&1 | tee artifacts/push.log
+
+      # ── Devolver e provar que nada mudou no repositório ──────────────────
+      - name: Devolver as forward-only reservadas
+        if: always()
+        run: |
+          if [ -d /tmp/reservadas ] && [ -n "$(ls -A /tmp/reservadas 2>/dev/null)" ]; then
+            mv /tmp/reservadas/* supabase/migrations/
+          fi
+          git diff --exit-code -- supabase/migrations/
+          git status --porcelain -- supabase/migrations/
+          echo "diretório de migrations devolvido intacto"
+
+      # ── Ledger DEPOIS ────────────────────────────────────────────────────
+      - name: Ledger remoto DEPOIS (somente leitura)
+        run: |
+          "$PGBIN/psql" -v ON_ERROR_STOP=1 -A -t -F '|' \
+            -c "BEGIN TRANSACTION READ ONLY;
+                SELECT version, name FROM supabase_migrations.schema_migrations ORDER BY version;
+                ROLLBACK;" \
+            > artifacts/ledger-depois.tsv
+          echo "versões no ledger depois: $(wc -l < artifacts/ledger-depois.tsv)"
+
+      - name: Conferir o ledger DEPOIS contra o manifesto
+        run: node scripts/ci/check-ledger.mjs artifacts/ledger-depois.tsv
+
+      # O delta tem de ser EXATAMENTE a versão selecionada. Nem zero (aplicação
+      # silenciosamente sem efeito), nem duas (o CLI arrastou outra junto).
+      - name: O delta é exatamente uma versão, e é a selecionada
+        env:
+          MIGRATION: ${{ inputs.migration }}
+        run: |
+          VERSAO="${MIGRATION%%_*}"
+          cut -d'|' -f1 artifacts/ledger-antes.tsv  | sort > /tmp/antes.txt
+          cut -d'|' -f1 artifacts/ledger-depois.tsv | sort > /tmp/depois.txt
+          NOVAS=$(comm -13 /tmp/antes.txt /tmp/depois.txt)
+          SUMIU=$(comm -23 /tmp/antes.txt /tmp/depois.txt)
+          echo "novas no ledger: ${NOVAS:-nenhuma}"
+          echo "sumiram do ledger: ${SUMIU:-nenhuma}"
+          if [ -n "$SUMIU" ]; then
+            echo "FALHA GRAVE: versões desapareceram do ledger."
+            exit 1
+          fi
+          if [ "$NOVAS" != "$VERSAO" ]; then
+            echo "FALHA: esperada exatamente a versão $VERSAO no delta."
+            exit 1
+          fi
+          echo "delta confere: exatamente $VERSAO"
+
+      - name: Publicar evidências
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: migration-apply-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Veredito
+        run: |
+          echo "APLICADA: ${{ inputs.migration }}"
+          echo "ledger antes .... $(wc -l < artifacts/ledger-antes.tsv) versão(ões)"
+          echo "ledger depois ... $(wc -l < artifacts/ledger-depois.tsv) versão(ões)"
+          echo ""
+          echo "Esta rota NÃO valida o efeito da migration no schema. As"
+          echo "pós-condições de catálogo embutidas em cada migration fazem isso"
+          echo "no momento da aplicação, e o migration-rebuild-verify prova a"
+          echo "equivalência do conjunto. Se a migration não trouxer pós-condição"
+          echo "própria, o efeito permanece não verificado por esta rota."

@@ -112,12 +112,77 @@ function findInAutomation(pattern) {
 
 // ── Comandos proibidos durante o congelamento ────────────────────────────────
 
-test("MF-01: nenhuma automação executa `supabase db push`", () => {
-  const hits = findInAutomation(/supabase\s+db\s+push/);
+// ── MF-01: `db push` — proibido em toda automação, MENOS na rota autorizada ──
+//
+// Durante o congelamento (Fases 2 a 6A) a proibição era absoluta, porque não
+// existia rota de aplicação: qualquer `db push` no repositório só poderia ser
+// um caminho não revisado até o banco de produção.
+//
+// A Fase 6B.1 criou a rota — e ela precisa, por definição, do comando proibido.
+// A exceção é NOMINAL e ÚNICA: um arquivo, listado abaixo. Fora dele a regra
+// segue absoluta.
+//
+// A troca não é "proibição por permissão". É "proibição em todo lugar" por
+// "proibição em todo lugar, menos num arquivo que tem quinze asserções próprias
+// (tests/migration-apply-guard.mjs), exige aprovação humana por environment
+// protegido, só roda a partir da main e recusa qualquer versão da faixa
+// congelada". MF-25 garante que a exceção não se espalhe e que o arquivo
+// isentado continue sendo aquilo.
+const ROTA_AUTORIZADA = ".github/workflows/migration-apply.yml";
+
+/** Como findInAutomation, ignorando um arquivo com exceção nominal. */
+function findInAutomationExceto(pattern, isento) {
+  return findInAutomation(pattern).filter(
+    (hit) => !hit.startsWith(isento.replace(/\//g, path.sep)) && !hit.startsWith(isento)
+  );
+}
+
+test("MF-01: nenhuma automação executa `supabase db push`, exceto a rota autorizada", () => {
+  const hits = findInAutomationExceto(/supabase\s+db\s+push/, ROTA_AUTORIZADA);
   assert.deepEqual(
     hits,
     [],
-    `db push encontrado (congelamento em vigor):\n  ${hits.join("\n  ")}`
+    `db push fora da rota autorizada (${ROTA_AUTORIZADA}):\n  ${hits.join("\n  ")}`
+  );
+});
+
+test("MF-25: a exceção de `db push` é única, e o arquivo isentado continua protegido", () => {
+  // 1. Nenhum OUTRO arquivo de automação usa db push.
+  const fora = findInAutomationExceto(/supabase\s+db\s+push/, ROTA_AUTORIZADA);
+  assert.deepEqual(fora, [], "a exceção nominal se espalhou para outros arquivos");
+
+  // 2. O arquivo isentado tem de existir. Se for removido, a exceção perde
+  //    sentido e a regra volta a ser absoluta — isto reprova antes.
+  const rota = path.join(root, ROTA_AUTORIZADA);
+  assert.ok(fs.existsSync(rota), `${ROTA_AUTORIZADA} não existe — remova também a exceção`);
+
+  // 3. E tem de continuar sendo o que justificou a exceção.
+  const wf = fs.readFileSync(rota, "utf8").replace(/\r\n?/g, "\n");
+  const executavel = wf.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+
+  assert.match(executavel, /environment:\s*db-production/, "a rota perdeu o environment protegido");
+  assert.match(executavel, /--dry-run/, "a rota perdeu o dry-run obrigatório");
+  assert.match(executavel, /needs:\s*preflight/, "a rota perdeu a dependência do preflight");
+  assert.match(
+    executavel,
+    /GITHUB_REF" != "refs\/heads\/main"/,
+    "a rota perdeu a restrição à main"
+  );
+  assert.match(
+    executavel,
+    /assert-apply-preconditions\.mjs/,
+    "a rota perdeu a verificação de pré-condições"
+  );
+  assert.doesNotMatch(executavel, /^\s{2}push:/m, "a rota ganhou gatilho automático");
+  assert.doesNotMatch(executavel, /^\s{2}pull_request:/m, "a rota ganhou gatilho automático");
+
+  // 4. A guarda específica da rota tem de existir e ser executada pelo verify.
+  const guarda = "tests/migration-apply-guard.mjs";
+  assert.ok(fs.existsSync(path.join(root, guarda)), `${guarda} não existe`);
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  assert.ok(
+    pkg.scripts["test:reconciliation"].includes(guarda),
+    `${guarda} não está no test:reconciliation — a exceção ficaria sem vigilância`
   );
 });
 
