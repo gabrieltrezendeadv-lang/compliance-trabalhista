@@ -119,8 +119,13 @@ BEGIN
   IF v_def !~* 'order\s+by' THEN
     RAISE EXCEPTION 'TG-12: fn_resolve_tenant_id continua sem ORDER BY';
   END IF;
-  IF v_def !~* 'created_at' OR v_def !~* 'order\s+by[^;]*\bid\b' THEN
-    RAISE EXCEPTION 'TG-12: ordenação sem critério total (esperado created_at e id)';
+  -- `\y` é a fronteira de palavra na regex do PostgreSQL. `\b` NÃO é: na ARE
+  -- do POSIX, `\b` é o caractere backspace (como em C), e não o `\b` do Perl.
+  -- Um padrão que o use exige um backspace literal no texto e, portanto, NUNCA
+  -- casa — a asserção reprovaria mesmo com a ordenação correta.
+  IF v_def !~* 'order\s+by[^;]*\ycreated_at\y'
+     OR v_def !~* 'order\s+by[^;]*\yid\y' THEN
+    RAISE EXCEPTION 'TG-12: ordenação sem critério total (esperado created_at e id). Definição encontrada: %', v_def;
   END IF;
 
   -- 2. filtro de membership inativa preservado

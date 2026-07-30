@@ -198,6 +198,59 @@ test("TG12-14: nenhuma resolução de tenant em src/ ficou sem ordenação", () 
   assert.deepEqual(problemas, [], `pontos sem ordenação:\n  ${problemas.join("\n  ")}`);
 });
 
+test("TG12-15: nenhuma regex de SQL usa \\b esperando fronteira de palavra", () => {
+  // Na ARE do POSIX — a do PostgreSQL — `\b` é o caractere BACKSPACE, não a
+  // fronteira de palavra do Perl. A fronteira é `\y`. Um padrão com `\b` exige
+  // um backspace literal no texto e NUNCA casa: a asserção reprova sempre,
+  // inclusive quando o estado está correto. Foi exatamente assim que a primeira
+  // execução da TG-12C falhou.
+  //
+  // A varredura cobre os arquivos SQL que a TG-12 pode alterar. As 36 históricas
+  // e os artefatos de `supabase/history/` e `docs/security/archive/` ficam de
+  // fora porque são congelados — nenhum deles usa `\b` hoje (usam `\d` e `\s`,
+  // ambos válidos na ARE), e incluí-los daria à guarda o poder de exigir uma
+  // alteração que o congelamento proíbe.
+  const alvos = [];
+  const juntar = (dir, filtro = () => true) => {
+    const abs = path.join(raiz, dir);
+    if (!fs.existsSync(abs)) return;
+    for (const nome of fs.readdirSync(abs)) {
+      if (nome.endsWith(".sql") && filtro(nome)) alvos.push(path.join(dir, nome));
+    }
+  };
+  juntar("supabase/migrations", (n) => n.slice(0, 14) > "20260728191324");
+  juntar("supabase/rollbacks");
+  juntar("scripts/ci");
+  alvos.push("supabase/baseline/verify.sql");
+
+  // Comentários saem antes de avaliar — como em TG12-08 e MF-17. Os próprios
+  // comentários que explicam esta regra CITAM `\b`; o que a guarda persegue é
+  // SQL executável, não a prosa que o documenta.
+  const problemas = [];
+  for (const arquivo of alvos) {
+    ler(arquivo)
+      .replace(/\/\*[\s\S]*?\*\//g, (bloco) => bloco.replace(/[^\n]/g, " "))
+      .split("\n")
+      .map((linha) => linha.replace(/--.*$/, ""))
+      .forEach((linha, i) => {
+        if (/\\[bB]/.test(linha)) problemas.push(`${arquivo}:${i + 1}: ${linha.trim()}`);
+      });
+  }
+  assert.deepEqual(
+    problemas,
+    [],
+    `use \\y (fronteira de palavra) — \\b é backspace na regex do PostgreSQL:\n  ${problemas.join("\n  ")}`
+  );
+});
+
+test("TG12-16: a ordenação total é asserida com fronteira de palavra válida", () => {
+  for (const arquivo of [MIGRATION, "supabase/baseline/verify.sql"]) {
+    const sql = ler(arquivo);
+    assert.match(sql, /order\\s\+by\[\^;\]\*\\ycreated_at\\y/, `${arquivo}: falta a asserção de created_at`);
+    assert.match(sql, /order\\s\+by\[\^;\]\*\\yid\\y/, `${arquivo}: falta a asserção de id`);
+  }
+});
+
 console.log("");
 console.log(`TG-12 guard: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

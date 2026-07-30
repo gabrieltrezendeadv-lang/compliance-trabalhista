@@ -201,8 +201,11 @@ BEGIN
     IF NOT v_tem_order THEN
       RAISE EXCEPTION 'TG-12 consta do ledger mas fn_resolve_tenant_id NÃO tem ORDER BY — migration não teve efeito';
     END IF;
-    IF v_def !~* 'created_at' OR v_def !~* 'order\s+by[^;]*\bid\b' THEN
-      RAISE EXCEPTION 'TG-12 aplicada com ordenação sem critério total (esperado created_at e id)';
+    -- `\y` é a fronteira de palavra na regex do PostgreSQL; `\b` é backspace na
+    -- ARE do POSIX e jamais casaria. Ver o mesmo comentário na migration.
+    IF v_def !~* 'order\s+by[^;]*\ycreated_at\y'
+       OR v_def !~* 'order\s+by[^;]*\yid\y' THEN
+      RAISE EXCEPTION 'TG-12 aplicada com ordenação sem critério total (esperado created_at e id). Definição encontrada: %', v_def;
     END IF;
     RAISE NOTICE 'OK 5/8 — TG-12 no ledger e resolução determinística por created_at, id (% históricas)', v_historicas;
   ELSE
