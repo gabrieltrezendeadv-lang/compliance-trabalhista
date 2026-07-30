@@ -66,6 +66,8 @@ export async function createEstablishment(raw: unknown) {
     .from("organization_members")
     .select("tenant_id")
     .is("deleted_at", null)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true })
     .limit(1)
     .single();
 
@@ -157,6 +159,8 @@ export async function createDepartment(raw: unknown) {
     .from("organization_members")
     .select("tenant_id")
     .is("deleted_at", null)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true })
     .limit(1)
     .single();
 

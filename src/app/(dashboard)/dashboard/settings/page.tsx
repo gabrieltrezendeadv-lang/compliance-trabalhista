@@ -24,6 +24,8 @@ export default async function SettingsPage() {
     .select("tenant_id, role, organizations(name, slug, legal_name, document_number, email, plan)")
     .eq("user_id", user.id)
     .is("deleted_at", null)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true })
     .limit(1)
     .single();
 

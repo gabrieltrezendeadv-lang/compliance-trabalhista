@@ -32,6 +32,8 @@ export default async function DashboardLayout({
     .select("tenant_id, role, organizations(name, slug)")
     .eq("user_id", user.id)
     .is("deleted_at", null)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true })
     .limit(1)
     .single();
 

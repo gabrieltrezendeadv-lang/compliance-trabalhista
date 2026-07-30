@@ -190,6 +190,8 @@ export async function checkPlanLimit(metric: string): Promise<{
     .select("tenant_id")
     .eq("user_id", user.id)
     .is("deleted_at", null)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true })
     .limit(1)
     .single()
 
@@ -259,6 +261,8 @@ export async function createSubscription(input: {
     .select("tenant_id")
     .eq("user_id", user.id)
     .is("deleted_at", null)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true })
     .limit(1)
     .single()
 
