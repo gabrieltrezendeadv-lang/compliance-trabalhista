@@ -3,6 +3,40 @@ import { existsSync, readFileSync } from "node:fs";
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
+/**
+ * Migrations canônicas — reconciliadas na Fase 3.
+ *
+ * Estas asserções liam os 13 arquivos que ocupavam supabase/migrations/ antes da
+ * reconciliação, e que hoje estão preservados em
+ * supabase/history/pre-reconciliation/. Passaram a ler o histórico canônico: as
+ * versões efetivamente aplicadas no banco, recuperadas de
+ * supabase_migrations.schema_migrations e conferidas por md5_norm.
+ *
+ * A troca fortalece as asserções. Antes elas provavam propriedades de arquivos
+ * que nunca foram aplicados; agora provam propriedades do SQL que o banco
+ * realmente executou.
+ *
+ * O nome dos arquivos tem timestamp duplo porque o `name` gravado no banco já
+ * era um nome de arquivo com timestamp. Ver supabase/migrations/README.md.
+ */
+const CANONICA = {
+  fix001: "supabase/migrations/20260728190937_20260728150000_fix_001_evidence_reports.sql",
+  fix003: "supabase/migrations/20260728191019_20260728151000_fix_003_reverse_scoring.sql",
+  fix004: "supabase/migrations/20260728191046_20260728152000_fix_004_assessment_submission.sql",
+  // PRIV-001 foi aplicada FATIADA em três versões. As asserções valem sobre o
+  // conjunto, então as três são lidas e concatenadas na ordem de aplicação.
+  priv001: [
+    "supabase/migrations/20260728191110_20260728152500_priv_001_anonymous_assessments_ddl.sql",
+    "supabase/migrations/20260728191144_20260728152500_priv_001_anonymous_assessments_fns1.sql",
+    "supabase/migrations/20260728191241_20260728152500_priv_001_anonymous_assessments_fns2_grants.sql",
+  ],
+  sec002: "supabase/migrations/20260728191311_20260728154500_sec_002_retire_plan_limit.sql",
+  fix005: "supabase/migrations/20260728191324_20260728155000_fix_005_close_expired_cycles.sql",
+};
+
+/** Lê e concatena as três fatias aplicadas de PRIV-001. */
+const readPriv001 = () => CANONICA.priv001.map(read).join("\n");
+
 const checks = [
   [
     "senha possui alternância visível",
@@ -44,9 +78,7 @@ const checks = [
   [
     "FIX-001 não referencia colunas inexistentes",
     () => {
-      const source = read(
-        "supabase/migrations/20260728150000_fix_001_evidence_reports.sql"
-      );
+      const source = read(CANONICA.fix001);
       assert.match(source, /ac\.starts_at/);
       assert.match(source, /ac\.ends_at/);
       assert.doesNotMatch(source, /ac\.started_at/);
@@ -56,9 +88,7 @@ const checks = [
   [
     "FIX-003 aplica pontuação reversa",
     () => {
-      const source = read(
-        "supabase/migrations/20260728151000_fix_003_reverse_scoring.sql"
-      );
+      const source = read(CANONICA.fix003);
       const matches = source.match(/qi\.reverse_scored/g) ?? [];
       assert.ok(matches.length >= 6);
     },
@@ -66,9 +96,7 @@ const checks = [
   [
     "FIX-004 trava convite e valida payload",
     () => {
-      const source = read(
-        "supabase/migrations/20260728152000_fix_004_assessment_submission.sql"
-      );
+      const source = read(CANONICA.fix004);
       assert.match(source, /FOR UPDATE/);
       assert.match(source, /duplicate_item/);
       assert.match(source, /missing_required_items/);
@@ -78,9 +106,7 @@ const checks = [
   [
     "PRIV-001 separa convite da resposta e protege participação",
     () => {
-      const migration = read(
-        "supabase/migrations/20260728152500_priv_001_anonymous_assessments.sql"
-      );
+      const migration = readPriv001();
       const privacyRollback = read(
         "supabase/rollbacks/20260728152500_priv_001_anonymous_assessments_rollback.sql"
       );
@@ -147,9 +173,7 @@ const checks = [
       const billing = read(
         "src/app/(dashboard)/dashboard/billing/page.tsx"
       );
-      const migration = read(
-        "supabase/migrations/20260728154500_sec_002_retire_plan_limit.sql"
-      );
+      const migration = read(CANONICA.sec002);
       assert.doesNotMatch(layout, /getSubscriptionWarning/);
       assert.ok(billing.includes('redirect("/dashboard")'));
       assert.match(migration, /REVOKE EXECUTE/);
@@ -162,9 +186,7 @@ const checks = [
       const route = read(
         "src/app/api/cron/close-assessment-cycles/route.ts"
       );
-      const migration = read(
-        "supabase/migrations/20260728155000_fix_005_close_expired_cycles.sql"
-      );
+      const migration = read(CANONICA.fix005);
       const rollback = read(
         "supabase/rollbacks/20260728155000_fix_005_close_expired_cycles_rollback.sql"
       );

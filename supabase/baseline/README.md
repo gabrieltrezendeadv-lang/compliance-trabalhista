@@ -229,15 +229,21 @@ Consequência prática: um banco criado a partir de `supabase/migrations/`
 continua incompleto. Este snapshot contorna o problema para fins de
 reconstrução e teste, mas **não o resolve**.
 
-### Risco imediato — migrations congeladas
+### Risco resolvido na Fase 3 — divergência de histórico
 
-Os 13 arquivos têm prefixos de versão **ausentes** do histórico remoto
-(interseção vazia). Como o CLI compara por timestamp, para ele os 13 estão
+Os 13 arquivos tinham prefixos de versão **ausentes** do histórico remoto
+(interseção vazia). Como o CLI compara por timestamp, para ele os 13 estavam
 pendentes, e um `supabase db push` tentaria aplicá-los contra um banco onde o
 DDL equivalente já existe.
 
-As migrations estão **congeladas**, com guarda automática em
-`tests/migration-freeze-guard.mjs` executada pelo `verify`. Ver
+**Reconciliado.** `supabase/migrations/` passou a conter as 36 versões
+aplicadas, com prefixos idênticos aos do banco; a interseção, antes vazia, é
+total. Os 13 anteriores estão preservados em
+[`supabase/history/pre-reconciliation/`](../history/pre-reconciliation/README.md).
+
+A guarda `tests/migration-freeze-guard.mjs` continua em vigor e as proibições
+não foram relaxadas — `db push`, `migration up`, `migration repair` e
+`migration fetch` seguem bloqueados, agora sem nenhuma exceção nominal. Ver
 [`supabase/migrations/README.md`](../migrations/README.md).
 
 ### Estratégia aprovada para a reconciliação
@@ -245,16 +251,31 @@ As migrations estão **congeladas**, com guarda automática em
 Fonte de verdade: **o histórico registrado no banco**.
 
 1. **Fase 1 — congelamento.** Bloquear `db push` por documentação e guarda de
-   CI. Sem alteração de banco.
-2. **Fase 2 — recuperação.** `supabase migration fetch --linked` em ambiente
-   descartável, recuperando as 36 com os timestamps remotos. Operação de
-   leitura no banco.
-3. **Fase 3 — reconciliação.** Os 13 arquivos atuais migram para
+   CI. Sem alteração de banco. ✅ concluída
+2. **Fase 2 — recuperação.** Recuperar as 36 versões com os timestamps remotos,
+   por leitura de `supabase_migrations.schema_migrations`. ✅ concluída.
+
+   O plano original previa `supabase migration fetch` num ambiente descartável.
+   O workflow correspondente **falhou nas três tentativas**, sempre no mesmo
+   passo e sem escrever nada — `failed to connect to postgres`, antes mesmo da
+   validação de credencial. A recuperação saiu pelo plano B: leitura da coluna
+   `statements` pelo conector já autenticado, sem CLI, sem secret e sem conexão
+   direta ao banco.
+
+   Fidelidade provada por `md5_norm`: 36/36 contra
+   [`applied-migrations.tsv`](applied-migrations.tsv). O workflow temporário foi
+   removido na Fase 3, e com ele a exceção que permitia `migration fetch`.
+3. **Fase 3 — reconciliação.** Os 13 arquivos migram para
    `supabase/history/pre-reconciliation/` como evidência histórica — contêm
    comentários e queries de verificação que não foram aplicados — e
    `supabase/migrations/` passa a conter apenas o histórico canônico das 36.
+   ✅ concluída
 4. **Fase 4 — validação.** Aplicar as 36 em banco descartável e comparar com
-   `schema.sql`. Critério de sucesso: diff estrutural vazio.
+   `schema.sql`. Critério de sucesso: diff estrutural vazio. ⬜ pendente
+
+**Até a Fase 4 passar, este snapshot continua sendo a única via de reconstrução
+com garantia.** Que as 36 reproduzam fielmente o SQL aplicado não prova que
+aplicá-las em sequência produza o mesmo schema.
 
 Também a corrigir na Fase 3: o cabeçalho de
 `20260728154500_sec_002_retire_plan_limit.sql` diz "PROPOSTA: não executada
