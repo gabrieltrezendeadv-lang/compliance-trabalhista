@@ -53,6 +53,67 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # ────────────────────────────────────────────────────────────────────
+      # EXECUTE PARA PUBLIC — promovida a verificação obrigatória
+      #
+      # Até a Fase 6B.1 esta asserção só rodava no migration-rebuild-verify,
+      # que é manual. Ou seja: o defeito que ela detecta podia entrar na main
+      # sem que nada reclamasse — e foi exatamente assim que
+      # `fn_process_webhook_event`, SECURITY DEFINER, ficou executável por
+      # PUBLIC em qualquer ambiente reconstruído a partir do repositório
+      # (Fase 4C). A causa raiz é `sec001` ter delegado
+      # `ALTER DEFAULT PRIVILEGES` a um passo manual de dashboard: toda função
+      # criada depois nasce com EXECUTE para PUBLIC por default do PostgreSQL,
+      # e só não fica exposta se a própria migration revogar.
+      #
+      # Roda DENTRO do job `verify` de propósito: `Verify` já é contexto
+      # obrigatório da branch protection da main, então a asserção passa a
+      # bloquear sem depender de mexer em configuração de repositório.
+      #
+      # Custo declarado: acrescenta o tempo de subir a stack ao job mais
+      # frequente do CI. É deliberado — a alternativa (job separado) exigiria
+      # registrar um novo contexto obrigatório, e um contexto que alguém
+      # esquece de registrar não protege nada.
+      #
+      # O estado avaliado é "as migrations do repositório aplicadas a um banco
+      # limpo", que é o que um ambiente novo recebe.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Instalar postgresql-client-17
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo "PGBIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.110.0
+
+      - name: Subir stack descartável e aplicar as migrations do repositório
+        run: |
+          set -o pipefail
+          supabase init --force
+          supabase start --exclude realtime,storage-api,imgproxy,studio,edge-runtime,logflare,vector,supavisor
+          echo "DB_URL=$(supabase status -o env | grep '^DB_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+
+      - name: Guarda — a conexão é loopback
+        run: |
+          HOST=$(printf '%s' "$DB_URL" | sed -E 's#^[^@]*@([^:/]+).*#\1#')
+          echo "host: $HOST"
+          case "$HOST" in
+            localhost|127.0.0.1|::1) echo "confere: banco local descartável" ;;
+            *) echo "FALHA: o CI não pode se conectar a $HOST"; exit 1 ;;
+          esac
+
+      - name: Nenhuma rotina de public concede EXECUTE a PUBLIC
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-no-public-execute.sql'
+
+      - name: Derrubar a stack
+        if: always()
+        run: supabase stop --no-backup || true
+
   # ══════════════════════════════════════════════════════════════════════════
   # GATE BLOQUEANTE — E2E sem banco e sem credenciais
   # ══════════════════════════════════════════════════════════════════════════

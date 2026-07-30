@@ -1,0 +1,39 @@
+{
+  "_comentario": [
+    "ALVO DE PRODUÇÃO DECLARADO E VERSIONADO.",
+    "",
+    "Recusar loopback não basta: sem esta declaração, uma credencial trocada",
+    "por engano — outro projeto, um clone, um ambiente de outra pessoa —",
+    "passaria por todas as demais guardas, porque nenhuma delas olha PARA ONDE",
+    "a conexão vai. Aqui o destino é fixado por escrito e conferido a cada",
+    "execução.",
+    "",
+    "O project ref NÃO é segredo (estabelecido na Fase 6A) e por isso pode",
+    "constar em arquivo versionado. Senha, URL e demais componentes continuam",
+    "exclusivamente no secret do environment.",
+    "",
+    "Alterar este arquivo é alterar o alvo de produção: passa por PR, revisão",
+    "e pelas guardas AP-17 e AP-18."
+  ],
+
+  "project_ref": "tvwgzpgyfdfrbdaeoqzl",
+
+  "conexoes_aceitas": [
+    {
+      "modo": "direta",
+      "host": "db.tvwgzpgyfdfrbdaeoqzl.supabase.co",
+      "usuario": "postgres",
+      "nota": "conexão direta: o ref aparece no host"
+    },
+    {
+      "modo": "pooler",
+      "host_padrao": "^aws-[0-9]+-[a-z0-9-]+\\.pooler\\.supabase\\.com$",
+      "usuario": "postgres.tvwgzpgyfdfrbdaeoqzl",
+      "nota": "pooler: o host é compartilhado e NÃO contém o ref — o vínculo vem do usuário, que precisa trazê-lo"
+    }
+  ],
+
+  "sslmode_aceitos": ["require", "verify-ca", "verify-full"],
+  "sslmode_recusados": ["disable", "allow", "prefer"],
+  "_nota_sslmode": "prefer e allow aceitam texto claro em silêncio se o servidor não oferecer TLS; disable garante texto claro. Nenhum é aceitável para credencial de produção."
+}
