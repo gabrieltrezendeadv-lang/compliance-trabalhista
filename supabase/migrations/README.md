@@ -35,6 +35,12 @@ padrão de nome.
 | Versão | Arquivo | O que faz |
 |---|---|---|
 | `20260730123613` | `20260730123613_revoke_public_webhook_execute.sql` | retira `EXECUTE` de `PUBLIC` em `fn_process_webhook_event`; corrige a lacuna achada na Fase 4C |
+| `20260731094500` | `20260731094500_make_tenant_resolution_deterministic.sql` | **TG-12** — `fn_resolve_tenant_id` passa a ordenar por `created_at ASC, id ASC`; sem isso, o tenant de usuário com mais de uma membership era escolhido de forma não determinística, e as 31 policies e `fn_user_has_role` herdavam a indeterminação |
+
+A `20260731094500` é a primeira forward-only que altera **estrutura** — o corpo
+de uma função aparece no dump, ACL não. É por isso que a verificação de
+reconstrução passou a ter duas âncoras; ver
+[`supabase/baseline/README.md`](../baseline/README.md).
 
 ---
 

@@ -51,12 +51,42 @@ preview separado, o banco é tratado **preventivamente como produção**.
 | `security.sql` | 15.162 | `ce07cdc41f5c1ce6714335ca43b931706be040c9e312bf1c9e9515124de5ce78` |
 | `verify.sql` | 12.811 | `a05916c10bce32ada9a8e3e471d34eac13296e03bdc5145e23e373a706b21084` |
 
-Os três acima são o snapshot e não mudam. Acompanham a pasta, sem hash fixo
+Os três acima são o snapshot e **não mudam**. Acompanham a pasta, sem hash fixo
 porque são documentação viva: [`README.md`](README.md),
 [`applied-migrations.tsv`](applied-migrations.tsv) — a matriz das 36 versões
-aplicadas — e
+aplicadas —,
 [`PHASE-4C-REBUILD-REPORT.md`](PHASE-4C-REBUILD-REPORT.md) — o resultado do teste
-de reconstrução sequencial.
+de reconstrução sequencial — e
+[`schema-after-forward-only.sql`](schema-after-forward-only.sql).
+
+### `schema-after-forward-only.sql` — estado esperado, não baseline
+
+A partir do TG-12 existe migration forward-only que altera **estrutura**, e não
+só ACL. `schema.sql` deixou de ser o alvo correto da comparação da reconstrução
+completa — mas continua sendo o alvo correto da reconstrução das **36
+históricas**. Por isso a verificação passou a ter duas âncoras:
+
+| Âncora | O que compara | Contra |
+|---|---|---|
+| **A** | as 36 históricas, sozinhas | `schema.sql` — imutável |
+| **B** | 36 históricas + forward-only, em ordem | `schema-after-forward-only.sql` |
+
+**`schema-after-forward-only.sql` NÃO é um novo baseline.** É gerado por
+[`scripts/ci/build-expected-schema.mjs`](../../scripts/ci/build-expected-schema.mjs),
+que parte de `schema.sql` e aplica os deltas estruturais **declarados** de cada
+migration forward-only. `schema.sql` não é tocado, e o TG-12 **não** é inserido
+retroativamente no snapshot nem no manifesto das 36.
+
+Integridade, em três camadas: o CI regenera e exige que o arquivo versionado
+seja idêntico (`--check`), o dump real do banco reconstruído é comparado
+**inteiro** contra ele, e cada delta é um literal — uma migration que altere
+outra coisa reprova até que o delta seja declarado conscientemente, e essa
+declaração aparece no diff do PR.
+
+O limite está escrito no cabeçalho do script: se o autor errar **e** declarar o
+mesmo erro, as duas pontas concordam. O desenho garante que a mudança
+estrutural seja explícita e revisável — não que esteja correta. Isso é papel da
+revisão e dos testes de comportamento.
 
 Conferência:
 

@@ -155,7 +155,11 @@ END $$;
 -- 5. fn_resolve_tenant_id — DEFINIÇÃO E DETERMINISMO
 -- =============================================================================
 DO $$
-DECLARE v_def text;
+DECLARE
+  v_def        text;
+  v_tem_order  boolean := false;
+  v_tg12       boolean := false;
+  v_historicas integer := 0;
 BEGIN
   SELECT pg_get_functiondef(p.oid) INTO v_def
     FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
@@ -168,14 +172,47 @@ BEGIN
   IF v_def NOT LIKE '%deleted_at IS NULL%' THEN
     RAISE EXCEPTION 'fn_resolve_tenant_id não filtra membership inativa'; END IF;
 
-  -- Estado do snapshot: LIMIT 1 SEM ORDER BY -> seleção NÃO determinística
-  -- para usuário com múltiplas memberships. Registrado como TG-12.
-  -- Quando a migration de determinismo for aplicada, esta verificação passa
-  -- a exigir ORDER BY e o bloco abaixo deve ser invertido.
-  IF v_def ~* 'order\s+by' THEN
-    RAISE NOTICE 'ATENÇÃO: fn_resolve_tenant_id já possui ORDER BY — baseline desatualizado (TG-12 resolvido?)';
+  -- ── Determinismo: a expectativa depende do ESTADO, não é fixa ─────────────
+  --
+  -- Este arquivo passou a ser executado contra bancos em estágios diferentes:
+  --
+  --   baseline restaurado    schema.sql + security.sql, sem ledger de
+  --                          migrations  -> TG-12 ainda não existe
+  --   36 históricas          reconstrução parcial, ledger com as 36
+  --                          -> TG-12 ainda não existe
+  --   reconstrução completa  36 históricas + forward-only ordenadas
+  --                          -> TG-12 aplicada, ORDER BY obrigatório
+  --
+  -- Fixar uma expectativa única tornaria o arquivo errado em dois dos três
+  -- casos. A fonte da verdade sobre o estágio é o próprio ledger local — e
+  -- NÃO o manifesto histórico, que continua com exatamente as 36 versões e
+  -- não registra forward-only.
+  v_tem_order := v_def ~* 'order\s+by';
+
+  IF to_regclass('supabase_migrations.schema_migrations') IS NOT NULL THEN
+    SELECT count(*) FILTER (WHERE version <= '20260728191324'),
+           COALESCE(bool_or(version = '20260731094500'), false)
+      INTO v_historicas, v_tg12
+      FROM supabase_migrations.schema_migrations;
+  END IF;
+
+  IF v_tg12 THEN
+    -- Estado reconstruído esperado: TG-12 aplicada.
+    IF NOT v_tem_order THEN
+      RAISE EXCEPTION 'TG-12 consta do ledger mas fn_resolve_tenant_id NÃO tem ORDER BY — migration não teve efeito';
+    END IF;
+    IF v_def !~* 'created_at' OR v_def !~* 'order\s+by[^;]*\bid\b' THEN
+      RAISE EXCEPTION 'TG-12 aplicada com ordenação sem critério total (esperado created_at e id)';
+    END IF;
+    RAISE NOTICE 'OK 5/8 — TG-12 no ledger e resolução determinística por created_at, id (% históricas)', v_historicas;
   ELSE
-    RAISE NOTICE 'OK 5/8 — fn_resolve_tenant_id sem ORDER BY (não determinístico, conforme snapshot; ver TG-12)';
+    -- Baseline ou reconstrução só das históricas: o snapshot NÃO tem ORDER BY.
+    -- Encontrar ORDER BY aqui é incoerência, não melhoria: significa que a
+    -- definição divergiu do estágio declarado pelo ledger.
+    IF v_tem_order THEN
+      RAISE EXCEPTION 'fn_resolve_tenant_id tem ORDER BY mas TG-12 não consta do ledger — estado incoerente com o estágio';
+    END IF;
+    RAISE NOTICE 'OK 5/8 — estágio sem TG-12: sem ORDER BY, conforme snapshot (% históricas no ledger; ver TG-12)', v_historicas;
   END IF;
 END $$;
 

@@ -92,6 +92,8 @@ export async function createCampaign(raw: unknown) {
     .eq("user_id", user.id)
     .in("role", ["owner", "admin", "manager"])
     .is("deleted_at", null)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true })
     .limit(1)
     .maybeSingle();
 

@@ -126,6 +126,12 @@ jobs:
       - name: Preflight — guardas do repositório continuam aprovadas
         run: npm run test:reconciliation
 
+      # O estado esperado após as forward-only é gerado por script a partir do
+      # snapshot. Aqui só se confere que o arquivo versionado é exatamente o que
+      # o script produz — edição manual do estado esperado é reprovada.
+      - name: Preflight — estado esperado é reprodutível
+        run: node scripts/ci/build-expected-schema.mjs --check
+
       # ── Stack local e descartável ───────────────────────────────────────────
       - name: Inicializar projeto local descartável
         run: |
@@ -183,7 +189,56 @@ jobs:
           [ "$MAJOR" -eq 17 ] || { echo "FALHA: servidor local é PostgreSQL $MAJOR; o snapshot é de 17"; exit 1; }
 
       # ── Aplicação das 36 em ordem canônica ──────────────────────────────────
-      - name: Aplicar as 36 migrations do zero, em ordem
+      # ── ÂNCORA A ────────────────────────────────────────────────────────────
+      #
+      # As 36 históricas, SOZINHAS, têm de reproduzir supabase/baseline/schema.sql.
+      # É a prova original da Fase 4C, por igualdade de SHA-256, e continua
+      # valendo integralmente — o snapshot histórico permanece imutável e é aqui
+      # que se detecta deriva nas 36.
+      #
+      # As forward-only são retiradas do diretório só durante esta fase, e
+      # devolvidas em seguida. Nenhum arquivo é editado.
+      - name: Âncora A — aplicar SOMENTE as 36 históricas
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/forward-only
+          node scripts/ci/list-forward-only.mjs > artifacts/forward-only.txt
+          echo "forward-only reservadas nesta fase:"; cat artifacts/forward-only.txt
+          while read -r f; do
+            [ -n "$f" ] && mv "supabase/migrations/$f" /tmp/forward-only/
+          done < artifacts/forward-only.txt
+          N=$(find supabase/migrations -maxdepth 1 -name '*.sql' | wc -l)
+          [ "$N" -eq 36 ] || { echo "FALHA: esperadas 36 históricas isoladas, há $N"; exit 1; }
+          supabase db reset --no-seed 2>&1 | tee artifacts/reset-historicas.log
+
+      - name: Âncora A — ledger com exatamente as 36
+        run: |
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -At -F'|' -c \
+            "SELECT version, name, coalesce(array_length(statements,1),0)
+               FROM supabase_migrations.schema_migrations ORDER BY version;" \
+            > artifacts/ledger-historicas.tsv
+          N=$(wc -l < artifacts/ledger-historicas.tsv)
+          [ "$N" -eq 36 ] || { echo "FALHA: ledger da âncora A tem $N versões, esperadas 36"; exit 1; }
+          node scripts/ci/check-ledger.mjs artifacts/ledger-historicas.tsv | tee artifacts/ledger-historicas.txt
+
+      - name: Âncora A — dump estrutural das 36
+        run: |
+          "$PGBIN/pg_dump" "$DB_URL" --schema-only --schema=public \
+            --no-owner --no-privileges --no-tablespaces \
+            -f artifacts/historicas-schema.sql
+          wc -c artifacts/historicas-schema.sql
+
+      - name: Devolver as migrations forward-only
+        run: |
+          while read -r f; do
+            [ -n "$f" ] && mv "/tmp/forward-only/$f" supabase/migrations/
+          done < artifacts/forward-only.txt
+          git diff --exit-code --stat -- supabase/migrations \
+            || { echo "FALHA: supabase/migrations foi modificado"; exit 1; }
+          echo "diretório restaurado sem alteração de conteúdo"
+
+      # ── ÂNCORA B ────────────────────────────────────────────────────────────
+      - name: Âncora B — aplicar as 36 históricas + forward-only, em ordem
         run: |
           set -o pipefail
           supabase db reset --no-seed 2>&1 | tee artifacts/reset.log
@@ -274,6 +329,46 @@ jobs:
              WHERE n.nspname = 'public' AND p.proname = 'fn_process_webhook_event'
              ORDER BY 1;" | tee artifacts/acl-webhook.txt
 
+      # Testes de COMPORTAMENTO do TG-12, em transação encerrada por ROLLBACK.
+      # Rodam antes da fase C, que destrói o schema `public` reconstruído.
+      - name: TG-12 — testes de resolução determinística do tenant
+        id: tg12
+        run: |
+          set -o pipefail
+          if "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
+               -f scripts/ci/assert-tenant-resolution.sql 2>&1 \
+               | tee artifacts/tg12-tenant-resolution.log; then
+            echo "resultado=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "resultado=reprovado" >> "$GITHUB_OUTPUT"
+            echo "TG-12 REPROVADO — o Veredito falhará. Log preservado."
+          fi
+
+      # Rollback e reaplicação, contra o mesmo banco descartável.
+      - name: TG-12 — rollback restaura o estado anterior, e a migration o restabelece
+        id: tg12rb
+        run: |
+          set -o pipefail
+          {
+            echo "== aplicando rollback =="
+            "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
+              -f supabase/rollbacks/20260731094500_make_tenant_resolution_deterministic_rollback.sql
+            echo "== definição após rollback =="
+            "$PGBIN/psql" "$DB_URL" -At -c \
+              "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                WHERE n.nspname='public' AND p.proname='fn_resolve_tenant_id';"
+            echo "== reaplicando a migration =="
+            "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
+              -f supabase/migrations/20260731094500_make_tenant_resolution_deterministic.sql
+            echo "== definição após reaplicação =="
+            "$PGBIN/psql" "$DB_URL" -At -c \
+              "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                WHERE n.nspname='public' AND p.proname='fn_resolve_tenant_id';"
+          } 2>&1 | tee artifacts/tg12-rollback.log
+          grep -q 'ORDER BY om.created_at ASC, om.id ASC' artifacts/tg12-rollback.log \
+            || { echo "FALHA: reaplicação não restabeleceu a ordenação"; exit 1; }
+          echo "resultado=ok" >> "$GITHUB_OUTPUT"
+
       # ── Piso de ruído: restaurar o baseline no MESMO descartável ────────────
       #
       # A partir daqui o schema `public` reconstruído é destruído. Tudo que
@@ -299,11 +394,25 @@ jobs:
           wc -l artifacts/baseline-security.txt
 
       # ── Comparações ─────────────────────────────────────────────────────────
-      - name: Normalizar os três dumps
+      - name: Normalizar os dumps
         run: |
           node scripts/ci/normalize-schema-dump.mjs supabase/baseline/schema.sql artifacts/snapshot.norm.sql
+          node scripts/ci/normalize-schema-dump.mjs supabase/baseline/schema-after-forward-only.sql artifacts/esperado.norm.sql
+          node scripts/ci/normalize-schema-dump.mjs artifacts/historicas-schema.sql artifacts/historicas-schema.norm.sql
           node scripts/ci/normalize-schema-dump.mjs artifacts/rebuilt-schema.sql artifacts/rebuilt-schema.norm.sql
           node scripts/ci/normalize-schema-dump.mjs artifacts/baseline-roundtrip.sql artifacts/baseline-roundtrip.norm.sql
+
+      # ÂNCORA A: as 36 históricas, sozinhas, reproduzem o snapshot histórico.
+      # Imutável, e é aqui que se detecta deriva nas 36.
+      - name: Diff — âncora A (36 históricas × snapshot histórico)
+        id: ancoraA
+        run: |
+          diff -u artifacts/snapshot.norm.sql artifacts/historicas-schema.norm.sql \
+            > artifacts/diff-ancora-a.diff || true
+          N=$(wc -l < artifacts/diff-ancora-a.diff)
+          echo "âncora A: $N linha(s) de diff"
+          echo "linhas=$N" >> "$GITHUB_OUTPUT"
+          [ "$N" -eq 0 ] || { echo "--- deriva nas 36 históricas (400 primeiras) ---"; head -400 artifacts/diff-ancora-a.diff; }
 
       - name: Diff — piso de ruído (round-trip do pg_dump)
         id: piso
@@ -315,12 +424,19 @@ jobs:
           echo "linhas=$N" >> "$GITHUB_OUTPUT"
           [ "$N" -eq 0 ] || { echo "--- piso de ruído (primeiras 200 linhas) ---"; head -200 artifacts/diff-piso-de-ruido.diff; }
 
-      - name: Diff — estrutura, bruto e normalizado
+      # ÂNCORA B: 36 históricas + forward-only, em ordem, reproduzem o estado
+      # esperado versionado — que é gerado a partir do snapshot pelos deltas
+      # declarados em scripts/ci/build-expected-schema.mjs.
+      #
+      # A função corrigida NÃO é excluída do diff: o arquivo inteiro é
+      # comparado, e uma diferença na própria função reprova se o corpo não for
+      # exatamente o declarado.
+      - name: Diff — âncora B (reconstrução completa × estado esperado)
         id: estrutura
         run: |
-          diff -u supabase/baseline/schema.sql artifacts/rebuilt-schema.sql \
+          diff -u supabase/baseline/schema-after-forward-only.sql artifacts/rebuilt-schema.sql \
             > artifacts/diff-estrutural-bruto.diff || true
-          diff -u artifacts/snapshot.norm.sql artifacts/rebuilt-schema.norm.sql \
+          diff -u artifacts/esperado.norm.sql artifacts/rebuilt-schema.norm.sql \
             > artifacts/diff-estrutural-normalizado.diff || true
           BRUTO=$(wc -l < artifacts/diff-estrutural-bruto.diff)
           NORM=$(wc -l < artifacts/diff-estrutural-normalizado.diff)
@@ -328,6 +444,15 @@ jobs:
           echo "diff normalizado ... $NORM linha(s)"
           echo "normalizado=$NORM" >> "$GITHUB_OUTPUT"
           [ "$NORM" -eq 0 ] || { echo "--- diff estrutural normalizado (primeiras 400 linhas) ---"; head -400 artifacts/diff-estrutural-normalizado.diff; }
+
+      # Delta declarado × delta observado. Torna visível, no log, exatamente o
+      # que as forward-only mudam na estrutura em relação ao snapshot histórico.
+      - name: Delta estrutural das forward-only (snapshot → esperado)
+        run: |
+          diff -u artifacts/snapshot.norm.sql artifacts/esperado.norm.sql \
+            > artifacts/delta-forward-only.diff || true
+          echo "delta declarado: $(wc -l < artifacts/delta-forward-only.diff) linha(s)"
+          cat artifacts/delta-forward-only.diff
 
       # O diff de segurança é classificado por categoria, e não tratado como um
       # número só. A Fase 4C documentou três categorias divergentes por motivo
@@ -395,19 +520,28 @@ jobs:
 
       - name: Veredito
         run: |
+          ANCORA_A="${{ steps.ancoraA.outputs.linhas }}"
           PISO="${{ steps.piso.outputs.linhas }}"
           NORM="${{ steps.estrutura.outputs.normalizado }}"
           SEG_BLOQ="${{ steps.seguranca.outputs.bloqueia }}"
           SEG_TOTAL="${{ steps.seguranca.outputs.total }}"
           PUBEXEC="${{ steps.publicexec.outputs.resultado }}"
+          TG12="${{ steps.tg12.outputs.resultado }}"
+          TG12RB="${{ steps.tg12rb.outputs.resultado }}"
+          echo "âncora A (36 × snapshot) ........ $ANCORA_A linha(s) de diff"
+          echo "âncora B (completa × esperado) .. $NORM linha(s) de diff"
           echo "piso de ruído ................... $PISO linha(s) de diff"
-          echo "estrutura normalizada ........... $NORM linha(s) de diff"
           echo "segurança, bloqueante ........... $SEG_BLOQ linha(s)"
           echo "segurança, total ................ $SEG_TOTAL linha(s) (inclui categorias documentadas)"
           echo "EXECUTE para PUBLIC ............. $PUBEXEC"
+          echo "TG-12 comportamento ............. $TG12"
+          echo "TG-12 rollback/reaplicação ...... $TG12RB"
           FALHA=0
           [ "$PUBEXEC" = "ok" ] || { echo "REPROVADO: a asserção de EXECUTE para PUBLIC não passou — ver artifacts/assert-public-execute.log"; FALHA=1; }
-          [ "$NORM" -eq 0 ] || { echo "REPROVADO: a estrutura reconstruída difere do snapshot"; FALHA=1; }
+          [ "$TG12" = "ok" ] || { echo "REPROVADO: os testes de resolução determinística do tenant não passaram — ver artifacts/tg12-tenant-resolution.log"; FALHA=1; }
+          [ "$TG12RB" = "ok" ] || { echo "REPROVADO: rollback/reaplicação do TG-12 não passou"; FALHA=1; }
+          [ "$ANCORA_A" -eq 0 ] || { echo "REPROVADO: as 36 históricas deixaram de reproduzir o snapshot — deriva no baseline histórico"; FALHA=1; }
+          [ "$NORM" -eq 0 ] || { echo "REPROVADO: a reconstrução completa difere do estado esperado versionado"; FALHA=1; }
           [ "$SEG_BLOQ" -eq 0 ] || { echo "REPROVADO: divergência de segurança em categoria que deve ser idêntica (RLS, propriedades de função, ACL de função ou policy)"; FALHA=1; }
           [ "$PISO" -eq 0 ] || echo "ATENÇÃO: o piso de ruído não é vazio — parte do diff acima pode ser round-trip do pg_dump, e não defeito de migration. Classificar antes de concluir."
           if [ "$SEG_TOTAL" -ne "$SEG_BLOQ" ]; then
@@ -418,7 +552,7 @@ jobs:
             echo "decisão própria e não foram tratadas aqui. Ver"
             echo "artifacts/diff-seguranca-categorias.txt."
           fi
-          [ "$FALHA" -eq 0 ] && echo "APROVADO: a reconstrução reproduz a estrutura do snapshot e as categorias de segurança que devem ser idênticas."
+          [ "$FALHA" -eq 0 ] && echo "APROVADO: as 36 históricas reproduzem o snapshot; a reconstrução completa reproduz o estado esperado; segurança e TG-12 conferem."
           exit $FALHA
 
       - name: Derrubar a stack
