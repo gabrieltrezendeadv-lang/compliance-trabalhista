@@ -1,0 +1,30 @@
+# DENYLIST DE ACESSO REMOTO
+#
+# Padrões que NÃO podem aparecer na automação executada por
+# .github/workflows/migration-rebuild-verify.yml.
+#
+# Por que os padrões vivem num .txt e não dentro do script que os aplica:
+# tests/migration-freeze-guard.mjs (MF-04, MF-05) reprova os literais
+# `--linked` e `supabase link` em QUALQUER arquivo de automação — .yml, .sh,
+# .mjs. Um script de guarda precisa desses literais como DADO para poder
+# procurá-los. Mantê-los aqui resolve o conflito sem abrir exceção nominal na
+# guarda: .txt não é arquivo de automação e não é varrido por ela.
+#
+# Formato: <rótulo><TAB><padrão ERE>. Linhas em branco e `#` são ignoradas.
+# Aplicado por scripts/ci/assert-local-only.sh na seção `pre`.
+#
+# ESCOPO: o workflow e os scripts que ele executa. NÃO é varredura do
+# repositório inteiro — o ref do projeto aparece legitimamente em prosa de
+# documentação (supabase/baseline/README.md, security.sql) e na própria guarda
+# de congelamento. O que esta lista impede é que o CAMINHO DE EXECUÇÃO adquira
+# capacidade de alcançar o projeto remoto.
+
+vinculo-a-projeto-remoto	supabase[[:space:]]+link
+operacao-contra-o-remoto	--linked
+project-ref-explicito	--project-ref
+ref-do-projeto-de-producao	tvwgzpgyfdfrbdaeoqzl
+host-de-projeto-supabase	[a-z0-9-]+\.supabase\.(co|com|in|net)
+host-do-pooler	pooler\.supabase\.com
+uso-de-secret-do-github	secrets\.[A-Za-z_]
+comando-que-escreve-no-historico-remoto	supabase[[:space:]]+db[[:space:]]+push
+recuperacao-por-cli-contra-o-remoto	supabase[[:space:]]+migration[[:space:]]+(fetch|repair)

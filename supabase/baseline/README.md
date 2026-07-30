@@ -270,8 +270,23 @@ Fonte de verdade: **o histórico registrado no banco**.
    comentários e queries de verificação que não foram aplicados — e
    `supabase/migrations/` passa a conter apenas o histórico canônico das 36.
    ✅ concluída
-4. **Fase 4 — validação.** Aplicar as 36 em banco descartável e comparar com
-   `schema.sql`. Critério de sucesso: diff estrutural vazio. ⬜ pendente
+4. **Fase 4 — validação.** Aplicar as 36 em banco descartável e comparar com o
+   snapshot. Implementada no workflow manual
+   [`migration-rebuild-verify.yml`](../../.github/workflows/migration-rebuild-verify.yml);
+   ferramental e limites documentados em
+   [`scripts/ci/README.md`](../../scripts/ci/README.md). ⬜ pendente
+
+   O critério tem **duas metades**, porque o snapshot também tem: diff
+   estrutural vazio contra `schema.sql` **e** equivalência das propriedades de
+   segurança contra `security.sql`. `schema.sql` foi gerado com
+   `--no-privileges` e contém 0 `GRANT` e 0 `REVOKE`; sozinho, não responde por
+   privilégios.
+
+   Uma divergência já é **previsível**: SEC-005 não é migration. O
+   endurecimento de default privileges está em [`../manual/`](../manual/) e foi
+   aplicado pelo dashboard — `tests/reconciliation-guards.mjs` exige que ele não
+   esteja em `supabase/migrations/`. Logo, o banco reconstruído pelas 36 não o
+   terá. É lacuna real do histórico, e não erro do teste.
 
 **Até a Fase 4 passar, este snapshot continua sendo a única via de reconstrução
 com garantia.** Que as 36 reproduzam fielmente o SQL aplicado não prova que
