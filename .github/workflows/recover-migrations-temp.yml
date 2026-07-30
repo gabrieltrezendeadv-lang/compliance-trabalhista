@@ -34,11 +34,16 @@ name: Recover migrations (TEMPORÁRIO — Fase 2)
 #    como dispará-lo — nem por engano.
 #
 # 2. Depois do merge na `main`, é necessária AUTORIZAÇÃO SEPARADA para
-#    cadastrar o secret `SUPABASE_DB_URL_FETCH` e realizar UMA ÚNICA execução.
-#    O merge deste PR não constitui essa autorização.
+#    cadastrar o secret `SUPABASE_DB_PASSWORD_FETCH` e realizar UMA ÚNICA
+#    execução. O merge deste PR não constitui essa autorização.
+#
+#    O secret contém SOMENTE A SENHA do banco — sem URI, sem aspas, sem
+#    colchetes, sem percent-encoding. Caracteres especiais devem ficar
+#    exatamente como são na senha. O endereço vai literal no comando, e a URI
+#    NÃO contém senha.
 #
 # 3. Concluída a recuperação e baixado o artefato, o secret é EXCLUÍDO
-#    IMEDIATAMENTE (`gh secret delete SUPABASE_DB_URL_FETCH`), com
+#    IMEDIATAMENTE (`gh secret delete SUPABASE_DB_PASSWORD_FETCH`), com
 #    `gh secret list` confirmando a remoção.
 #
 # 4. A REMOÇÃO DESTE WORKFLOW TEMPORÁRIO acontece em PR POSTERIOR, junto da
@@ -96,19 +101,33 @@ jobs:
           mkdir -p "$WORKDIR/supabase/migrations"
           echo "arquivos antes do fetch: $(ls -1 "$WORKDIR/supabase/migrations" | wc -l)"
 
+      # ── AUTENTICAÇÃO (corrigida na Fase 2B.1) ────────────────────────────────
+      #
+      # A primeira tentativa passava a URI completa, com senha embutida, por um
+      # único secret. O CLI recusou a conexão e apontou o caminho correto:
+      #
+      #   Connect to your database by setting the env var correctly:
+      #   SUPABASE_DB_PASSWORD
+      #
+      # Agora a credencial é separada do endereço:
+      #   · a URI vai literal no comando e NÃO CONTÉM SENHA
+      #   · a senha vai apenas em SUPABASE_DB_PASSWORD, o mecanismo oficial
+      #
+      # Vantagens: a senha nunca passa por percent-encoding — a causa provável
+      # da falha anterior —, nunca aparece na linha de comando, e o secret
+      # guarda só a senha, não o endereço inteiro.
+      #
       # `--db-url` conecta direto, sem `supabase link` e sem access token.
-      # O secret é lido do ambiente pelo próprio processo; não aparece na linha
-      # de comando renderizada no log.
       - name: Recuperar migrations do histórico remoto
         working-directory: /tmp/recover
         env:
-          SUPABASE_DB_URL_FETCH: ${{ secrets.SUPABASE_DB_URL_FETCH }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD_FETCH }}
         run: |
-          if [ -z "$SUPABASE_DB_URL_FETCH" ]; then
-            echo "FALHA: secret SUPABASE_DB_URL_FETCH ausente ou vazio"
+          if [ -z "$SUPABASE_DB_PASSWORD" ]; then
+            echo "FALHA: secret SUPABASE_DB_PASSWORD_FETCH ausente ou vazio"
             exit 1
           fi
-          supabase migration fetch --db-url "$SUPABASE_DB_URL_FETCH"
+          supabase migration fetch --db-url "postgresql://postgres.tvwgzpgyfdfrbdaeoqzl@aws-0-sa-east-1.pooler.supabase.com:5432/postgres"
           echo "arquivos após o fetch: $(ls -1 supabase/migrations/*.sql 2>/dev/null | wc -l)"
 
       - name: Conferir que nada foi escrito em supabase/migrations do repositório

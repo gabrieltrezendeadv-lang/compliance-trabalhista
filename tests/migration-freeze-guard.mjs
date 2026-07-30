@@ -174,6 +174,14 @@ export function violacoesDeFetch(entradas) {
       if (!/--db-url\b/.test(text)) {
         violacoes.push(`${file}:${n} invoca migration fetch sem --db-url`);
       }
+      // A URI não pode conter senha. A senha vai só em SUPABASE_DB_PASSWORD.
+      // `postgresql://usuario:senha@host` → proibido.
+      // `postgresql://usuario@host`       → permitido.
+      if (/postgres(ql)?:\/\/[^:/@\s"']+:[^@\s"']+@/.test(text)) {
+        violacoes.push(
+          `${file}:${n} embute senha na URI — use SUPABASE_DB_PASSWORD`
+        );
+      }
     }
     if (!/workflow_dispatch/.test(content)) {
       violacoes.push(`${file} invoca migration fetch sem workflow_dispatch`);
@@ -278,7 +286,7 @@ test("MF-08: o conjunto de migrations não mudou durante o congelamento", () => 
 // casos abaixo alimentam `violacoesDeFetch` com entradas sintéticas e exigem
 // que ela ACUSE a violação. Nada é escrito no disco.
 
-const WF_OK = `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "$SUPABASE_DB_URL_FETCH"\n`;
+const WF_OK = `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "postgresql://user@host:5432/postgres"\n`;
 
 test("MF-09: fetch com --linked é reprovado, mesmo no workflow autorizado", () => {
   const v = violacoesDeFetch([
@@ -334,6 +342,29 @@ test("MF-12: fetch sem workflow_dispatch é reprovado", () => {
 test("MF-13: o caso legítimo da Fase 2 é aprovado", () => {
   const v = violacoesDeFetch([{ file: FETCH_AUTORIZADO, content: WF_OK }]);
   assert.deepEqual(v, [], `não deveria acusar o caso válido: ${JSON.stringify(v)}`);
+});
+
+test("MF-15: URI com senha embutida é reprovada", () => {
+  const v = violacoesDeFetch([
+    {
+      file: FETCH_AUTORIZADO,
+      content: `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "postgresql://postgres.abc:senha123@host:5432/postgres"\n`,
+    },
+  ]);
+  assert.ok(
+    v.some((m) => m.includes("embute senha na URI")),
+    `deveria acusar senha na URI: ${JSON.stringify(v)}`
+  );
+});
+
+test("MF-16: URI sem senha é aprovada", () => {
+  const v = violacoesDeFetch([
+    {
+      file: FETCH_AUTORIZADO,
+      content: `on:\n  workflow_dispatch:\njobs:\n  x:\n    steps:\n      - run: supabase migration fetch --db-url "postgresql://postgres.abc@host:5432/postgres"\n`,
+    },
+  ]);
+  assert.deepEqual(v, [], `URI sem senha não deveria ser acusada: ${JSON.stringify(v)}`);
 });
 
 test("MF-14: --linked é reprovado em qualquer arquivo, mesmo sem fetch", () => {

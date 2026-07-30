@@ -141,6 +141,7 @@ const PROIBIDOS = [
   [/\baact_/, "chave Asaas"],
   [/\bwhsec_/, "segredo de webhook"],
   [/SUPABASE_DB_URL/, "nome de variável de conexão"],
+  [/SUPABASE_DB_PASSWORD/, "nome de variável de senha"],
 ];
 
 for (const arquivo of arquivos) {
