@@ -199,14 +199,13 @@ jobs:
           echo "host de destino confere (valor omitido do log)"
 
       # ── Ledger ANTES ─────────────────────────────────────────────────────
+      # Implementação ÚNICA, compartilhada com o passo DEPOIS. A versão
+      # anterior embutia o comando psql duas vezes, e o defeito da estreia
+      # existia nas duas: o bloco `BEGIN ... ROLLBACK` fazia o psql imprimir o
+      # tag de status de cada comando, e o arquivo recebia `BEGIN` + 36 linhas
+      # + `ROLLBACK`. Ver scripts/ci/read-remote-ledger.sh.
       - name: Ledger remoto ANTES (somente leitura)
-        run: |
-          "$PGBIN/psql" -v ON_ERROR_STOP=1 -A -t -F '|' \
-            -c "BEGIN TRANSACTION READ ONLY;
-                SELECT version, name FROM supabase_migrations.schema_migrations ORDER BY version;
-                ROLLBACK;" \
-            > artifacts/ledger-antes.tsv
-          echo "versões no ledger antes: $(wc -l < artifacts/ledger-antes.tsv)"
+        run: bash scripts/ci/read-remote-ledger.sh artifacts/ledger-antes.tsv
 
       - name: Conferir o ledger ANTES contra o manifesto
         run: node scripts/ci/check-ledger.mjs artifacts/ledger-antes.tsv
@@ -321,14 +320,10 @@ jobs:
           echo "diretório de migrations devolvido intacto"
 
       # ── Ledger DEPOIS ────────────────────────────────────────────────────
+      # Mesma implementação do passo ANTES. AP-24 reprova se os dois deixarem
+      # de compartilhá-la.
       - name: Ledger remoto DEPOIS (somente leitura)
-        run: |
-          "$PGBIN/psql" -v ON_ERROR_STOP=1 -A -t -F '|' \
-            -c "BEGIN TRANSACTION READ ONLY;
-                SELECT version, name FROM supabase_migrations.schema_migrations ORDER BY version;
-                ROLLBACK;" \
-            > artifacts/ledger-depois.tsv
-          echo "versões no ledger depois: $(wc -l < artifacts/ledger-depois.tsv)"
+        run: bash scripts/ci/read-remote-ledger.sh artifacts/ledger-depois.tsv
 
       - name: Conferir o ledger DEPOIS contra o manifesto
         run: node scripts/ci/check-ledger.mjs artifacts/ledger-depois.tsv

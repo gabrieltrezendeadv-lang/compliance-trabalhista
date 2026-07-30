@@ -388,6 +388,87 @@ test("AP-22: verify-recovered-migrations.mjs é chamada COM o diretório", () =>
   }
 });
 
+test("AP-23: a leitura do ledger não usa bloco BEGIN/ROLLBACK no psql", () => {
+  // O bloco explícito faz o psql imprimir o tag de status de CADA comando —
+  // era daí que vinham `BEGIN` e `ROLLBACK` no arquivo. A sessão somente
+  // leitura via PGOPTIONS cobre mais (vale para tudo o que a sessão fizer) e
+  // não imprime tag nenhum.
+  const leitor = ler("scripts/ci/read-remote-ledger.sh");
+  const executavel = leitor.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+
+  assert.doesNotMatch(executavel, /BEGIN\s+TRANSACTION/i, "voltou o bloco BEGIN explícito");
+  assert.doesNotMatch(executavel, /\bROLLBACK\b/i, "voltou o ROLLBACK explícito");
+  assert.match(
+    executavel,
+    /PGOPTIONS=['"]?-c default_transaction_read_only=on/,
+    "a sessão precisa ser explicitamente somente leitura"
+  );
+  assert.match(executavel, /ON_ERROR_STOP=1/, "ON_ERROR_STOP=1 é obrigatório");
+  assert.match(executavel, /-F '\|'/, "o separador tem de ser |");
+  assert.match(executavel, /ORDER BY version/, "a ordenação por version é obrigatória");
+  assert.match(executavel, /-A\b/, "saída não alinhada");
+  assert.match(executavel, /-t\b/, "só tuplas: sem cabeçalho nem rodapé");
+  assert.match(executavel, /-X\b/, "-X evita que um ~/.psqlrc alheio mude a saída");
+  assert.match(executavel, /assert-ledger-format\.mjs/, "a saída bruta tem de ser validada");
+
+  // Nada de esconder linha desconhecida.
+  assert.doesNotMatch(
+    executavel,
+    /grep\s+-v.*(BEGIN|ROLLBACK)/i,
+    "filtrar o tag por nome esconde o próximo tag em vez de reprovar"
+  );
+});
+
+test("AP-24: ANTES e DEPOIS usam a MESMA implementação de leitura", () => {
+  const chamadas = wf
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .filter((l) => l.includes("read-remote-ledger.sh"))
+    .map((l) => l.trim());
+
+  assert.equal(chamadas.length, 2, `esperadas 2 chamadas ao leitor, achadas ${chamadas.length}`);
+  assert.ok(
+    chamadas.some((c) => c.includes("artifacts/ledger-antes.tsv")),
+    "o passo ANTES não usa o leitor compartilhado"
+  );
+  assert.ok(
+    chamadas.some((c) => c.includes("artifacts/ledger-depois.tsv")),
+    "o passo DEPOIS não usa o leitor compartilhado"
+  );
+
+  // E nenhum dos dois pode ter voltado a invocar psql direto.
+  const executavel = wf.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+  assert.doesNotMatch(
+    executavel,
+    /psql[^\n]*schema_migrations/,
+    "voltou a haver psql embutido lendo o ledger — é a duplicação que causou o defeito"
+  );
+
+  assert.ok(fs.existsSync(path.join(raiz, "scripts/ci/read-remote-ledger.sh")));
+  assert.ok(fs.existsSync(path.join(raiz, "scripts/ci/assert-ledger-format.mjs")));
+});
+
+test("AP-25: check-ledger reprova version fora do formato de 14 dígitos", () => {
+  // Fecha o fail-open que classificou BEGIN e ROLLBACK como forward-only.
+  const cl = ler("scripts/ci/check-ledger.mjs");
+  assert.match(
+    cl,
+    /\^\\d\{14\}\$/,
+    "check-ledger precisa exigir 14 dígitos na version"
+  );
+});
+
+test("AP-26: o Verify exercita a leitura do ledger contra psql real", () => {
+  const ci = ler(".github/workflows/ci.yml");
+  const verify = ci.slice(ci.indexOf("  verify:"), ci.indexOf("  e2e:"));
+  assert.match(verify, /read-remote-ledger\.sh/, "a implementação real não é exercitada no CI");
+  assert.match(
+    verify,
+    /grep -qE '\^\(BEGIN\|ROLLBACK\|COMMIT\|SET\)\$'/,
+    "o CI não confere a ausência de tag de status no arquivo"
+  );
+});
+
 console.log("");
 console.log(`Migration apply guard: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

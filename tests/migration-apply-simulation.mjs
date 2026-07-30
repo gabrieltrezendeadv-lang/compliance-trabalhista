@@ -552,6 +552,104 @@ test("SIM-26: o passo de guardas do preflight executa e passa", () => {
   assert.match(r.out, /36/, "a verificação das 36 históricas não produziu saída reconhecível");
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// 10. VALIDAÇÃO DO LEDGER LIDO DO BANCO
+// ══════════════════════════════════════════════════════════════════════════
+const VERSOES_HISTORICAS = parseManifest(
+  fs.readFileSync(path.join(raiz, "supabase/baseline/applied-migrations.tsv"), "utf8")
+);
+
+/** Roda o validador real sobre um conteúdo bruto. */
+function validar(conteudo, rotulo) {
+  const bruto = path.join(tmp, `bruto-${rotulo}.txt`);
+  const destino = path.join(tmp, `destino-${rotulo}.tsv`);
+  fs.writeFileSync(bruto, conteudo, "utf8");
+  const r = shell(`node scripts/ci/assert-ledger-format.mjs "${bruto}" "${destino}"`, {});
+  return { ...r, destino, existe: fs.existsSync(destino) };
+}
+
+/** As 36 linhas reais do ledger de produção, no formato do psql. */
+const LEDGER_36 = VERSOES_HISTORICAS.map((r) => `${r.version}|${r.name}`).join("\n") + "\n";
+
+test("SIM-27: aceita exatamente as 36 linhas do estado atual de produção", () => {
+  const r = validar(LEDGER_36, "36");
+  assert.equal(r.code, 0, `deveria aceitar as 36 linhas:\n${r.out}`);
+  assert.match(r.out, /ledger lido: 36 registro\(s\)/);
+
+  const linhas = fs.readFileSync(r.destino, "utf8").trimEnd().split("\n");
+  assert.equal(linhas.length, 36, "o destino deve ter exatamente 36 linhas");
+  // Primeira e última são versões válidas, e são as esperadas.
+  assert.match(linhas[0], /^\d{14}\|.+$/);
+  assert.match(linhas.at(-1), /^\d{14}\|.+$/);
+  assert.equal(linhas[0].split("|")[0], VERSOES_HISTORICAS[0].version);
+  assert.equal(linhas.at(-1).split("|")[0], VERSOES_HISTORICAS.at(-1).version);
+});
+
+test("SIM-28: BEGIN não entra no TSV — reprova, não é escondido", () => {
+  const r = validar("BEGIN\n" + LEDGER_36, "begin");
+  assert.equal(r.code, 1, "deveria reprovar com BEGIN na saída");
+  assert.match(r.out, /linha 1: fora do formato .*"BEGIN"/);
+  assert.ok(!r.existe, "o destino não pode ser escrito quando a validação reprova");
+});
+
+test("SIM-29: ROLLBACK não entra no TSV — reprova, não é escondido", () => {
+  const r = validar(LEDGER_36 + "ROLLBACK\n", "rollback");
+  assert.equal(r.code, 1, "deveria reprovar com ROLLBACK na saída");
+  assert.match(r.out, /fora do formato .*"ROLLBACK"/);
+  assert.ok(!r.existe);
+});
+
+test("SIM-30: reproduz a falha exata da estreia — BEGIN + 36 + ROLLBACK", () => {
+  // 38 linhas foi o que a execução real produziu.
+  const conteudo = "BEGIN\n" + LEDGER_36 + "ROLLBACK\n";
+  assert.equal(conteudo.trimEnd().split("\n").length, 38, "a reprodução deve ter 38 linhas");
+  const r = validar(conteudo, "estreia");
+  assert.equal(r.code, 1);
+  assert.match(r.out, /"BEGIN"/);
+  assert.match(r.out, /"ROLLBACK"/);
+  assert.match(r.out, /FORMATO REPROVADO/);
+  assert.ok(!r.existe, "nenhum arquivo pode chegar ao check-ledger");
+});
+
+test("SIM-31: linha desconhecida reprova, seja qual for", () => {
+  for (const intruso of ["SET", "COMMIT", "NOTICE: algo", "(36 rows)", "  ", "20260730123613"]) {
+    const r = validar(LEDGER_36 + intruso + "\n", `intruso-${intruso.slice(0, 6)}`);
+    assert.equal(r.code, 1, `deveria reprovar: ${JSON.stringify(intruso)}`);
+    assert.match(r.out, /FORMATO REPROVADO/);
+  }
+});
+
+test("SIM-32: versão fora de ordem reprova", () => {
+  const linhas = LEDGER_36.trimEnd().split("\n");
+  [linhas[3], linhas[4]] = [linhas[4], linhas[3]];
+  const r = validar(linhas.join("\n") + "\n", "ordem");
+  assert.equal(r.code, 1, "deveria reprovar ordem invertida");
+  assert.match(r.out, /fora de ordem/);
+});
+
+test("SIM-33: versão duplicada reprova", () => {
+  const linhas = LEDGER_36.trimEnd().split("\n");
+  const r = validar([...linhas, linhas[0]].join("\n") + "\n", "dup");
+  assert.equal(r.code, 1);
+  assert.match(r.out, /fora de ordem|duplicada/);
+});
+
+test("SIM-34: ledger vazio reprova", () => {
+  const r = validar("", "vazio");
+  assert.equal(r.code, 1);
+  assert.match(r.out, /não pode estar vazio/);
+});
+
+test("SIM-35: check-ledger também reprova version malformada", () => {
+  // Defesa em profundidade: mesmo que alguém entregue o arquivo sujo direto ao
+  // check-ledger, ele não pode classificar `BEGIN` como forward-only.
+  const arquivo = path.join(tmp, "sujo.tsv");
+  fs.writeFileSync(arquivo, "BEGIN\n" + LEDGER_36 + "ROLLBACK\n", "utf8");
+  const r = shell(`node scripts/ci/check-ledger.mjs "${arquivo}"`, {});
+  assert.equal(r.code, 1, "check-ledger deveria reprovar");
+  assert.match(r.out, /version fora do formato de 14 dígitos/);
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log("");
