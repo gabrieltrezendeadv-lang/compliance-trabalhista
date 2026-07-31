@@ -91,11 +91,56 @@ jobs:
         with:
           version: 2.110.0
 
-      - name: Subir stack descartável e aplicar as migrations do repositório
+      # ────────────────────────────────────────────────────────────────────
+      # ENSAIO DIAGNÓSTICO — psql, antes da aplicação autoritativa
+      #
+      # O wrapper `effect/sql` do CLI do Supabase NÃO expõe a mensagem do
+      # `RAISE EXCEPTION`: imprime só "At statement: N" e o texto do statement.
+      # Uma pós-condição que falha fica indiagnosticável — foi o que aconteceu
+      # com `pc_assinaturas`, e três execuções não revelaram a causa.
+      #
+      # As forward-only são RESERVADAS para a stack subir, o ensaio as aplica
+      # por psql numa transação encerrada em ROLLBACK — que imprime MESSAGE,
+      # DETAIL, HINT e CONTEXT — e depois elas voltam ao lugar para o CLI
+      # aplicá-las de verdade.
+      #
+      # Este passo NÃO substitui nada: é informativo e não deixa efeito.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Subir stack com as forward-only reservadas
         run: |
           set -o pipefail
           supabase init --force
+          mkdir -p /tmp/fo
+          node scripts/ci/list-forward-only.mjs > /tmp/forward-only.txt
+          echo "forward-only reservadas para o ensaio:"; cat /tmp/forward-only.txt
+          while read -r f; do
+            [ -n "$f" ] && mv "supabase/migrations/$f" /tmp/fo/
+          done < /tmp/forward-only.txt
           supabase start --exclude realtime,storage-api,imgproxy,studio,edge-runtime,logflare,vector,supavisor
+          echo "DB_URL=$(supabase status -o env | grep '^DB_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+
+      - name: Ensaio diagnóstico das forward-only (psql, ROLLBACK obrigatório)
+        run: |
+          set -o pipefail
+          ORDEM=""
+          while read -r f; do
+            [ -n "$f" ] && ORDEM="$ORDEM /tmp/fo/$f"
+          done < /tmp/forward-only.txt
+          # A ordem do arquivo é lexicográfica = cronológica, então a 12A vem
+          # antes da 12B, que depende dela.
+          bash scripts/ci/diagnose-forward-only.sh "$DB_URL" $ORDEM
+
+      - name: Devolver as forward-only e aplicar pelo CLI (autoritativo)
+        run: |
+          set -o pipefail
+          while read -r f; do
+            [ -n "$f" ] && mv "/tmp/fo/$f" supabase/migrations/
+          done < /tmp/forward-only.txt
+          git diff --exit-code --stat -- supabase/migrations \
+            || { echo "FALHA: supabase/migrations foi modificado"; exit 1; }
+          # `db reset` reaplica TUDO pelo CLI, na ordem, como a rota de produção
+          # fará. É esta aplicação que vale como prova.
+          supabase db reset --no-seed
           ST=$(supabase status -o env)
           echo "DB_URL=$(printf '%s' "$ST" | grep '^DB_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
           # API_URL e SERVICE_ROLE_KEY alimentam o contrato contra o PostgREST.
