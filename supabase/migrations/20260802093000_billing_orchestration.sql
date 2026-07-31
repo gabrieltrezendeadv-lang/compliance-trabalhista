@@ -1663,47 +1663,112 @@ $pc_public$;
 
 DO $pc_assinaturas$
 DECLARE
-  v_int   integer;
-  v_txt   text;
-  v_owner oid;
+  v_txt text;
+  v_int integer;
+  v_esperadas oid[];
 BEGIN
--- 11.5 As dezesseis RPCs existem, com o conjunto EXATO de assinaturas.
-  --      Uma função a mais, a menos, ou uma sobrecarga, reprova aqui.
-  SELECT string_agg(esperada, ', ' ORDER BY esperada) INTO v_txt
+  -- 11.5 As dezesseis RPCs existem, com identidade EXATA.
+  --
+  -- ── POR QUE OID, E NÃO TEXTO ──────────────────────────────────────────────
+  --
+  -- A primeira versão comparava contra
+  -- `pg_get_function_identity_arguments(oid)`, supondo que ele rendesse só os
+  -- TIPOS. Ele rende também os NOMES: o catálogo devolve
+  -- `fn_billing_apply_provider_event(p_provider text, p_provider_account_id
+  -- text, …)`, não `(text, text, …)`. A comparação textual reprovava as
+  -- dezesseis, e a mensagem do CLI não dizia por quê.
+  --
+  -- `to_regprocedure` resolve a assinatura para o OID da função, sem depender
+  -- de como o catálogo a imprime. Ausente vira NULL, e NULL reprova.
+  SELECT string_agg(t.esperada, ', ' ORDER BY t.esperada) INTO v_txt
     FROM unnest(ARRAY[
-      'fn_billing_apply_provider_event(text, text, text, text, text, timestamp with time zone, text, timestamp with time zone)',
-      'fn_billing_cancel_at_period_end(uuid, uuid, text, text, timestamp with time zone)',
-      'fn_billing_change_plan(uuid, uuid, text, text, text, text, timestamp with time zone, timestamp with time zone, integer, text, text, text, text, text, timestamp with time zone)',
-      'fn_billing_claim_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)',
-      'fn_billing_fail_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)',
-      'fn_billing_finalize_checkout(uuid, uuid, text, text, text, text, text, integer, timestamp with time zone, timestamp with time zone, text, text, text, timestamp with time zone)',
-      'fn_billing_grant_courtesy(uuid, uuid, text, timestamp with time zone, timestamp with time zone, text, text)',
-      'fn_billing_read_catalog(uuid, uuid, text)',
-      'fn_billing_read_ledger(uuid, uuid)',
-      'fn_billing_read_state(uuid, uuid)',
-      'fn_billing_record_worker_count(uuid, uuid, integer, text, timestamp with time zone)',
-      'fn_billing_revoke_courtesy(uuid, uuid, uuid, timestamp with time zone, text, text)',
-      'fn_billing_save_grandfathering(uuid, uuid, timestamp with time zone, timestamp with time zone, text)',
-      'fn_billing_schedule_downgrade(uuid, uuid, text, text, text, text, timestamp with time zone)',
-      'fn_billing_start_trial(uuid, uuid, text, text, text, integer, text, timestamp with time zone, timestamp with time zone, timestamp with time zone, integer, text, text)',
-      'fn_billing_transition_state(uuid, uuid, text, text, text, text, timestamp with time zone)'
+      'public.fn_billing_apply_provider_event(text, text, text, text, text, timestamp with time zone, text, timestamp with time zone)',
+      'public.fn_billing_cancel_at_period_end(uuid, uuid, text, text, timestamp with time zone)',
+      'public.fn_billing_change_plan(uuid, uuid, text, text, text, text, timestamp with time zone, timestamp with time zone, integer, text, text, text, text, text, timestamp with time zone)',
+      'public.fn_billing_claim_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)',
+      'public.fn_billing_fail_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)',
+      'public.fn_billing_finalize_checkout(uuid, uuid, text, text, text, text, text, integer, timestamp with time zone, timestamp with time zone, text, text, text, timestamp with time zone)',
+      'public.fn_billing_grant_courtesy(uuid, uuid, text, timestamp with time zone, timestamp with time zone, text, text)',
+      'public.fn_billing_read_catalog(uuid, uuid, text)',
+      'public.fn_billing_read_ledger(uuid, uuid)',
+      'public.fn_billing_read_state(uuid, uuid)',
+      'public.fn_billing_record_worker_count(uuid, uuid, integer, text, timestamp with time zone)',
+      'public.fn_billing_revoke_courtesy(uuid, uuid, uuid, timestamp with time zone, text, text)',
+      'public.fn_billing_save_grandfathering(uuid, uuid, timestamp with time zone, timestamp with time zone, text)',
+      'public.fn_billing_schedule_downgrade(uuid, uuid, text, text, text, text, timestamp with time zone)',
+      'public.fn_billing_start_trial(uuid, uuid, text, text, text, integer, text, timestamp with time zone, timestamp with time zone, timestamp with time zone, integer, text, text)',
+      'public.fn_billing_transition_state(uuid, uuid, text, text, text, text, timestamp with time zone)'
     ]) AS t(esperada)
-   WHERE NOT EXISTS (
-     SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-      WHERE n.nspname = 'public'
-        AND p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' = t.esperada
-   );
+   WHERE to_regprocedure(t.esperada) IS NULL;
   IF v_txt IS NOT NULL THEN
-    -- A mensagem carrega o que o CATÁLOGO realmente rendeu, e não apenas o que
-    -- se esperava. Sem isso, "assinatura diferente" não diz em quê ela difere —
-    -- e foi exatamente essa a informação que faltou na primeira execução real.
-    RAISE EXCEPTION E'RPC(s) ausente(s) ou com assinatura diferente:\n  esperado: %\n  no catalogo: %',
-      v_txt,
-      (SELECT string_agg(
-                p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
-                E'\n              ' ORDER BY p.proname)
-         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%');
+    RAISE EXCEPTION E'RPC(s) ausente(s) ou com assinatura diferente:
+  %', v_txt;
+  END IF;
+
+  SELECT array_agg(to_regprocedure(t.esperada)::oid) INTO v_esperadas
+    FROM unnest(ARRAY[
+      'public.fn_billing_apply_provider_event(text, text, text, text, text, timestamp with time zone, text, timestamp with time zone)',
+      'public.fn_billing_cancel_at_period_end(uuid, uuid, text, text, timestamp with time zone)',
+      'public.fn_billing_change_plan(uuid, uuid, text, text, text, text, timestamp with time zone, timestamp with time zone, integer, text, text, text, text, text, timestamp with time zone)',
+      'public.fn_billing_claim_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)',
+      'public.fn_billing_fail_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)',
+      'public.fn_billing_finalize_checkout(uuid, uuid, text, text, text, text, text, integer, timestamp with time zone, timestamp with time zone, text, text, text, timestamp with time zone)',
+      'public.fn_billing_grant_courtesy(uuid, uuid, text, timestamp with time zone, timestamp with time zone, text, text)',
+      'public.fn_billing_read_catalog(uuid, uuid, text)',
+      'public.fn_billing_read_ledger(uuid, uuid)',
+      'public.fn_billing_read_state(uuid, uuid)',
+      'public.fn_billing_record_worker_count(uuid, uuid, integer, text, timestamp with time zone)',
+      'public.fn_billing_revoke_courtesy(uuid, uuid, uuid, timestamp with time zone, text, text)',
+      'public.fn_billing_save_grandfathering(uuid, uuid, timestamp with time zone, timestamp with time zone, text)',
+      'public.fn_billing_schedule_downgrade(uuid, uuid, text, text, text, text, timestamp with time zone)',
+      'public.fn_billing_start_trial(uuid, uuid, text, text, text, integer, text, timestamp with time zone, timestamp with time zone, timestamp with time zone, integer, text, text)',
+      'public.fn_billing_transition_state(uuid, uuid, text, text, text, text, timestamp with time zone)'
+    ]) AS t(esperada);
+
+  -- Nenhuma EXTRA, nenhuma sobrecarga não declarada: o conjunto real precisa
+  -- ser exatamente o esperado.
+  SELECT string_agg(p.oid::regprocedure::text, ', ' ORDER BY p.oid::regprocedure::text)
+    INTO v_txt
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
+     AND NOT (p.oid = ANY(v_esperadas));
+  IF v_txt IS NOT NULL THEN
+    RAISE EXCEPTION E'RPC(s) de billing NAO AUTORIZADA(S) em public:
+  %', v_txt;
+  END IF;
+
+  SELECT count(*) INTO v_int
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%';
+  IF v_int <> 16 THEN
+    RAISE EXCEPTION 'esperadas 16 RPCs de billing, encontradas %', v_int;
+  END IF;
+
+  -- Nenhum parâmetro com default: o PostgREST escolheria sobrecarga por
+  -- omissão de chave, e uma chamada incompleta passaria a ser válida.
+  SELECT string_agg(p.proname, ', ' ORDER BY p.proname) INTO v_txt
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
+     AND p.pronargdefaults <> 0;
+  IF v_txt IS NOT NULL THEN
+    RAISE EXCEPTION 'RPC(s) com parametro default: %', v_txt;
+  END IF;
+
+  -- Todos os parâmetros são de ENTRADA e TÊM NOME. O PostgREST associa as
+  -- chaves do corpo de `.rpc()` aos nomes dos parâmetros: função sem nome, ou
+  -- com parâmetro OUT/INOUT, muda o contrato de chamada sem mudar os tipos.
+  SELECT string_agg(p.proname, ', ' ORDER BY p.proname) INTO v_txt
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
+     AND (p.proargmodes IS NOT NULL
+          OR p.proallargtypes IS NOT NULL
+          OR p.proargnames IS NULL
+          OR array_length(p.proargnames, 1) IS DISTINCT FROM p.pronargs
+          OR EXISTS (SELECT 1 FROM unnest(p.proargnames) AS nome
+                      WHERE nome IS NULL OR nome !~ '^p_[a-z0-9_]+$'));
+  IF v_txt IS NOT NULL THEN
+    RAISE EXCEPTION
+      'RPC(s) com parametro sem nome, fora do padrao p_*, ou em modo OUT/INOUT: %', v_txt;
   END IF;
 END
 $pc_assinaturas$;

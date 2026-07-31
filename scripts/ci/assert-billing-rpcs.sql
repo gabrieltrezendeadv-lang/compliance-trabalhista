@@ -54,22 +54,22 @@ DECLARE
   v_int   integer;
   v_owner oid;
   v_esperadas text[] := ARRAY[
-    'fn_billing_read_state(uuid, uuid)|jsonb|s',
-    'fn_billing_read_catalog(uuid, uuid, text)|jsonb|s',
-    'fn_billing_read_ledger(uuid, uuid)|jsonb|s',
-    'fn_billing_start_trial(uuid, uuid, text, text, text, integer, text, timestamp with time zone, timestamp with time zone, timestamp with time zone, integer, text, text)|jsonb|v',
-    'fn_billing_change_plan(uuid, uuid, text, text, text, text, timestamp with time zone, timestamp with time zone, integer, text, text, text, text, text, timestamp with time zone)|jsonb|v',
-    'fn_billing_schedule_downgrade(uuid, uuid, text, text, text, text, timestamp with time zone)|jsonb|v',
-    'fn_billing_cancel_at_period_end(uuid, uuid, text, text, timestamp with time zone)|jsonb|v',
-    'fn_billing_transition_state(uuid, uuid, text, text, text, text, timestamp with time zone)|jsonb|v',
-    'fn_billing_record_worker_count(uuid, uuid, integer, text, timestamp with time zone)|jsonb|v',
-    'fn_billing_claim_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)|jsonb|v',
-    'fn_billing_fail_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)|jsonb|v',
-    'fn_billing_finalize_checkout(uuid, uuid, text, text, text, text, text, integer, timestamp with time zone, timestamp with time zone, text, text, text, timestamp with time zone)|jsonb|v',
-    'fn_billing_apply_provider_event(text, text, text, text, text, timestamp with time zone, text, timestamp with time zone)|jsonb|v',
-    'fn_billing_grant_courtesy(uuid, uuid, text, timestamp with time zone, timestamp with time zone, text, text)|jsonb|v',
-    'fn_billing_revoke_courtesy(uuid, uuid, uuid, timestamp with time zone, text, text)|jsonb|v',
-    'fn_billing_save_grandfathering(uuid, uuid, timestamp with time zone, timestamp with time zone, text)|jsonb|v'
+      'public.fn_billing_read_state(uuid, uuid)|jsonb|s',
+      'public.fn_billing_read_catalog(uuid, uuid, text)|jsonb|s',
+      'public.fn_billing_read_ledger(uuid, uuid)|jsonb|s',
+      'public.fn_billing_start_trial(uuid, uuid, text, text, text, integer, text, timestamp with time zone, timestamp with time zone, timestamp with time zone, integer, text, text)|jsonb|v',
+      'public.fn_billing_change_plan(uuid, uuid, text, text, text, text, timestamp with time zone, timestamp with time zone, integer, text, text, text, text, text, timestamp with time zone)|jsonb|v',
+      'public.fn_billing_schedule_downgrade(uuid, uuid, text, text, text, text, timestamp with time zone)|jsonb|v',
+      'public.fn_billing_cancel_at_period_end(uuid, uuid, text, text, timestamp with time zone)|jsonb|v',
+      'public.fn_billing_transition_state(uuid, uuid, text, text, text, text, timestamp with time zone)|jsonb|v',
+      'public.fn_billing_record_worker_count(uuid, uuid, integer, text, timestamp with time zone)|jsonb|v',
+      'public.fn_billing_claim_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)|jsonb|v',
+      'public.fn_billing_fail_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)|jsonb|v',
+      'public.fn_billing_finalize_checkout(uuid, uuid, text, text, text, text, text, integer, timestamp with time zone, timestamp with time zone, text, text, text, timestamp with time zone)|jsonb|v',
+      'public.fn_billing_apply_provider_event(text, text, text, text, text, timestamp with time zone, text, timestamp with time zone)|jsonb|v',
+      'public.fn_billing_grant_courtesy(uuid, uuid, text, timestamp with time zone, timestamp with time zone, text, text)|jsonb|v',
+      'public.fn_billing_revoke_courtesy(uuid, uuid, uuid, timestamp with time zone, text, text)|jsonb|v',
+      'public.fn_billing_save_grandfathering(uuid, uuid, timestamp with time zone, timestamp with time zone, text)|jsonb|v'
   ];
 BEGIN
   IF array_length(v_esperadas, 1) <> 16 THEN
@@ -77,39 +77,50 @@ BEGIN
       array_length(v_esperadas, 1);
   END IF;
 
-  -- 1.1 Nenhuma AUSENTE, e retorno/volatilidade conferem na mesma passada.
-  SELECT string_agg(split_part(e, '|', 1), E'\n  ' ORDER BY e) INTO v_txt
+  -- ── IDENTIDADE POR OID, NAO POR TEXTO ─────────────────────────────────────
+  --
+  -- `pg_get_function_identity_arguments` rende os NOMES dos parametros junto
+  -- com os tipos — `(p_actor_id uuid, p_organization_id uuid)`, e nao
+  -- `(uuid, uuid)`. Comparar a string renderizada reprovava as dezesseis.
+  -- `to_regprocedure` resolve para o OID e nao depende da impressao.
+  SELECT string_agg(split_part(e, '|', 1), E'
+  ' ORDER BY e) INTO v_txt
     FROM unnest(v_esperadas) AS e
-   WHERE NOT EXISTS (
-     SELECT 1
-       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-      WHERE n.nspname = 'public'
-        AND p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')'
-            = split_part(e, '|', 1)
-        AND pg_catalog.format_type(p.prorettype, NULL) = split_part(e, '|', 2)
-        AND p.provolatile::text = split_part(e, '|', 3)
-   );
+   WHERE to_regprocedure(split_part(e, '|', 1)) IS NULL;
   IF v_txt IS NOT NULL THEN
-    RAISE EXCEPTION
-      E'RPC(s) AUSENTE(S), com assinatura, retorno ou volatilidade diferente:\n  %', v_txt;
+    RAISE EXCEPTION E'RPC(s) AUSENTE(S) ou com assinatura diferente:
+  %', v_txt;
   END IF;
 
-  -- 1.2 Nenhuma EXTRA. É aqui que uma sobrecarga acidental ou maliciosa morre:
-  --     `fn_billing_read_state(uuid, uuid, text)` seria outra função, com o
-  --     mesmo nome, escolhida pelo PostgREST conforme o que o chamador manda.
-  SELECT string_agg(
-           p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
-           E'\n  ' ORDER BY p.proname)
+  -- Retorno e volatilidade, conferidos pelo OID resolvido.
+  SELECT string_agg(format('%s (retorno %s, volatilidade %s)',
+                           split_part(e, '|', 1),
+                           pg_catalog.format_type(p.prorettype, NULL),
+                           p.provolatile),
+                    E'
+  ' ORDER BY e)
+    INTO v_txt
+    FROM unnest(v_esperadas) AS e
+    JOIN pg_proc p ON p.oid = to_regprocedure(split_part(e, '|', 1))
+   WHERE pg_catalog.format_type(p.prorettype, NULL) <> split_part(e, '|', 2)
+      OR p.provolatile::text <> split_part(e, '|', 3);
+  IF v_txt IS NOT NULL THEN
+    RAISE EXCEPTION E'RPC(s) com retorno ou volatilidade divergente:
+  %', v_txt;
+  END IF;
+
+  -- Nenhuma EXTRA: o conjunto real precisa ser exatamente o esperado.
+  SELECT string_agg(p.oid::regprocedure::text, E'
+  ' ORDER BY p.proname)
     INTO v_txt
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
    WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
-     AND NOT EXISTS (
-       SELECT 1 FROM unnest(v_esperadas) AS e
-        WHERE split_part(e, '|', 1)
-              = p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')'
-     );
+     AND NOT (p.oid = ANY(
+       SELECT to_regprocedure(split_part(e, '|', 1))::oid FROM unnest(v_esperadas) AS e
+     ));
   IF v_txt IS NOT NULL THEN
-    RAISE EXCEPTION E'RPC(s) de billing NÃO AUTORIZADA(S) em public:\n  %', v_txt;
+    RAISE EXCEPTION E'RPC(s) de billing NAO AUTORIZADA(S) em public:
+  %', v_txt;
   END IF;
 
   SELECT count(*) INTO v_int
@@ -119,19 +130,33 @@ BEGIN
     RAISE EXCEPTION 'esperadas 16 RPCs de billing, encontradas %', v_int;
   END IF;
 
-  -- 1.3 SECURITY DEFINER, owner esperado e search_path VAZIO.
-  --
-  -- O owner esperado é o dono das tabelas de billing: as funções rodam como
-  -- ele, e é por isso que alcançam um schema em que `service_role` não tem
-  -- nem USAGE. Um owner diferente significaria privilégio diferente do
-  -- revisado.
+  -- Nomes dos parametros SAO contrato: o PostgREST associa as chaves do corpo
+  -- de `.rpc()` aos nomes. Validar so os tipos deixaria passar uma renomeacao
+  -- que quebra toda chamada sem mudar assinatura de tipos.
+  SELECT string_agg(p.proname, ', ' ORDER BY p.proname) INTO v_txt
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
+     AND (p.proargmodes IS NOT NULL
+          OR p.proallargtypes IS NOT NULL
+          OR p.proargnames IS NULL
+          OR p.pronargdefaults <> 0
+          OR array_length(p.proargnames, 1) IS DISTINCT FROM p.pronargs
+          OR EXISTS (SELECT 1 FROM unnest(p.proargnames) AS nome
+                      WHERE nome IS NULL OR nome !~ '^p_[a-z0-9_]+$'));
+  IF v_txt IS NOT NULL THEN
+    RAISE EXCEPTION
+      'RPC(s) com parametro sem nome, com default, ou em modo OUT/INOUT: %', v_txt;
+  END IF;
+
+  -- SECURITY DEFINER, owner esperado e search_path VAZIO.
   SELECT c.relowner INTO v_owner FROM pg_class c WHERE c.oid = 'billing.subscriptions'::regclass;
 
   SELECT string_agg(
            format('%s [secdef=%s owner=%s search_path=%s]',
                   p.proname, p.prosecdef, pg_get_userbyid(p.proowner),
                   COALESCE(array_to_string(p.proconfig, ','), '(nenhum)')),
-           E'\n  ' ORDER BY p.proname)
+           E'
+  ' ORDER BY p.proname)
     INTO v_txt
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
    WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
@@ -143,11 +168,12 @@ BEGIN
              ));
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION
-      E'RPC(s) sem SECURITY DEFINER, com owner inesperado ou sem search_path vazio:\n  %',
+      E'RPC(s) sem SECURITY DEFINER, com owner inesperado ou sem search_path vazio:
+  %',
       v_txt;
   END IF;
 
-  RAISE NOTICE 'billingRPC/catalogo OK: 16 assinaturas exatas, SECURITY DEFINER, owner %, search_path vazio',
+  RAISE NOTICE 'billingRPC/catalogo OK: 16 assinaturas por OID, nomes de parametro, SECURITY DEFINER, owner %, search_path vazio',
     pg_get_userbyid(v_owner);
 END
 $conjunto$;
