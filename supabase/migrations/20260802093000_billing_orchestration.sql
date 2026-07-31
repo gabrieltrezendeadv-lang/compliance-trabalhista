@@ -1564,21 +1564,34 @@ $$;
 -- 11. PÓS-CONDIÇÕES
 -- ═════════════════════════════════════════════════════════════════════════════
 
-DO $$
+-- Cada asserção em seu PRÓPRIO bloco, com tag nomeada.
+-- Motivo: o CLI do Supabase reporta só o número do statement e despeja o
+-- bloco inteiro, sem a mensagem do RAISE. Com um bloco por asserção, a
+-- falha diz qual invariante caiu — que é a informação de que se precisa.
+
+DO $pc_tabelas$
 DECLARE
   v_int   integer;
   v_txt   text;
   v_owner oid;
 BEGIN
-  -- 11.1 As cinco tabelas novas; o schema passa a ter 14.
+-- 11.1 As cinco tabelas novas; o schema passa a ter 14.
   SELECT count(*) INTO v_int
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 'billing' AND c.relkind = 'r';
   IF v_int <> 14 THEN
     RAISE EXCEPTION 'esperadas 14 tabelas em billing apos a 12B, encontradas %', v_int;
   END IF;
+END
+$pc_tabelas$;
 
-  -- 11.2 RLS ligada em todas, e nenhuma policy.
+DO $pc_rls$
+DECLARE
+  v_int   integer;
+  v_txt   text;
+  v_owner oid;
+BEGIN
+-- 11.2 RLS ligada em todas, e nenhuma policy.
   SELECT count(*) INTO v_int
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 'billing' AND c.relkind = 'r' AND NOT c.relrowsecurity;
@@ -1593,8 +1606,16 @@ BEGIN
   IF v_int <> 0 THEN
     RAISE EXCEPTION 'billing ganhou % policy(ies)', v_int;
   END IF;
+END
+$pc_rls$;
 
-  -- 11.3 NENHUM privilégio para nenhum papel do PostgREST em nenhuma tabela.
+DO $pc_privilegios$
+DECLARE
+  v_int   integer;
+  v_txt   text;
+  v_owner oid;
+BEGIN
+-- 11.3 NENHUM privilégio para nenhum papel do PostgREST em nenhuma tabela.
   --      Não há mais allowlist de UPDATE: não há mais UPDATE concedido.
   SELECT string_agg(format('%s→%s em %s', pg_get_userbyid(a.grantee),
                            a.privilege_type, c.relname), ', ')
@@ -1609,8 +1630,16 @@ BEGIN
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION 'privilegio direto sobrevivente em billing: %', v_txt;
   END IF;
+END
+$pc_privilegios$;
 
-  -- 11.4 Nenhuma TABELA, VIEW, SEQUENCE ou TIPO de billing em `public`.
+DO $pc_public$
+DECLARE
+  v_int   integer;
+  v_txt   text;
+  v_owner oid;
+BEGIN
+-- 11.4 Nenhuma TABELA, VIEW, SEQUENCE ou TIPO de billing em `public`.
   --      A exceção nominal vale só para FUNÇÃO.
   SELECT count(*) INTO v_int
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1629,8 +1658,16 @@ BEGIN
   IF v_int <> 0 THEN
     RAISE EXCEPTION '% tipo(s) da 12B foram criados em public', v_int;
   END IF;
+END
+$pc_public$;
 
-  -- 11.5 As dezesseis RPCs existem, com o conjunto EXATO de assinaturas.
+DO $pc_assinaturas$
+DECLARE
+  v_int   integer;
+  v_txt   text;
+  v_owner oid;
+BEGIN
+-- 11.5 As dezesseis RPCs existem, com o conjunto EXATO de assinaturas.
   --      Uma função a mais, a menos, ou uma sobrecarga, reprova aqui.
   SELECT string_agg(esperada, ', ' ORDER BY esperada) INTO v_txt
     FROM unnest(ARRAY[
@@ -1659,8 +1696,16 @@ BEGIN
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION 'RPC(s) de billing ausente(s) ou com assinatura diferente: %', v_txt;
   END IF;
+END
+$pc_assinaturas$;
 
-  -- 11.6 Todas SECURITY DEFINER, com search_path VAZIO e mesmo owner do schema.
+DO $pc_definer$
+DECLARE
+  v_int   integer;
+  v_txt   text;
+  v_owner oid;
+BEGIN
+-- 11.6 Todas SECURITY DEFINER, com search_path VAZIO e mesmo owner do schema.
   SELECT c.relowner INTO v_owner FROM pg_class c WHERE c.oid = 'billing.subscriptions'::regclass;
 
   SELECT string_agg(p.proname, ', ' ORDER BY p.proname) INTO v_txt
@@ -1676,8 +1721,16 @@ BEGIN
     RAISE EXCEPTION
       'RPC(s) sem SECURITY DEFINER, com owner inesperado ou sem search_path vazio: %', v_txt;
   END IF;
+END
+$pc_definer$;
 
-  -- 11.7 EXECUTE somente para service_role.
+DO $pc_execute$
+DECLARE
+  v_int   integer;
+  v_txt   text;
+  v_owner oid;
+BEGIN
+-- 11.7 EXECUTE somente para service_role.
   SELECT string_agg(format('%s→%s', p.proname, pg_get_userbyid(a.grantee)), ', ')
     INTO v_txt
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -1688,8 +1741,16 @@ BEGIN
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION 'EXECUTE indevido em RPC de billing: %', v_txt;
   END IF;
+END
+$pc_execute$;
 
-  -- 11.8 Triggers de cobrança e imutabilidades da 12A.
+DO $pc_triggers$
+DECLARE
+  v_int   integer;
+  v_txt   text;
+  v_owner oid;
+BEGIN
+-- 11.8 Triggers de cobrança e imutabilidades da 12A.
   SELECT count(*) INTO v_int
     FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1699,8 +1760,16 @@ BEGIN
   IF v_int <> 4 THEN
     RAISE EXCEPTION 'esperadas 4 triggers de integridade, encontradas %', v_int;
   END IF;
+END
+$pc_triggers$;
 
-  -- 11.9 Unicidades que sustentam idempotência e resolução de tenant.
+DO $pc_unicidades$
+DECLARE
+  v_int   integer;
+  v_txt   text;
+  v_owner oid;
+BEGIN
+-- 11.9 Unicidades que sustentam idempotência e resolução de tenant.
   SELECT string_agg(esperada, ', ' ORDER BY esperada) INTO v_txt
     FROM unnest(ARRAY[
       'idempotency_chave_unica', 'charges_externo_unico', 'charges_comando_unico',
@@ -1712,8 +1781,12 @@ BEGIN
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION 'unicidade(s) ausente(s): %', v_txt;
   END IF;
+END
+$pc_unicidades$;
 
+DO $pc_final$
+BEGIN
   RAISE NOTICE
     'OK: orquestracao 12B instalada (14 tabelas, 16 RPCs, 0 privilegio direto)';
 END
-$$;
+$pc_final$;
