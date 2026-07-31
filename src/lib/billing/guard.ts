@@ -1,277 +1,251 @@
 /**
- * Billing Guard — Plan limit verification middleware
+ * BILLING GUARD — verificação de entitlement, FAIL-CLOSED
  *
- * ADR-005: Limites verificados em tempo real ANTES de operações.
- * Called by server actions before any resource creation to enforce
- * plan limits and subscription status.
+ * ── O QUE ESTE ARQUIVO SUBSTITUI ────────────────────────────────────────────
  *
- * Usage in server actions:
- *   const guard = await enforcePlanLimit("establishments")
- *   if (!guard.allowed) return { error: guard.message }
+ * A versão anterior terminava assim:
+ *
+ *     if (error) {
+ *       // If RPC fails (e.g., no subscription table), allow operation
+ *       return { allowed: true, reason: "ok" }
+ *     }
+ *
+ * Isso é fail-open. E não era risco teórico: `check_plan_limit` está com
+ * `EXECUTE` revogado de TODOS os papéis, inclusive `service_role`
+ * (`20260728191311_..._sec_002_retire_plan_limit.sql`). A chamada falhava
+ * SEMPRE, aquele ramo era o único alcançável, e o guard aprovava tudo. Um
+ * controle que aprova sempre é pior que controle nenhum: ele parece proteger.
+ *
+ * A regra nova, sem exceção:
+ *
+ *   * erro ao verificar entitlement NUNCA produz `allowed: true`;
+ *   * com billing ATIVO, falha de verificação NEGA a operação;
+ *   * com billing DESATIVADO, a permissão sai por um desvio EXPLÍCITO e
+ *     IDENTIFICÁVEL da feature flag — `reason: "billing_disabled"` e
+ *     `bypass: true` —, jamais por captura genérica de erro.
+ *
+ * A diferença entre os dois últimos itens é o ponto inteiro. Com `catch →
+ * allow`, "não havia assinatura" e "não consegui verificar" produzem o mesmo
+ * resultado e ficam indistinguíveis no log. Aqui são estados diferentes, com
+ * nomes diferentes, e só um deles permite.
+ *
+ * Nenhuma função deste arquivo chama `check_plan_limit`. SEC-002 permanece
+ * intacta e nenhum `GRANT` é reconcedido.
+ *
+ * ── LIMITE DECLARADO DESTA ETAPA ────────────────────────────────────────────
+ *
+ * A fonte de dados de assinatura vive no schema `billing`, que NÃO é exposto ao
+ * PostgREST — de propósito (ver docs/decisions/PLANOS-E-PRECIFICACAO.md §8.1).
+ * A fachada que a tornará legível pelo servidor é da Etapa 12B.
+ *
+ * Consequência, declarada e deliberada: **com a feature flag ligada hoje, toda
+ * verificação NEGA**, porque não há como verificar. É o comportamento correto
+ * de um guard fail-closed, e é a razão de a flag nascer desligada. Ligá-la
+ * antes da 12B não libera nada indevidamente — bloqueia tudo.
  */
 
-import { createClient } from "@/lib/supabase/server"
-import type { SubscriptionStatus } from "./types"
+import { createClient } from "@/lib/supabase/server";
+import { isBillingEnabled } from "./flag";
+import { canWrite, planIncludes } from "./plans/entitlements";
+import type {
+  EntitlementDecision,
+  EntitlementDenialReason,
+  FeatureKey,
+  PlanSlug,
+  SubscriptionState,
+} from "./plans/model";
 
-export interface GuardResult {
-  allowed: boolean
-  message?: string
-  /** Reason code for programmatic handling */
-  reason?:
-    | "ok"
-    | "no_subscription"
-    | "subscription_blocked"
-    | "read_only_mode"
-    | "limit_reached"
-    | "not_authenticated"
-    | "no_organization"
-  /** Current usage count */
-  current?: number
-  /** Plan limit (null = unlimited) */
-  limit?: number | null
-}
-
-// Status messages in Portuguese for user-facing errors
-const STATUS_MESSAGES: Record<string, string> = {
-  no_subscription:
-    "Nenhuma assinatura ativa encontrada. Assine um plano para continuar.",
-  subscription_blocked:
-    "Sua assinatura está bloqueada por inadimplência. Regularize o pagamento para continuar.",
-  read_only_mode:
-    "Sua conta está em modo somente leitura por inadimplência. Regularize o pagamento para criar novos recursos.",
-  limit_reached:
-    "Limite do plano atingido. Faça upgrade para um plano superior.",
+const MENSAGENS: Record<EntitlementDenialReason, string> = {
+  billing_disabled: "",
+  feature_not_in_plan:
+    "Este recurso não está incluído no seu plano. Faça upgrade para o Completo.",
+  read_only:
+    "Sua conta está em modo somente leitura. Os dados continuam disponíveis para consulta.",
+  no_subscription: "Nenhuma assinatura ativa encontrada para esta organização.",
+  verification_failed:
+    "Não foi possível verificar seu plano no momento. Tente novamente.",
   not_authenticated: "Sessão expirada. Faça login novamente.",
   no_organization: "Organização não encontrada.",
+  not_owner: "Somente o proprietário pode administrar a assinatura.",
+};
+
+function negar(reason: EntitlementDenialReason): EntitlementDecision {
+  return { allowed: false, reason, message: MENSAGENS[reason] };
 }
 
 /**
- * Enforce plan limit before a create operation.
- * Call this at the top of any server action that creates resources.
+ * O ÚNICO caminho que permite sem verificar.
+ *
+ * Isolado numa função própria, com nome próprio e marca própria (`bypass`),
+ * para que seja localizável por busca e por teste. Um `return { allowed: true }`
+ * espalhado pelo arquivo seria indistinguível de um fail-open.
  */
-export async function enforcePlanLimit(
-  metric: string
-): Promise<GuardResult> {
-  const supabase = await createClient()
+function desvioDaFeatureFlag(): EntitlementDecision {
+  return { allowed: true, reason: "billing_disabled", bypass: true };
+}
 
-  // 1. Get user
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+// ─── Contexto ──────────────────────────────────────────────────────────────
 
-  if (!user) {
-    return {
-      allowed: false,
-      reason: "not_authenticated",
-      message: STATUS_MESSAGES.not_authenticated,
+interface BillingContext {
+  readonly organizationId: string;
+  readonly plan: PlanSlug;
+  readonly state: SubscriptionState;
+}
+
+type ContextResult =
+  | { readonly ok: true; readonly context: BillingContext }
+  | { readonly ok: false; readonly reason: EntitlementDenialReason };
+
+/**
+ * Carrega o contexto de billing da organização do chamador.
+ *
+ * A resolução de organização É feita — ela já vale hoje, e é onde a ordenação
+ * determinística do TG-12 precisa estar. A leitura da assinatura ainda não
+ * existe (ver o limite declarado no cabeçalho); a Etapa 12B substitui apenas o
+ * trecho final.
+ */
+async function loadBillingContext(): Promise<ContextResult> {
+  // A REDE, e ela fecha para o lado seguro.
+  //
+  // Sem este `try`, uma exceção — `createClient` falhando, `fetch` estourando
+  // por timeout, resposta malformada quebrando a desestruturação — sairia por
+  // cima de todas as decisões abaixo. O chamador típico é
+  // `if (!guard.allowed) return { error }`, que nunca roda quando a promessa
+  // rejeita: a operação aborta com erro não tratado.
+  //
+  // Abortar não autoriza, então isso já era fail-closed. Mas era fail-closed
+  // POR ACIDENTE, dependendo de como cada chamador reage. Aqui a exceção vira
+  // uma NEGAÇÃO explícita, com motivo nomeado, que todo chamador trata igual.
+  try {
+    const supabase = await createClient();
+
+    const { data: auth, error: authError } = await supabase.auth.getUser();
+    if (authError) return { ok: false, reason: "verification_failed" };
+
+    const user = auth?.user;
+    if (!user) return { ok: false, reason: "not_authenticated" };
+
+    const { data: membership, error } = await supabase
+      .from("organization_members")
+      .select("tenant_id")
+      .eq("user_id", user.id)
+      .is("deleted_at", null)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) return { ok: false, reason: "verification_failed" };
+    if (!membership) return { ok: false, reason: "no_organization" };
+    // Resposta malformada: veio linha, mas sem o tenant. Não é "sem
+    // organização" — é "não consigo confiar no que recebi".
+    if (typeof membership.tenant_id !== "string" || membership.tenant_id === "") {
+      return { ok: false, reason: "verification_failed" };
     }
+
+    // A assinatura vive em `billing`, inalcançável pelo cliente PostgREST. Sem
+    // fachada não há verificação possível — e "não consigo verificar" NEGA.
+    return { ok: false, reason: "verification_failed" };
+  } catch {
+    // Único `catch` do arquivo, e ele NEGA. Um `catch` que permitisse seria
+    // exatamente o defeito que este PR remove.
+    return { ok: false, reason: "verification_failed" };
   }
+}
 
-  // 2. Get tenant
-  const { data: membership } = await supabase
-    .from("organization_members")
-    .select("tenant_id")
-    .eq("user_id", user.id)
-    .is("deleted_at", null)
-    .order("created_at", { ascending: true })
-    .order("id", { ascending: true })
-    .limit(1)
-    .single()
+// ─── API ───────────────────────────────────────────────────────────────────
 
-  if (!membership) {
-    return {
-      allowed: false,
-      reason: "no_organization",
-      message: STATUS_MESSAGES.no_organization,
+/**
+ * O recurso está liberado para a organização do chamador?
+ *
+ * Chame no TOPO de qualquer server action que exponha recurso sujeito a plano.
+ * O cadeado da interface não substitui esta chamada.
+ */
+export async function enforceFeature(
+  feature: FeatureKey
+): Promise<EntitlementDecision> {
+  if (!isBillingEnabled()) return desvioDaFeatureFlag();
+
+  const ctx = await loadBillingContext();
+  if (!ctx.ok) return negar(ctx.reason);
+
+  try {
+    // `planIncludes` LANÇA para plano desconhecido, de propósito: um plano fora
+    // do catálogo é dado corrompido, não um caso a tratar. Aqui isso vira
+    // negação — plano desconhecido não libera recurso nenhum.
+    if (!planIncludes(ctx.context.plan, feature)) {
+      return negar("feature_not_in_plan");
     }
+  } catch {
+    return negar("verification_failed");
   }
 
-  // 3. Check via RPC
-  const { data, error } = await supabase.rpc("check_plan_limit", {
-    p_tenant_id: membership.tenant_id,
-    p_metric: metric,
-  })
+  // Estado desconhecido cai fora da lista de permissão e vira somente leitura.
+  if (!canWrite(ctx.context.state)) return negar("read_only");
 
-  if (error) {
-    // If RPC fails (e.g., no subscription table), allow operation
-    // This supports onboarding before a subscription exists
-    console.warn(`[billing-guard] RPC error for metric=${metric}:`, error.message)
-    return { allowed: true, reason: "ok" }
-  }
+  return { allowed: true, reason: "ok" };
+}
 
-  const result = data as {
-    allowed: boolean
-    limit: number | null
-    current: number
-    remaining?: number
-    reason?: string
-  }
+/**
+ * O estado da assinatura permite ESCREVER agora?
+ *
+ * Para operações que não são específicas de recurso — editar um registro já
+ * existente, por exemplo. Leitura nunca passa por aqui: nenhum dado desaparece
+ * por inadimplência ou por downgrade.
+ */
+export async function enforceWriteAccess(): Promise<EntitlementDecision> {
+  if (!isBillingEnabled()) return desvioDaFeatureFlag();
 
-  if (!result.allowed) {
-    const reason = (result.reason ?? "limit_reached") as GuardResult["reason"]
+  const ctx = await loadBillingContext();
+  if (!ctx.ok) return negar(ctx.reason);
+
+  return canWrite(ctx.context.state)
+    ? { allowed: true, reason: "ok" }
+    : negar("read_only");
+}
+
+export interface SubscriptionWarning {
+  readonly level: "info" | "warning" | "critical";
+  readonly title: string;
+  readonly message: string;
+  readonly state: SubscriptionState;
+}
+
+/**
+ * Aviso de estado da assinatura, para a interface.
+ *
+ * Com billing desligado devolve `null` — nenhum banner aparece e o layout
+ * continua sem qualquer referência a billing. Falha de verificação também
+ * devolve `null`: aviso é informação, e informação não verificada não se
+ * exibe.
+ */
+export async function getSubscriptionWarning(): Promise<SubscriptionWarning | null> {
+  if (!isBillingEnabled()) return null;
+
+  const ctx = await loadBillingContext();
+  if (!ctx.ok) return null;
+
+  const { state } = ctx.context;
+
+  if (state === "past_due_tolerance") {
     return {
-      allowed: false,
-      reason,
+      level: "warning",
+      title: "Pagamento pendente",
       message:
-        STATUS_MESSAGES[reason ?? "limit_reached"] ??
-        STATUS_MESSAGES.limit_reached,
-      current: result.current,
-      limit: result.limit,
-    }
+        "Existe uma fatura vencida. Regularize o pagamento para manter o acesso completo.",
+      state,
+    };
   }
 
-  return {
-    allowed: true,
-    reason: "ok",
-    current: result.current,
-    limit: result.limit,
-  }
-}
-
-/**
- * Check if the tenant's subscription allows write operations.
- * Use this for operations that aren't metric-based
- * (e.g., editing records in partially_blocked state).
- */
-export async function enforceWriteAccess(): Promise<GuardResult> {
-  const supabase = await createClient()
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) {
+  if (state === "read_only") {
     return {
-      allowed: false,
-      reason: "not_authenticated",
-      message: STATUS_MESSAGES.not_authenticated,
-    }
+      level: "critical",
+      title: "Conta em modo somente leitura",
+      message:
+        "Seus dados continuam disponíveis para consulta. Regularize a assinatura para voltar a editar.",
+      state,
+    };
   }
 
-  const { data: subscription } = await supabase
-    .from("tenant_subscriptions")
-    .select("status")
-    .is("deleted_at", null)
-    .limit(1)
-    .maybeSingle()
-
-  // No subscription = allow (onboarding/trial)
-  if (!subscription) {
-    return { allowed: true, reason: "ok" }
-  }
-
-  const status = subscription.status as SubscriptionStatus
-
-  const blockedStatuses: SubscriptionStatus[] = [
-    "fully_blocked",
-    "cancelled",
-  ]
-
-  const readOnlyStatuses: SubscriptionStatus[] = ["partially_blocked"]
-
-  if (blockedStatuses.includes(status)) {
-    return {
-      allowed: false,
-      reason: "subscription_blocked",
-      message: STATUS_MESSAGES.subscription_blocked,
-    }
-  }
-
-  if (readOnlyStatuses.includes(status)) {
-    return {
-      allowed: false,
-      reason: "read_only_mode",
-      message: STATUS_MESSAGES.read_only_mode,
-    }
-  }
-
-  return { allowed: true, reason: "ok" }
-}
-
-/**
- * Get subscription status warning banner info.
- * Returns null if no warning is needed.
- */
-export async function getSubscriptionWarning(): Promise<{
-  level: "info" | "warning" | "critical"
-  title: string
-  message: string
-  status: SubscriptionStatus
-} | null> {
-  const supabase = await createClient()
-
-  const { data: subscription } = await supabase
-    .from("tenant_subscriptions")
-    .select("status, trial_ends_at, grace_period_ends_at, block_escalation_at")
-    .is("deleted_at", null)
-    .limit(1)
-    .maybeSingle()
-
-  if (!subscription) return null
-
-  const status = subscription.status as SubscriptionStatus
-
-  switch (status) {
-    case "trialing": {
-      const trialEnd = subscription.trial_ends_at
-        ? new Date(subscription.trial_ends_at)
-        : null
-      const daysLeft = trialEnd
-        ? Math.max(0, Math.ceil((trialEnd.getTime() - Date.now()) / 86400000))
-        : null
-      if (daysLeft !== null && daysLeft <= 3) {
-        return {
-          level: "warning",
-          title: "Período de teste expirando",
-          message: `Seu período de teste expira em ${daysLeft} dia(s). Assine um plano para manter o acesso.`,
-          status,
-        }
-      }
-      return null
-    }
-
-    case "past_due":
-      return {
-        level: "warning",
-        title: "Pagamento pendente",
-        message:
-          "Existe uma fatura vencida. Regularize o pagamento para evitar restrições.",
-        status,
-      }
-
-    case "grace_period": {
-      const graceEnd = subscription.grace_period_ends_at
-        ? new Date(subscription.grace_period_ends_at)
-        : null
-      const daysLeft = graceEnd
-        ? Math.max(0, Math.ceil((graceEnd.getTime() - Date.now()) / 86400000))
-        : null
-      return {
-        level: "warning",
-        title: "Período de carência",
-        message: `Sua conta entrará em modo restrito em ${daysLeft ?? "poucos"} dia(s) se o pagamento não for regularizado.`,
-        status,
-      }
-    }
-
-    case "partially_blocked":
-      return {
-        level: "critical",
-        title: "Funcionalidades restritas",
-        message:
-          "Novas campanhas, avaliações e cadastros estão bloqueados. Regularize o pagamento para restaurar o acesso completo.",
-        status,
-      }
-
-    case "fully_blocked":
-      return {
-        level: "critical",
-        title: "Conta em modo somente leitura",
-        message:
-          "Todas as funcionalidades de escrita estão bloqueadas (exceto canal de denúncias). Regularize o pagamento.",
-        status,
-      }
-
-    default:
-      return null
-  }
+  return null;
 }

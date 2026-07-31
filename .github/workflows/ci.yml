@@ -111,6 +111,90 @@ jobs:
         run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-no-public-execute.sql'
 
       # ────────────────────────────────────────────────────────────────────
+      # SEGURANÇA DO SCHEMA `billing` (Etapa 12A)
+      #
+      # A fundação de planos vive num schema próprio, fora de `public`, para
+      # não perturbar as âncoras do migration-rebuild-verify — e, pelo mesmo
+      # motivo, fora do alcance da asserção acima, que varre só `public`.
+      #
+      # Trocar uma cobertura por nenhuma seria regressão. Este passo é a
+      # cobertura equivalente, e vai além: além de conferir catálogo (RLS,
+      # policies, privilégios, triggers), EXECUTA o comportamento — insere,
+      # tenta alterar, tenta apagar, e exige que o banco recuse. Tudo em
+      # transação encerrada por ROLLBACK, contra a mesma stack descartável.
+      #
+      # "A trigger existe" e "a trigger funciona" são afirmações diferentes.
+      # Só a segunda vale como prova.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Segurança e imutabilidade do schema billing
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-billing-security.sql'
+
+      # ────────────────────────────────────────────────────────────────────
+      # RECONSTRUÇÃO DESCARTÁVEL — o que a rota de produção fará, ensaiado
+      #
+      # Quatro afirmações que só um banco de verdade sustenta:
+      #
+      #   1. as 36 históricas continuam byte-idênticas ao manifesto (md5_norm);
+      #   2. o VERIFICADOR INDEPENDENTE da nova migration aprova o estado
+      #      reconstruído — é o mesmo arquivo que a rota executará em produção,
+      #      então um defeito nele aparece aqui, e não lá;
+      #   3. o ROLLBACK desfaz de verdade, restaurando is_active ao valor real;
+      #   4. a REAPLICAÇÃO devolve o estado, provando idempotência.
+      #
+      # Tudo contra a stack local. Nenhum acesso remoto, nenhuma credencial.
+      # ────────────────────────────────────────────────────────────────────
+      - name: 36/36 hashes das históricas contra o manifesto
+        run: node tests/verify-recovered-migrations.mjs supabase/migrations
+
+      - name: Verificador independente da nova forward-only
+        run: |
+          set -o pipefail
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
+            -f scripts/ci/verify-applied/20260801120000.sql
+
+      - name: Rollback e reaplicação da nova forward-only
+        run: |
+          set -o pipefail
+          P() { "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 "$@"; }
+
+          echo "== estado ANTES do rollback =="
+          P -At -c "SELECT slug, coalesce(is_active::text,'NULO') FROM public.subscription_plans ORDER BY slug;" \
+            | tee /tmp/planos-antes.txt
+          ANTES=$(P -At -c "SELECT count(*) FROM pg_namespace WHERE nspname='billing';")
+          [ "$ANTES" = "1" ] || { echo "FALHA: schema billing ausente antes do rollback"; exit 1; }
+
+          echo "== rollback =="
+          P -f supabase/rollbacks/20260801120000_billing_foundation_rollback.sql
+
+          DEPOIS=$(P -At -c "SELECT count(*) FROM pg_namespace WHERE nspname='billing';")
+          [ "$DEPOIS" = "0" ] || { echo "FALHA: o schema billing sobreviveu ao rollback"; exit 1; }
+
+          echo "== planos APÓS o rollback (devem voltar ao estado original) =="
+          P -At -c "SELECT slug, coalesce(is_active::text,'NULO') FROM public.subscription_plans ORDER BY slug;" \
+            | tee /tmp/planos-rollback.txt
+          # No banco reconstruído os três nasceram ativos (seed de 20260724161707),
+          # então o rollback tem de devolvê-los a `true`. Um `false` remanescente
+          # significaria rollback incompleto.
+          if grep -qv '|true$' /tmp/planos-rollback.txt; then
+            echo "FALHA: plano não voltou a ativo após o rollback"
+            grep -v '|true$' /tmp/planos-rollback.txt
+            exit 1
+          fi
+
+          echo "== reaplicação =="
+          P -f supabase/migrations/20260801120000_billing_foundation.sql
+
+          echo "== verificador independente, de novo =="
+          P -f scripts/ci/verify-applied/20260801120000.sql
+
+          P -At -c "SELECT slug, coalesce(is_active::text,'NULO') FROM public.subscription_plans ORDER BY slug;" \
+            > /tmp/planos-reaplicado.txt
+          diff -u /tmp/planos-antes.txt /tmp/planos-reaplicado.txt \
+            || { echo "FALHA: reaplicar não reproduziu o mesmo estado"; exit 1; }
+          echo "rollback e reaplicação conferem — estado idêntico ao inicial"
+
+
+      # ────────────────────────────────────────────────────────────────────
       # LEITURA DO LEDGER — contra psql de verdade
       #
       # A estreia da rota de aplicação falhou porque o passo de leitura do
