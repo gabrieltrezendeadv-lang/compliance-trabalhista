@@ -80,9 +80,13 @@ limpar
 Q >/dev/null <<SQL
 INSERT INTO auth.users (id, instance_id, aud, role, email)
 VALUES ('$DONO', '00000000-0000-0000-0000-000000000000', 'authenticated',
-        'authenticated', 'dono@corrida.test');
+        'authenticated', 'dono@corrida.test')
+ON CONFLICT (id) DO NOTHING;
+-- `auth.users` tem trigger que já cria o perfil. O INSERT abaixo é para o caso
+-- de a trigger não existir no descartável — por isso ON CONFLICT.
 INSERT INTO public.profiles (id, full_name, email)
-VALUES ('$DONO', 'dono corrida', 'dono@corrida.test');
+VALUES ('$DONO', 'dono corrida', 'dono@corrida.test')
+ON CONFLICT (id) DO NOTHING;
 INSERT INTO public.organizations (id, name, slug)
 VALUES ('$ORG', 'Fixture corrida', 'fixture-corrida');
 INSERT INTO public.organization_members (tenant_id, user_id, role, created_at)
