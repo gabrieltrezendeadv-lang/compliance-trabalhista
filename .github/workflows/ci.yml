@@ -96,7 +96,14 @@ jobs:
           set -o pipefail
           supabase init --force
           supabase start --exclude realtime,storage-api,imgproxy,studio,edge-runtime,logflare,vector,supavisor
-          echo "DB_URL=$(supabase status -o env | grep '^DB_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+          ST=$(supabase status -o env)
+          echo "DB_URL=$(printf '%s' "$ST" | grep '^DB_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+          # API_URL e SERVICE_ROLE_KEY alimentam o contrato contra o PostgREST.
+          # A chave é de uma stack descartável criada neste job e destruída ao
+          # final — não é segredo, e não vem de environment protegido.
+          echo "SUPABASE_API_URL=$(printf '%s' "$ST" | grep '^API_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+          echo "::add-mask::$(printf '%s' "$ST" | grep '^SERVICE_ROLE_KEY=' | cut -d= -f2- | tr -d '\"')"
+          echo "SUPABASE_SERVICE_KEY=$(printf '%s' "$ST" | grep '^SERVICE_ROLE_KEY=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
 
       - name: Guarda — a conexão é loopback
         run: |
@@ -153,6 +160,75 @@ jobs:
       # ────────────────────────────────────────────────────────────────────
       - name: Integração da orquestração de billing (12B)
         run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-billing-orchestration.sql'
+
+      # ────────────────────────────────────────────────────────────────────
+      # A EXCEÇÃO NOMINAL EM `public`, CONFERIDA NO CATÁLOGO
+      #
+      # A 12B abre uma exceção à regra "nenhum objeto de billing em public":
+      # dezesseis RPCs, porque `public` é o único schema exposto ao PostgREST e
+      # sem elas o repositório não alcança o banco.
+      #
+      # Os blocos dessas dezesseis saem da âncora textual do
+      # migration-rebuild-verify (split-public-rpcs.mjs). Esta asserção é a
+      # contrapartida — e é MAIS forte do que o diff que substitui, porque os
+      # dumps são tirados com --no-owner --no-privileges e nunca enxergaram
+      # proprietário nem ACL.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Exceção nominal de billing em public (catálogo)
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-billing-rpcs.sql'
+
+      # ────────────────────────────────────────────────────────────────────
+      # CORRIDA REAL — duas conexões independentes
+      #
+      # Uma sessão psql não disputa nada consigo mesma. Este passo abre duas
+      # conexões, sincroniza-as com advisory lock e exige um único vencedor,
+      # uma única cobrança e recusa de fingerprint divergente.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Concorrência real na idempotência de billing
+        run: bash scripts/ci/assert-billing-concurrency.sh "$DB_URL"
+
+      # ────────────────────────────────────────────────────────────────────
+      # CONTRATO DO REPOSITÓRIO CONTRA O POSTGREST REAL
+      #
+      # O passo que faltava, e cuja ausência deixou passar um repositório que
+      # NUNCA havia executado: ele endereçava `billing` por `Accept-Profile`, o
+      # PostgREST recusava com PGRST106, e nenhum teste percebia porque nenhum
+      # teste o instanciava.
+      #
+      # Aqui as MESMAS expectativas que rodam contra o dublê rodam contra
+      # `SupabaseBillingRepository`, pelo mesmo cliente supabase-js que a
+      # aplicação usa. A rede é liberada apenas em loopback
+      # (`tests/setup/loopback-only.ts`); qualquer outro destino aborta antes
+      # da conexão.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Semear fixtures do contrato
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/seed-contract-fixtures.sql'
+
+      - name: Contrato memória × PostgREST real
+        env:
+          BILLING_CONTRACT_URL: ${{ env.SUPABASE_API_URL }}
+          BILLING_CONTRACT_KEY: ${{ env.SUPABASE_SERVICE_KEY }}
+        run: |
+          set -o pipefail
+          # Guarda redundante e deliberada: o setup do Vitest também bloqueia,
+          # mas falhar aqui é mais barato e mais claro.
+          case "$BILLING_CONTRACT_URL" in
+            http://127.0.0.1:*|http://localhost:*) ;;
+            *) echo "FALHA: contrato só roda contra loopback (recebido: $BILLING_CONTRACT_URL)"; exit 1 ;;
+          esac
+          npx --no-install vitest run --project contract 2>&1 | tee /tmp/contrato.log
+          # A variante real NÃO pode ter sido pulada: um skip silencioso aqui
+          # devolveria exatamente o buraco que este passo existe para fechar.
+          if grep -q "PULADO" /tmp/contrato.log; then
+            echo "FALHA: a variante PostgREST foi pulada — o caminho real não foi exercitado"
+            exit 1
+          fi
+          grep -q "PostgREST real" /tmp/contrato.log || {
+            echo "FALHA: a suíte do PostgREST real não apareceu no relatório"; exit 1; }
+
+      - name: Remover fixtures do contrato e conferir que nada sobrou
+        if: always()
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/teardown-contract-fixtures.sql'
 
       - name: 36/36 hashes das históricas contra o manifesto
         run: node tests/verify-recovered-migrations.mjs supabase/migrations

@@ -39,6 +39,25 @@ export default defineConfig({
       {
         extends: true,
         test: {
+          // ── CONTRATO: memória × PostgREST real ──────────────────────────
+          //
+          // Projeto SEPARADO porque é o único que pode abrir rede — e, ainda
+          // assim, só em loopback. A suíte unitária continua com proibição
+          // total; misturar as duas políticas num projeto só faria a mais
+          // frouxa valer para tudo.
+          //
+          // A variante PostgREST se auto-pula quando `BILLING_CONTRACT_URL`
+          // não está definida, e é o CI que a define, apontando para a stack
+          // descartável.
+          name: "contract",
+          environment: "node",
+          setupFiles: ["./tests/setup/loopback-only.ts"],
+          include: ["tests/contract/**/*.spec.ts"],
+        },
+      },
+      {
+        extends: true,
+        test: {
           name: "component",
           environment: "jsdom",
           setupFiles: ["./tests/setup/jsdom.setup.ts"],

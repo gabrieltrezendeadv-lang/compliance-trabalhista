@@ -1,21 +1,38 @@
 /**
- * CONTRATO DE PERSISTÊNCIA DE BILLING
+ * CONTRATO DE PERSISTÊNCIA DE BILLING — Etapa 12B
  *
- * Uma interface, duas implementações: `SupabaseBillingRepository` (servidor) e
- * `InMemoryBillingRepository` (teste). A suíte de contrato roda contra as
- * DUAS — um comportamento que só a versão em memória tem é um teste que mede o
- * dublê, não o produto.
+ * Uma interface, duas implementações: `SupabaseBillingRepository` (servidor,
+ * por RPC) e `InMemoryBillingRepository` (teste). A suíte de contrato em
+ * `tests/contract/billing-repository.contract.ts` roda as MESMAS expectativas
+ * sobre as duas — a real contra PostgREST local, no CI.
  *
- * ── O QUE O REPOSITÓRIO GARANTE, E O QUE NÃO GARANTE ────────────────────────
+ * ── POR QUE O CONTRATO ESPELHA AS RPCs, UMA A UMA ───────────────────────────
  *
- * GARANTE: isolamento por `organization_id` em toda leitura e escrita,
- * idempotência por chave única, auditoria em toda escrita relevante, e erro
- * TIPADO — nunca uma exceção crua vazando driver.
+ * A versão anterior deste arquivo expunha operações finas — `createCharge`,
+ * `appendAuditEvent`, `updateSubscription` — e os casos de uso as encadeavam.
+ * Cada elo era uma requisição HTTP, logo uma transação: "cobrança + auditoria"
+ * eram duas, e um erro entre elas deixava cobrança sem trilha.
  *
- * NÃO GARANTE: autorização. Quem decide se o chamador pode operar é o caso de
- * uso, com o contexto resolvido no servidor. O repositório recebe uma
- * organização já autorizada e não tem como saber se a autorização aconteceu —
- * é por isso que `assertTenant` fica na camada de cima, e não aqui.
+ * Agora cada método é UMA RPC, e cada RPC é UMA transação. O contrato não
+ * oferece mais nenhuma peça com a qual se possa montar uma escrita parcial.
+ *
+ * ── O QUE O CONTRATO GARANTE, E O QUE NÃO GARANTE ───────────────────────────
+ *
+ * GARANTE: atomicidade de cada chamada, erro TIPADO (nunca exceção crua
+ * vazando driver), e recusa INDISTINGUÍVEL entre tenant alheio e inexistente.
+ *
+ * NÃO GARANTE: atomicidade entre o banco e o provider externo. Isso não existe,
+ * e nenhum comentário deste repositório vai fingir que existe. A garantia real
+ * está descrita em `docs/decisions/ARQUITETURA-BILLING-12B.md` §5: efeitos
+ * idempotentes, estado recuperável, e processamento efetivamente único sob a
+ * chave declarada.
+ *
+ * ── O ATOR NÃO VEM DO CLIENTE ───────────────────────────────────────────────
+ *
+ * `actorId` e `organizationId` são resolvidos NO SERVIDOR, a partir da sessão,
+ * antes de qualquer chamada aqui. O repositório os repassa à RPC, que os
+ * revalida contra `public.organization_members` dentro da mesma transação do
+ * efeito. Nem o repositório nem a RPC confiam no que o cliente mandou.
  */
 
 import type {
@@ -43,41 +60,24 @@ export interface Charge {
   readonly organizationId: string;
   readonly subscriptionId: string;
   readonly provider: string;
+  readonly providerAccountId: string;
+  readonly externalCustomerId: string;
   readonly externalChargeId: string;
   readonly method: ChargeMethod;
   readonly amountCents: number;
+  readonly currency: string;
+  readonly billingPeriod: BillingPeriod;
   readonly status: ChargeStatus;
-  /** Período que esta cobrança quita — é o que impede pagamento antigo de
-   *  reativar período posterior. */
+  /** Período que esta cobrança quita — impede pagamento antigo de reativar
+   *  período posterior. */
   readonly periodStart: string;
   readonly periodEnd: string;
   readonly createdAt: string;
   readonly paidAt: string | null;
   readonly failedAt: string | null;
+  readonly cancelledAt: string | null;
   /** Chave do comando que criou a cobrança. Nulo quando a origem é automática. */
   readonly idempotencyKey: string | null;
-}
-
-export interface CreateChargeInput {
-  readonly organizationId: string;
-  readonly subscriptionId: string;
-  readonly provider: string;
-  readonly externalChargeId: string;
-  readonly method: ChargeMethod;
-  readonly amountCents: number;
-  readonly periodStart: string;
-  readonly periodEnd: string;
-  readonly createdAt: string;
-  readonly idempotencyKey: string | null;
-}
-
-// ─── Cliente no provider ───────────────────────────────────────────────────
-
-export interface BillingCustomer {
-  readonly organizationId: string;
-  readonly provider: string;
-  readonly externalCustomerId: string;
-  readonly createdAt: string;
 }
 
 // ─── Idempotência ──────────────────────────────────────────────────────────
@@ -88,15 +88,56 @@ export interface BillingCustomer {
  */
 export type IdempotencyScope = "provider_event" | "command";
 
-export interface IdempotencyRecord {
-  readonly organizationId: string;
-  readonly scope: IdempotencyScope;
-  readonly provider: string;
-  readonly key: string;
-  /** Resultado gravado na primeira execução, devolvido nas repetições. */
-  readonly result: Readonly<Record<string, unknown>>;
-  readonly createdAt: string;
-}
+/**
+ * Resultado de uma reserva.
+ *
+ * União DISCRIMINADA, e não booleano: `created: boolean` não tinha como
+ * expressar "a chave existe, está em andamento e o pedido é outro" — que é
+ * justamente o caso em que devolver o resultado anterior faz o segundo pedido
+ * sumir sem aviso.
+ */
+export type ClaimOutcome =
+  /** A reserva é minha; siga para o provider. */
+  | { readonly kind: "claimed" }
+  /** Outra execução está em curso sob a mesma chave e o mesmo pedido. */
+  | { readonly kind: "in_progress" }
+  /** Já concluída: devolva ISTO, sem repetir o efeito. */
+  | { readonly kind: "completed"; readonly result: Readonly<Record<string, unknown>> }
+  /** Mesma chave, OUTRO pedido. Nunca devolve o resultado do primeiro. */
+  | { readonly kind: "fingerprint_conflict" };
+
+export type SettleOutcome =
+  | { readonly kind: "failed" }
+  | { readonly kind: "completed"; readonly result: Readonly<Record<string, unknown>> }
+  | { readonly kind: "in_progress" }
+  | { readonly kind: "fingerprint_conflict" };
+
+export type FinalizeOutcome =
+  | {
+      readonly kind: "completed";
+      readonly result: Readonly<Record<string, unknown>>;
+      readonly charge: Charge;
+    }
+  | { readonly kind: "fingerprint_conflict" };
+
+// ─── Evento do provider ────────────────────────────────────────────────────
+
+/**
+ * Resultado de um evento externo.
+ *
+ * `applied` traz a organização RESOLVIDA pelo banco a partir do identificador
+ * externo. Ela não é entrada: aceitar a organização do corpo do webhook
+ * deixaria quem manda o evento escolher a quem ele se aplica.
+ */
+export type ProviderEventOutcome =
+  | {
+      readonly kind: "applied";
+      readonly organizationId: string;
+      readonly charge: Charge;
+      readonly subscription: StoredSubscription;
+    }
+  | { readonly kind: "duplicate" }
+  | { readonly kind: "out_of_order"; readonly reason: string };
 
 // ─── Auditoria ─────────────────────────────────────────────────────────────
 
@@ -111,11 +152,12 @@ export type AuditSubject =
   | "payment"
   | "charge";
 
-export interface AuditEventInput {
+export interface AuditEvent {
+  readonly id: string;
   readonly organizationId: string;
   readonly subscriptionId: string | null;
   readonly subject: AuditSubject;
-  /** Nulo apenas quando a origem não é humana (webhook, rotina). */
+  /** Nulo quando a origem não é humana (webhook, rotina). */
   readonly actorId: string | null;
   readonly origin: BillingActionOrigin;
   readonly occurredAt: string;
@@ -123,12 +165,7 @@ export interface AuditEventInput {
   readonly newValue: Record<string, unknown> | null;
   readonly reason: string | null;
   readonly idempotencyKey: string | null;
-  /** Liga eventos da mesma operação — checkout, cobrança e transição. */
   readonly correlationId: string | null;
-}
-
-export interface AuditEvent extends AuditEventInput {
-  readonly id: string;
 }
 
 // ─── Catálogo ──────────────────────────────────────────────────────────────
@@ -143,129 +180,16 @@ export interface CatalogPrice {
 
 // ─── Assinatura ────────────────────────────────────────────────────────────
 
-export interface CreateSubscriptionInput {
-  readonly organizationId: string;
-  readonly plan: PlanSlug;
-  readonly tier: TierSlug;
-  readonly period: BillingPeriod;
-  readonly state: SubscriptionState;
-  readonly workerCount: number;
-  readonly cnpj: string;
-  readonly currentPeriodStart: string;
-  readonly currentPeriodEnd: string;
-  readonly trialEndsAt: string | null;
-}
-
-/** Campos que a assinatura aceita mudar. Preço nunca está aqui. */
-export interface UpdateSubscriptionInput {
-  readonly plan?: PlanSlug;
-  readonly tier?: TierSlug;
-  readonly state?: SubscriptionState;
-  readonly workerCount?: number;
-  readonly currentPeriodStart?: string;
-  readonly currentPeriodEnd?: string;
-  readonly trialEndsAt?: string | null;
-  readonly paymentFailedAt?: string | null;
-  readonly scheduledDowngrade?: { plan: PlanSlug; tier: TierSlug } | null;
-}
-
 /**
  * Assinatura como o banco a guarda.
  *
  * Acrescenta à `Subscription` da 12A o que só existe na persistência: a
- * identidade (`id`) e o `cnpj`. O modelo puro da 12A recebe o CNPJ como
- * ENTRADA de `startTrial` e não o carrega adiante — os cálculos não dependem
- * dele. A coluna, porém, é `NOT NULL`, e é aqui que essa diferença é
- * declarada, em vez de alterar o modelo puro só para agradar ao banco.
+ * identidade (`id`) e o `cnpj`.
  */
 export interface StoredSubscription extends Subscription {
   readonly id: string;
   readonly cnpj: string;
 }
-
-// ─── O contrato ────────────────────────────────────────────────────────────
-
-export interface BillingRepository {
-  // Catálogo — leitura apenas.
-  listCatalogPrices(catalogVersion: string): Promise<Result<readonly CatalogPrice[]>>;
-
-  // Assinatura.
-  findSubscription(organizationId: string): Promise<Result<StoredSubscription | null>>;
-  createSubscription(input: CreateSubscriptionInput): Promise<Result<StoredSubscription>>;
-  updateSubscription(
-    organizationId: string,
-    patch: UpdateSubscriptionInput
-  ): Promise<Result<StoredSubscription>>;
-
-  // Snapshot de preço — insere; nunca atualiza.
-  appendPriceSnapshot(
-    organizationId: string,
-    subscriptionId: string,
-    snapshot: PriceSnapshot
-  ): Promise<Result<PriceSnapshot>>;
-  listPriceSnapshots(organizationId: string): Promise<Result<readonly PriceSnapshot[]>>;
-
-  // Cliente no provider.
-  findCustomer(organizationId: string, provider: string): Promise<Result<BillingCustomer | null>>;
-  saveCustomer(customer: BillingCustomer): Promise<Result<BillingCustomer>>;
-
-  // Cobranças.
-  createCharge(input: CreateChargeInput): Promise<Result<Charge>>;
-  findChargeByExternalId(
-    organizationId: string,
-    provider: string,
-    externalChargeId: string
-  ): Promise<Result<Charge | null>>;
-  /**
-   * Busca pela chave do COMANDO.
-   *
-   * É o que permite que um checkout repetido devolva a cobrança original em
-   * vez de erro — idempotência de verdade, e não apenas "não duplicou".
-   */
-  findChargeByIdempotencyKey(
-    organizationId: string,
-    idempotencyKey: string
-  ): Promise<Result<Charge | null>>;
-  listCharges(organizationId: string): Promise<Result<readonly Charge[]>>;
-  markChargePaid(organizationId: string, chargeId: string, paidAt: string): Promise<Result<Charge>>;
-  markChargeFailed(
-    organizationId: string,
-    chargeId: string,
-    failedAt: string
-  ): Promise<Result<Charge>>;
-
-  // Grandfathering e cortesia.
-  findGrandfatheringCutoff(): Promise<Result<string | null>>;
-  findGrandfathering(organizationId: string): Promise<Result<Grandfathering | null>>;
-  saveGrandfathering(record: Grandfathering): Promise<Result<Grandfathering>>;
-  listCourtesies(organizationId: string): Promise<Result<readonly StoredCourtesy[]>>;
-  /**
-   * A identidade é atribuída pela PERSISTÊNCIA, não pelo chamador.
-   *
-   * `billing.courtesies.id` é `uuid DEFAULT gen_random_uuid()`. Deixar o caso
-   * de uso inventar o identificador exigiria que ele gerasse um uuid válido —
-   * e gerar uuid no domínio é justamente o que a 12B proíbe, porque tornaria o
-   * resultado não determinístico.
-   */
-  saveCourtesy(courtesy: NewCourtesy): Promise<Result<StoredCourtesy>>;
-  revokeCourtesy(input: CourtesyRevocation): Promise<Result<CourtesyRevocation>>;
-
-  // Idempotência.
-  //
-  // `reserve` é a operação ATÔMICA que sustenta a concorrência: devolve
-  // `created` quando a chave é nova e `existing` quando já havia — nunca as
-  // duas coisas, nunca duas vezes `created` para a mesma chave.
-  reserveIdempotency(
-    record: IdempotencyRecord
-  ): Promise<Result<{ created: boolean; record: IdempotencyRecord }>>;
-
-  // Auditoria.
-  appendAuditEvent(event: AuditEventInput): Promise<Result<AuditEvent>>;
-  listAuditEvents(organizationId: string): Promise<Result<readonly AuditEvent[]>>;
-}
-
-/** Cortesia ainda sem identidade — é a persistência que a atribui. */
-export type NewCourtesy = Courtesy;
 
 /** Cortesia com identidade e estado de revogação. */
 export interface StoredCourtesy extends Courtesy {
@@ -273,10 +197,172 @@ export interface StoredCourtesy extends Courtesy {
   readonly revokedAt: string | null;
 }
 
-export interface CourtesyRevocation {
-  readonly courtesyId: string;
+export type RevokeCourtesyOutcome =
+  | { readonly kind: "revoked"; readonly courtesyId: string; readonly revokedAt: string }
+  | { readonly kind: "already_revoked" };
+
+export type GrandfatheringOutcome =
+  | { readonly kind: "granted"; readonly record: Grandfathering }
+  | { readonly kind: "already_granted" };
+
+/** Tudo o que uma organização precisa para decidir acesso, numa leitura só. */
+export interface BillingState {
+  readonly subscription: StoredSubscription | null;
+  readonly courtesies: readonly StoredCourtesy[];
+  readonly grandfathering: Grandfathering | null;
+  readonly grandfatheringCutoff: string | null;
+}
+
+export interface BillingLedger {
+  readonly charges: readonly Charge[];
+  readonly snapshots: readonly PriceSnapshot[];
+  readonly auditEvents: readonly AuditEvent[];
+}
+
+// ─── Entradas ──────────────────────────────────────────────────────────────
+
+/** O que TODA operação carrega: quem, por qual organização, sob qual correlação. */
+export interface ComandoContexto {
+  readonly actorId: string;
   readonly organizationId: string;
-  readonly revokedAt: string;
-  readonly revokedBy: string;
-  readonly reason: string;
+  readonly correlationId: string;
+}
+
+export interface StartTrialInput extends ComandoContexto {
+  readonly plan: PlanSlug;
+  readonly tier: TierSlug;
+  readonly period: BillingPeriod;
+  readonly workerCount: number;
+  readonly cnpj: string;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+  readonly trialEndsAt: string;
+  readonly amountCents: number | null;
+  readonly catalogVersion: string | null;
+}
+
+export interface ChangePlanInput extends ComandoContexto {
+  readonly plan: PlanSlug | null;
+  readonly tier: TierSlug | null;
+  readonly period: BillingPeriod | null;
+  readonly state: SubscriptionState | null;
+  readonly periodStart: string | null;
+  readonly periodEnd: string | null;
+  readonly amountCents: number | null;
+  readonly catalogVersion: string | null;
+  readonly subject: Extract<AuditSubject, "plan_change" | "tier_change" | "subscription_state">;
+  readonly reason: string | null;
+  readonly idempotencyKey: string | null;
+  readonly now: string;
+}
+
+export interface ClaimInput extends ComandoContexto {
+  readonly scope: IdempotencyScope;
+  readonly provider: string;
+  readonly key: string;
+  /** Hash canônico do pedido. NUNCA o pedido em si. */
+  readonly fingerprint: string;
+  readonly now: string;
+}
+
+export interface FinalizeCheckoutInput extends ComandoContexto {
+  readonly provider: string;
+  readonly providerAccountId: string;
+  readonly externalCustomerId: string;
+  readonly externalChargeId: string;
+  readonly method: ChargeMethod;
+  readonly amountCents: number;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+  readonly idempotencyKey: string;
+  readonly fingerprint: string;
+  readonly now: string;
+}
+
+/**
+ * Entrada do evento externo.
+ *
+ * NÃO tem `organizationId` nem `actorId`, e a ausência é o ponto: o webhook não
+ * tem sessão, e a organização é resolvida pelo banco a partir do identificador
+ * externo. Um campo de organização aqui seria um convite a confiar nele.
+ */
+export interface ProviderEventInput {
+  readonly provider: string;
+  readonly providerAccountId: string;
+  readonly externalEventId: string;
+  readonly externalChargeId: string;
+  readonly eventType: "charge_paid" | "charge_failed";
+  readonly occurredAt: string;
+  readonly correlationId: string;
+  readonly now: string;
+}
+
+// ─── O contrato ────────────────────────────────────────────────────────────
+
+export interface BillingRepository {
+  // Leitura.
+  readState(actorId: string, organizationId: string): Promise<Result<BillingState>>;
+  readCatalog(
+    actorId: string,
+    organizationId: string,
+    catalogVersion: string
+  ): Promise<Result<readonly CatalogPrice[]>>;
+  readLedger(actorId: string, organizationId: string): Promise<Result<BillingLedger>>;
+
+  // Ciclo de vida — cada um é uma transação.
+  startTrial(input: StartTrialInput): Promise<Result<StoredSubscription>>;
+  changePlan(input: ChangePlanInput): Promise<Result<StoredSubscription>>;
+  scheduleDowngrade(
+    ctx: ComandoContexto,
+    plan: PlanSlug,
+    tier: TierSlug,
+    reason: string | null,
+    now: string
+  ): Promise<Result<StoredSubscription>>;
+  cancelAtPeriodEnd(
+    ctx: ComandoContexto,
+    reason: string | null,
+    now: string
+  ): Promise<Result<StoredSubscription>>;
+  transitionState(
+    ctx: ComandoContexto,
+    state: SubscriptionState,
+    origin: Extract<BillingActionOrigin, "owner" | "scheduler">,
+    reason: string | null,
+    now: string
+  ): Promise<Result<StoredSubscription>>;
+  recordWorkerCount(
+    ctx: ComandoContexto,
+    workerCount: number,
+    now: string
+  ): Promise<Result<StoredSubscription>>;
+
+  // Máquina de estados da idempotência.
+  claimIdempotency(input: ClaimInput): Promise<Result<ClaimOutcome>>;
+  failIdempotency(
+    input: ClaimInput,
+    errorCode: string
+  ): Promise<Result<SettleOutcome>>;
+  finalizeCheckout(input: FinalizeCheckoutInput): Promise<Result<FinalizeOutcome>>;
+  applyProviderEvent(input: ProviderEventInput): Promise<Result<ProviderEventOutcome>>;
+
+  // Acesso.
+  grantCourtesy(
+    ctx: ComandoContexto,
+    plan: PlanSlug,
+    startsAt: string,
+    endsAt: string,
+    reason: string
+  ): Promise<Result<StoredCourtesy>>;
+  revokeCourtesy(
+    ctx: ComandoContexto,
+    courtesyId: string,
+    revokedAt: string,
+    reason: string
+  ): Promise<Result<RevokeCourtesyOutcome>>;
+  saveGrandfathering(
+    ctx: ComandoContexto,
+    cutoffAt: string,
+    grantedAt: string
+  ): Promise<Result<GrandfatheringOutcome>>;
 }

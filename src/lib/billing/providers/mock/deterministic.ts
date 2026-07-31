@@ -87,6 +87,13 @@ export class BillingProviderMock implements BillingProviderPort {
   readonly #ids: IdGenerator;
   readonly #roteiro: MockScenario[];
   readonly #cobrancas = new Map<string, EstadoCobranca>();
+  readonly #clientes = new Map<string, string>();
+  readonly #chamadas: ProviderChargeInput[] = [];
+  /** `chave → recurso externo`, com o fingerprint que o produziu. */
+  readonly #porChave = new Map<
+    string,
+    { fingerprint: string; externalChargeId: string; amountCents: number; pixPayload: string | null }
+  >();
 
   constructor(options: MockProviderOptions) {
     const env = options.env ?? {
@@ -107,16 +114,61 @@ export class BillingProviderMock implements BillingProviderPort {
     this.#roteiro = [...(options.scenarios ?? [])];
   }
 
+  /**
+   * Cliente por ORGANIZAÇÃO, não por chamada.
+   *
+   * Numa retomada, criar um segundo cliente abandonaria o primeiro no provider
+   * — e o identificador gravado no banco deixaria de corresponder ao que existe
+   * do outro lado.
+   */
   async createCustomer(input: ProviderCustomerInput): Promise<Result<ProviderCustomer>> {
     if (input.cnpj.trim() === "") {
       return fail("invalid_input", "CNPJ é obrigatório para criar cliente");
     }
-    return ok({ externalCustomerId: this.#ids.next("cus") });
+    const existente = this.#clientes.get(input.organizationId);
+    if (existente !== undefined) return ok({ externalCustomerId: existente });
+
+    const novo = this.#ids.next("cus");
+    this.#clientes.set(input.organizationId, novo);
+    return ok({ externalCustomerId: novo });
+  }
+
+  /** Toda tentativa de cobrança, na ordem. É o que os testes contam. */
+  get chamadasDeCobranca(): readonly ProviderChargeInput[] {
+    return this.#chamadas;
+  }
+
+  /** Quantas vezes esta chave foi apresentada ao provider. */
+  contagemPorChave(idempotencyKey: string): number {
+    return this.#chamadas.filter((c) => c.idempotencyKey === idempotencyKey).length;
   }
 
   async createCharge(input: ProviderChargeInput): Promise<Result<ProviderCharge>> {
+    // Registra ANTES de qualquer validação: o teste precisa contar inclusive as
+    // tentativas recusadas.
+    this.#chamadas.push(input);
+
     if (!Number.isInteger(input.amountCents) || input.amountCents <= 0) {
       return fail("invalid_input", "valor da cobrança precisa ser centavo inteiro positivo");
+    }
+
+    // ── IDEMPOTÊNCIA DO LADO DO PROVIDER ──────────────────────────────────
+    //
+    // `chave + fingerprint → recurso externo`. É esta relação que faz uma
+    // retomada devolver a MESMA cobrança em vez de criar a segunda — inclusive
+    // quando a primeira tentativa foi `unavailable_after_persist`, em que o
+    // recurso existe e o chamador não soube.
+    const anterior = this.#porChave.get(input.idempotencyKey);
+    if (anterior !== undefined) {
+      if (anterior.fingerprint !== input.fingerprint) {
+        return fail("conflict", "chave de idempotência reusada com outro pedido");
+      }
+      return ok({
+        externalChargeId: anterior.externalChargeId,
+        status: "pending",
+        amountCents: anterior.amountCents,
+        pixPayload: anterior.pixPayload,
+      });
     }
 
     const cenario = this.#roteiro.shift() ?? "approve";
@@ -137,6 +189,16 @@ export class BillingProviderMock implements BillingProviderPort {
       amountCents: input.amountCents,
       pixPayload: pix,
       cenario,
+    });
+
+    // Registrado ANTES do desfecho: em `unavailable_after_persist` o recurso
+    // externo EXISTE, e é exatamente por isso que a retomada com a mesma chave
+    // precisa encontrá-lo aqui em vez de criar outro.
+    this.#porChave.set(input.idempotencyKey, {
+      fingerprint: input.fingerprint,
+      externalChargeId,
+      amountCents: input.amountCents,
+      pixPayload: pix,
     });
 
     if (cenario === "unavailable_after_persist") {

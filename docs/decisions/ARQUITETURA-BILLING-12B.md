@@ -71,6 +71,46 @@ O identificador do cliente **nunca autoriza** — só é comparado.
 O ator da auditoria vem do **contexto**, nunca do argumento: aceitá-lo por
 parâmetro permitiria atribuir a ação a outra pessoa.
 
+## 4.1 O caminho real até o banco
+
+**`billing` NÃO é exposto ao PostgREST, e continua não sendo.**
+
+A primeira versão desta etapa alcançava o schema com
+`.schema("billing").from(...)`, e **nunca funcionou**: `.schema()` do
+supabase-js não abre conexão SQL — define o cabeçalho HTTP `Accept-Profile`,
+e o PostgREST recusa qualquer schema fora de `db-schemas` com **PGRST106**.
+Nenhum teste percebeu porque nenhum teste instanciava a classe.
+
+O acesso passou a ser exclusivamente por **dezesseis RPCs em `public`**, que é
+o único schema exposto. Elas rodam como owner e alcançam `billing` por dentro;
+o `service_role` perdeu todo privilégio direto, **inclusive `USAGE` no
+schema**. A allowlist é um tipo fechado no repositório (`NomeDeRpc`), o que
+torna erro de compilação chamar qualquer outra coisa.
+
+## 4.2 Atomicidade — o que é e o que não é
+
+**Cada RPC é uma transação.** Assinatura + snapshot + auditoria entram juntas
+ou não entram.
+
+**Não existe atomicidade entre o PostgreSQL e o provider**, e nenhuma parte
+deste documento afirma que exista. A garantia real é outra, e é suficiente:
+
+* efeitos **idempotentes** sob a chave declarada;
+* estado **recuperável** — nenhuma falha deixa a operação presa;
+* processamento **efetivamente único** sob aquela chave: no máximo uma cobrança
+  lógica no provider, e no máximo uma cobrança, um snapshot e uma transição no
+  banco.
+
+O fluxo é `claim → provider → finalize | fail`, com o provider **fora** de
+qualquer transação aberta.
+
+**Erro ambíguo do provider não marca `failed`.** `provider_unavailable` e
+`provider_timeout` não dizem se o recurso externo foi criado — uma conexão que
+cai depois do commit do provider é indistinguível de uma que cai antes. Marcar
+`failed` afirmaria "nada aconteceu", e a retomada imediata criaria a segunda
+cobrança. Nesses casos a reserva fica `in_progress` e quem governa a retomada é
+a **lease**. `failed` fica reservado às recusas determinísticas.
+
 ## 5. Idempotência
 
 `billing.idempotency_records`, com `UNIQUE (organization_id, scope, provider, key)`.
@@ -139,7 +179,8 @@ estrutura persistida.
 
 | Camada | Onde | O que prova |
 | --- | --- | --- |
-| Unitária/integração | `tests/unit/billing/usecases/` | ciclo de vida, bordas temporais, faixas, preços, pró-rata, autorização, IDOR, isolamento A×B, idempotência, ordem, falhas, mock proibido em produção |
+| Unitária | `tests/unit/billing/usecases/` | ciclo de vida, bordas temporais, faixas, preços, pró-rata, autorização, IDOR, idempotência, ordem, falhas, mock proibido em produção. `resilience.spec.ts` **mede** as chamadas ao provider por cenário |
+| Contrato | `tests/contract/shared-expectations.ts` | as MESMAS expectativas executadas contra o dublê **e** contra `SupabaseBillingRepository` pelo PostgREST local. É o arquivo que fecha o buraco de um repositório nunca exercitado |
 | Estática | `tests/billing-orchestration-guard.mjs` (22) | determinismo, ausência de rede, fronteira do `service_role`, alcance público, integridade da migration |
 | Mutação | `tests/billing-orchestration-mutation-guard.mjs` (35) | que as guardas acima reprovam quando a propriedade é removida |
 | PostgreSQL real | `scripts/ci/assert-billing-orchestration.sql` | **o que o dublê não reproduz**: UNIQUE resolvendo concorrência, transação desfazendo escrita parcial, RLS/grants efetivos, trigger de imutabilidade sobre linha real |

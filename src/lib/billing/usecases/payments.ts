@@ -1,36 +1,57 @@
 /**
- * CASOS DE USO DE PAGAMENTO — checkout simulado, confirmação, falha e
- * tolerância.
+ * CHECKOUT E PAGAMENTO — máquina de estados recuperável
  *
- * Nenhuma chamada de rede: o provider é o mock determinístico. Nenhum dado de
- * cartão entra aqui, nem sai para a auditoria.
+ * ── A GARANTIA, DITA COM PRECISÃO ───────────────────────────────────────────
  *
- * ── AS DUAS REGRAS QUE GOVERNAM TODO O ARQUIVO ──────────────────────────────
+ * NÃO existe atomicidade entre o PostgreSQL e o provider. São dois sistemas,
+ * cada um com o seu commit, e nenhuma linha deste arquivo vai fingir o
+ * contrário. "Exatamente-uma-vez" entre sistemas distribuídos não é uma
+ * garantia disponível.
  *
- * 1. IDEMPOTÊNCIA. Todo efeito passa por uma chave reservada no banco. Evento
- *    repetido devolve o resultado anterior sem repetir a cobrança, o snapshot
- *    ou a transição.
+ * O que ESTÁ garantido, e é o que basta:
  *
- * 2. ORDEM. Todo evento carrega o instante do provider. Evento anterior ao
- *    período vigente é RECUSADO — um pagamento atrasado de um ciclo antigo não
- *    pode reativar o ciclo atual.
+ *   * cada RPC é atômica INDIVIDUALMENTE;
+ *   * os efeitos são idempotentes sob a chave declarada;
+ *   * o estado é recuperável — nenhuma falha deixa a operação presa;
+ *   * o processamento é EFETIVAMENTE ÚNICO sob aquela chave: no máximo uma
+ *     cobrança lógica no provider, e no máximo uma cobrança, um snapshot e uma
+ *     transição no banco.
+ *
+ * ── AS TRÊS FASES ───────────────────────────────────────────────────────────
+ *
+ *   CLAIM     RPC atômica reserva a chave e devolve o desfecho.
+ *   PROVIDER  chamado FORA de qualquer transação, com a MESMA chave.
+ *   FINALIZE  RPC atômica grava cobrança, auditoria e conclusão — ou FAIL
+ *             registra a falha sem declarar efeito.
+ *
+ * ── QUANDO O PROVIDER NÃO PODE SER CHAMADO ──────────────────────────────────
+ *
+ * Autorização negada, fingerprint conflitante, operação já concluída, ou lease
+ * de outro processamento ainda válida. Nos quatro casos a função retorna antes,
+ * e o teste `resilience` prova contando as chamadas do mock.
+ *
+ * ── PROVIDER CONCLUIU E O FINALIZE FALHOU ───────────────────────────────────
+ *
+ * A reserva PERMANECE `in_progress`: marcar `failed` seria mentira, porque o
+ * recurso externo existe. Vencida a lease, a repetição chama o provider com a
+ * mesma chave, recebe o MESMO recurso externo — o mock guarda
+ * `provider + chave + fingerprint → resultado` — e refaz o finalize. Nenhuma
+ * segunda cobrança é criada.
  */
 
 import { fail, ok, type Result } from "../core/errors";
-import type { ProviderEvent } from "../core/provider";
 import type { Charge, ChargeMethod, StoredSubscription } from "../core/repository";
-import { resolveState, toleranceEndsAt } from "../plans/lifecycle";
 import { priceCents } from "../plans/pricing";
-import { assertTenant, auditar, exigirAssinatura, reservar, type UseCaseEnv } from "./shared";
-import type { ComandoBase } from "./subscription";
+import {
+  assertTenant,
+  contexto,
+  exigirAssinatura,
+  fingerprintDe,
+  type ComandoBase,
+  type UseCaseEnv,
+} from "./shared";
 
-function ms(iso: string): number {
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) throw new Error(`instante inválido: ${iso}`);
-  return t;
-}
-
-// ─── 9. createMockCheckout ─────────────────────────────────────────────────
+// ─── Checkout ──────────────────────────────────────────────────────────────
 
 export interface CheckoutInput extends ComandoBase {
   readonly method: ChargeMethod;
@@ -42,21 +63,15 @@ export interface CheckoutInput extends ComandoBase {
 export interface CheckoutResult {
   readonly charge: Charge;
   readonly pixPayload: string | null;
+  /** `true` quando a cobrança já existia e foi apenas devolvida. */
+  readonly replay: boolean;
 }
 
-/**
- * Cria a cobrança do período vigente no provider MOCK e a registra.
- *
- * A ordem importa e é deliberada: reservar a chave, garantir o cliente, criar
- * no provider, registrar no banco. Se o provider criar e falhar ao responder
- * (cenário `unavailable_after_persist`), a chave já está reservada — e a
- * repetição com a MESMA chave devolve o resultado anterior em vez de criar uma
- * segunda cobrança.
- */
-export async function createMockCheckout(
+export async function createCheckout(
   env: UseCaseEnv,
   input: CheckoutInput
 ): Promise<Result<CheckoutResult>> {
+  // 1. AUTORIZAÇÃO — antes de qualquer efeito, e antes do provider.
   const negado = assertTenant<CheckoutResult>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
@@ -73,291 +88,207 @@ export async function createMockCheckout(
     return fail("invalid_state", "faixa Enterprise não tem checkout automático");
   }
 
-  const reserva = await reservar(env, {
-    scope: "command",
-    key: input.idempotencyKey,
-    result: { intent: "checkout", amountCents: valor },
+  // 2. FINGERPRINT — fixado ANTES do claim, a partir do pedido inteiro. Mudar
+  //    qualquer campo muda o fingerprint, e a mesma chave passa a conflitar.
+  const fingerprint = fingerprintDe({
+    intent: "checkout",
+    plan: sub.plan,
+    tier: sub.tier,
+    period: sub.period,
+    amountCents: valor,
+    method: input.method,
+    periodStart: sub.currentPeriodStart,
+    periodEnd: sub.currentPeriodEnd,
   });
-  if (!reserva.ok) return reserva;
 
-  if (!reserva.value.novo) {
-    // Idempotência de verdade: a repetição devolve a MESMA cobrança, achada
-    // pela chave do comando. Só quando não há cobrança gravada — o provider
-    // criou e falhou ao responder, por exemplo — é que se recusa.
-    const existente = await env.repo.findChargeByIdempotencyKey(
-      env.auth.organizationId,
-      input.idempotencyKey
-    );
-    if (!existente.ok) return existente;
-    if (existente.value) {
-      return ok({ charge: existente.value, pixPayload: null });
+  const agora = env.clock.now();
+  const reserva = {
+    ...contexto(env),
+    scope: "command" as const,
+    provider: env.provider.name,
+    key: input.idempotencyKey,
+    fingerprint,
+    now: agora,
+  };
+
+  // 3. CLAIM.
+  const claim = await env.repo.claimIdempotency(reserva);
+  if (!claim.ok) return claim;
+
+  switch (claim.value.kind) {
+    case "fingerprint_conflict":
+      // Mesma chave, outro pedido. O provider NÃO é chamado.
+      return fail("conflict", "esta chave já foi usada para um pedido diferente");
+
+    case "in_progress":
+      // Outro processamento válido tem a lease. O provider NÃO é chamado.
+      return fail("conflict", "operação em andamento para esta chave");
+
+    case "completed": {
+      // Replay: devolve a cobrança já criada, sem tocar no provider.
+      const idAnterior = claim.value.result.chargeId;
+      if (typeof idAnterior !== "string") {
+        return fail("conflict", "reserva concluída sem cobrança correspondente");
+      }
+      const anterior = await buscarCobranca(env, idAnterior);
+      if (!anterior.ok) return anterior;
+      return ok({ charge: anterior.value, pixPayload: null, replay: true });
     }
-    return fail("duplicate_event", "checkout já iniciado com esta chave, sem cobrança gravada");
+
+    case "claimed":
+      break;
   }
 
-  // Cliente no provider — idempotente por (organização, provider).
-  const jaCliente = await env.repo.findCustomer(env.auth.organizationId, env.provider.name);
-  if (!jaCliente.ok) return jaCliente;
-
-  let externalCustomerId = jaCliente.value?.externalCustomerId ?? null;
-  if (externalCustomerId === null) {
-    const criado = await env.provider.createCustomer({
-      organizationId: env.auth.organizationId,
-      cnpj: sub.cnpj,
-      name: input.customerName,
-      email: input.customerEmail,
-    });
-    if (!criado.ok) return criado;
-    externalCustomerId = criado.value.externalCustomerId;
-
-    const salvo = await env.repo.saveCustomer({
-      organizationId: env.auth.organizationId,
-      provider: env.provider.name,
-      externalCustomerId,
-      createdAt: env.clock.now(),
-    });
-    if (!salvo.ok) return salvo;
-    externalCustomerId = salvo.value.externalCustomerId;
+  // 4. PROVIDER — fora de transação, com a MESMA chave de idempotência. Numa
+  //    retomada, o provider devolve o mesmo recurso externo em vez de criar
+  //    outro; é essa propriedade que impede a segunda cobrança.
+  const cliente = await env.provider.createCustomer({
+    organizationId: env.auth.organizationId,
+    cnpj: sub.cnpj,
+    name: input.customerName,
+    email: input.customerEmail,
+  });
+  if (!cliente.ok) {
+    await talvezMarcarFalha(env, reserva, cliente.error.code);
+    return cliente;
   }
 
   const cobranca = await env.provider.createCharge({
-    externalCustomerId,
+    externalCustomerId: cliente.value.externalCustomerId,
     amountCents: valor,
     method: input.method,
     description: `Neo SST — ${sub.plan} ${sub.period}`,
     dueAt: sub.currentPeriodEnd,
+    // A MESMA chave e o MESMO fingerprint que foram ao banco. É esta
+    // igualdade que faz a retomada recuperar o recurso externo já criado.
     idempotencyKey: input.idempotencyKey,
+    fingerprint,
   });
-  if (!cobranca.ok) return cobranca;
+  if (!cobranca.ok) {
+    await talvezMarcarFalha(env, reserva, cobranca.error.code);
+    return cobranca;
+  }
 
-  const registrada = await env.repo.createCharge({
-    organizationId: env.auth.organizationId,
-    subscriptionId: sub.id,
+  // 5. FINALIZE — cobrança, auditoria e conclusão da chave, em UMA transação.
+  const finalizado = await env.repo.finalizeCheckout({
+    ...contexto(env),
     provider: env.provider.name,
+    providerAccountId: env.providerAccountId,
+    externalCustomerId: cliente.value.externalCustomerId,
     externalChargeId: cobranca.value.externalChargeId,
     method: input.method,
     amountCents: valor,
     periodStart: sub.currentPeriodStart,
     periodEnd: sub.currentPeriodEnd,
-    createdAt: env.clock.now(),
     idempotencyKey: input.idempotencyKey,
+    fingerprint,
+    now: agora,
   });
-  if (!registrada.ok) return registrada;
 
-  const trilha = await auditar(env, {
-    subject: "charge",
-    subscriptionId: sub.id,
-    previousValue: null,
-    newValue: {
-      externalChargeId: registrada.value.externalChargeId,
-      amountCents: valor,
-      method: input.method,
-      periodStart: sub.currentPeriodStart,
-      periodEnd: sub.currentPeriodEnd,
-    },
-    idempotencyKey: input.idempotencyKey,
+  if (!finalizado.ok) {
+    // DELIBERADAMENTE não marcamos `failed`: o recurso externo EXISTE. Dizer
+    // que falhou permitiria uma retomada criar uma segunda cobrança no
+    // provider. A reserva fica `in_progress` e a lease governa a retomada.
+    return finalizado;
+  }
+
+  if (finalizado.value.kind === "fingerprint_conflict") {
+    return fail("conflict", "esta chave já foi usada para um pedido diferente");
+  }
+
+  return ok({
+    charge: finalizado.value.charge,
+    pixPayload: cobranca.value.pixPayload,
+    replay: false,
   });
-  if (!trilha.ok) return trilha;
-
-  return ok({ charge: registrada.value, pixPayload: cobranca.value.pixPayload });
-}
-
-// ─── Guarda de evento: idempotência + ordem ────────────────────────────────
-
-interface EventoAceito {
-  readonly charge: Charge;
-  readonly sub: StoredSubscription;
 }
 
 /**
- * Aceita um evento do provider, ou explica por que não.
+ * Códigos em que a falha do provider é AMBÍGUA.
  *
- * Três recusas, nesta ordem:
- *   * chave já processada → `duplicate_event`;
- *   * cobrança desconhecida para esta organização → `not_found`;
- *   * evento anterior ao início do período vigente → `out_of_order_event`.
+ * ── A DISTINÇÃO QUE O CHAMADOR NÃO TEM ──────────────────────────────────────
  *
- * A terceira é a que impede um pagamento atrasado de reativar um período
- * posterior: o evento pertence ao ciclo em que a cobrança foi emitida, e não ao
- * ciclo em que ele chegou.
+ * "Indisponível" e "não respondeu a tempo" NÃO dizem se o recurso externo foi
+ * criado. Uma conexão que cai depois do commit do provider é indistinguível de
+ * uma que cai antes — do lado de cá chega o mesmo erro.
+ *
+ * Marcar `failed` nesses casos afirmaria "nada aconteceu", e uma retomada
+ * imediata criaria a SEGUNDA cobrança. Por isso a reserva fica `in_progress` e
+ * quem governa a retomada é a lease: passado o prazo, a retomada chama o
+ * provider com a mesma chave e recupera o que houver.
+ *
+ * `failed` fica reservado às recusas DETERMINÍSTICAS — entrada inválida,
+ * conflito, configuração proibida — em que o provider rejeitou sem criar nada.
  */
-async function aceitarEvento(
+const AMBIGUOS: ReadonlySet<string> = new Set(["provider_unavailable", "provider_timeout"]);
+
+async function talvezMarcarFalha(
   env: UseCaseEnv,
-  evento: ProviderEvent,
-  resultado: Record<string, unknown>
-): Promise<Result<EventoAceito | null>> {
-  const assinatura = await exigirAssinatura(env);
-  if (!assinatura.ok) return assinatura;
-
-  const reserva = await reservar(env, {
-    scope: "provider_event",
-    key: evento.eventId,
-    result: resultado,
-  });
-  if (!reserva.ok) return reserva;
-  if (!reserva.value.novo) return ok(null);
-
-  const cobranca = await env.repo.findChargeByExternalId(
-    env.auth.organizationId,
-    env.provider.name,
-    evento.externalChargeId
-  );
-  if (!cobranca.ok) return cobranca;
-  if (!cobranca.value) {
-    return fail("not_found", "cobrança desconhecida para esta organização");
-  }
-
-  if (ms(evento.occurredAt) < ms(cobranca.value.periodStart)) {
-    return fail("out_of_order_event", "evento anterior ao período da cobrança", {
-      eventoEm: evento.occurredAt,
-      periodoInicio: cobranca.value.periodStart,
-    });
-  }
-
-  if (ms(cobranca.value.periodEnd) <= ms(assinatura.value.currentPeriodStart)) {
-    return fail("out_of_order_event", "cobrança de período já encerrado", {
-      cobrancaFim: cobranca.value.periodEnd,
-      periodoAtualInicio: assinatura.value.currentPeriodStart,
-    });
-  }
-
-  return ok({ charge: cobranca.value, sub: assinatura.value });
+  reserva: Parameters<UseCaseEnv["repo"]["failIdempotency"]>[0],
+  code: string
+): Promise<void> {
+  if (AMBIGUOS.has(code)) return;
+  await env.repo.failIdempotency(reserva, code);
 }
 
-// ─── 10. recordPaymentSucceeded ────────────────────────────────────────────
-
-export async function recordPaymentSucceeded(
-  env: UseCaseEnv,
-  evento: ProviderEvent
-): Promise<Result<StoredSubscription>> {
-  const aceito = await aceitarEvento(env, evento, { tipo: "charge_paid" });
-  if (!aceito.ok) return aceito;
-
-  // Duplicata: nada é repetido, e o estado atual é devolvido.
-  if (aceito.value === null) {
-    const atual = await exigirAssinatura(env);
-    return atual;
+async function buscarCobranca(env: UseCaseEnv, chargeId: string): Promise<Result<Charge>> {
+  const ledger = await env.repo.readLedger(env.auth.userId, env.auth.organizationId);
+  if (!ledger.ok) return ledger;
+  const achada = ledger.value.charges.find((c) => c.id === chargeId);
+  if (achada === undefined) {
+    return fail("not_found", "cobrança referida pela reserva não existe");
   }
-
-  const { charge, sub } = aceito.value;
-
-  const paga = await env.repo.markChargePaid(
-    env.auth.organizationId,
-    charge.id,
-    evento.occurredAt
-  );
-  if (!paga.ok) return paga;
-
-  const atualizada = await env.repo.updateSubscription(env.auth.organizationId, {
-    state: "active",
-    paymentFailedAt: null,
-  });
-  if (!atualizada.ok) return atualizada;
-
-  const trilha = await auditar(env, {
-    subject: "payment",
-    subscriptionId: sub.id,
-    previousValue: { state: sub.state, chargeStatus: charge.status },
-    newValue: {
-      state: "active",
-      chargeStatus: "paid",
-      externalChargeId: charge.externalChargeId,
-      amountCents: charge.amountCents,
-    },
-    idempotencyKey: evento.eventId,
-  });
-  if (!trilha.ok) return trilha;
-
-  return ok(atualizada.value);
+  return ok(achada);
 }
 
-// ─── 11. recordPaymentFailed ───────────────────────────────────────────────
+// ─── Evento do provider ────────────────────────────────────────────────────
+
+export interface WebhookInput {
+  readonly externalEventId: string;
+  readonly externalChargeId: string;
+  readonly eventType: "charge_paid" | "charge_failed";
+  readonly occurredAt: string;
+}
+
+export type WebhookResult =
+  | { readonly kind: "applied"; readonly subscription: StoredSubscription; readonly charge: Charge }
+  | { readonly kind: "duplicate" }
+  | { readonly kind: "out_of_order"; readonly reason: string };
 
 /**
- * Falha de pagamento abre a janela de tolerância: 7 dias com ACESSO NORMAL.
- * Não é acesso degradado — é o que o modelo aprovado determina.
- */
-export async function recordPaymentFailed(
-  env: UseCaseEnv,
-  evento: ProviderEvent
-): Promise<Result<StoredSubscription>> {
-  const aceito = await aceitarEvento(env, evento, { tipo: "charge_failed" });
-  if (!aceito.ok) return aceito;
-
-  if (aceito.value === null) {
-    const atual = await exigirAssinatura(env);
-    return atual;
-  }
-
-  const { charge, sub } = aceito.value;
-
-  const falhou = await env.repo.markChargeFailed(
-    env.auth.organizationId,
-    charge.id,
-    evento.occurredAt
-  );
-  if (!falhou.ok) return falhou;
-
-  const atualizada = await env.repo.updateSubscription(env.auth.organizationId, {
-    state: "past_due_tolerance",
-    paymentFailedAt: evento.occurredAt,
-  });
-  if (!atualizada.ok) return atualizada;
-
-  const trilha = await auditar(env, {
-    subject: "payment",
-    subscriptionId: sub.id,
-    previousValue: { state: sub.state },
-    newValue: {
-      state: "past_due_tolerance",
-      toleranciaAte: toleranceEndsAt(evento.occurredAt),
-      externalChargeId: charge.externalChargeId,
-    },
-    idempotencyKey: evento.eventId,
-  });
-  if (!trilha.ok) return trilha;
-
-  return ok(atualizada.value);
-}
-
-// ─── 12. advanceGracePeriod ────────────────────────────────────────────────
-
-/**
- * Encerra a tolerância vencida: a conta vai para MODO LEITURA.
+ * Aplica um evento do provider.
  *
- * Recusa se a tolerância ainda corre — a transição é derivada da data, não da
- * vontade de quem chama.
+ * NÃO recebe organização nem ator, e a ausência é o desenho: o webhook não tem
+ * sessão, e o tenant é RESOLVIDO pelo banco a partir do identificador externo,
+ * que é único globalmente. Aceitar a organização do corpo do evento deixaria
+ * quem manda o evento escolher a quem ele se aplica.
  */
-export async function advanceGracePeriod(
+export async function applyProviderEvent(
   env: UseCaseEnv,
-  input: ComandoBase = {}
-): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
-  if (negado) return negado;
-
-  const atual = await exigirAssinatura(env);
-  if (!atual.ok) return atual;
-
-  if (atual.value.paymentFailedAt === null) {
-    return fail("invalid_state", "não há falha de pagamento em curso");
-  }
-  if (resolveState(atual.value, env.clock.now()) !== "read_only") {
-    return fail("invalid_state", "a tolerância de 7 dias ainda não venceu");
-  }
-
-  const atualizada = await env.repo.updateSubscription(env.auth.organizationId, {
-    state: "read_only",
+  input: WebhookInput
+): Promise<Result<WebhookResult>> {
+  const aplicado = await env.repo.applyProviderEvent({
+    provider: env.provider.name,
+    providerAccountId: env.providerAccountId,
+    externalEventId: input.externalEventId,
+    externalChargeId: input.externalChargeId,
+    eventType: input.eventType,
+    occurredAt: input.occurredAt,
+    correlationId: env.correlationId,
+    now: env.clock.now(),
   });
-  if (!atualizada.ok) return atualizada;
+  if (!aplicado.ok) return aplicado;
 
-  const trilha = await auditar(env, {
-    subject: "subscription_state",
-    subscriptionId: atual.value.id,
-    previousValue: { state: atual.value.state, paymentFailedAt: atual.value.paymentFailedAt },
-    newValue: { state: "read_only" },
-    reason: "tolerância de 7 dias encerrada sem regularização",
-  });
-  if (!trilha.ok) return trilha;
-
-  return ok(atualizada.value);
+  switch (aplicado.value.kind) {
+    case "duplicate":
+      return ok({ kind: "duplicate" });
+    case "out_of_order":
+      return ok({ kind: "out_of_order", reason: aplicado.value.reason });
+    case "applied":
+      return ok({
+        kind: "applied",
+        subscription: aplicado.value.subscription,
+        charge: aplicado.value.charge,
+      });
+  }
 }

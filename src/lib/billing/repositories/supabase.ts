@@ -1,28 +1,39 @@
 /**
  * REPOSITÓRIO DE BILLING SOBRE SUPABASE — exclusivo do servidor
  *
- * ── POR QUE `server-only` ESTÁ NA PRIMEIRA LINHA ────────────────────────────
+ * ── POR QUE ESTE ARQUIVO FOI REESCRITO POR INTEIRO ──────────────────────────
  *
- * Este módulo alcança o schema `billing` com `service_role`. Importá-lo de um
- * componente cliente colocaria a chave no bundle do browser. Com `server-only`,
- * a tentativa é ERRO DE BUILD — não um risco a documentar.
+ * A versão anterior alcançava o schema com `.schema("billing").from(...)` e
+ * NUNCA funcionou. `.schema()` do supabase-js não abre conexão SQL: define o
+ * cabeçalho HTTP `Accept-Profile` para o PostgREST, que recusa qualquer schema
+ * fora de `db-schemas` com PGRST106. Como `billing` nunca esteve exposto — e
+ * continua não estando, por decisão — toda chamada falhava. Nenhum teste
+ * percebeu porque nenhum teste instanciava a classe.
  *
- * ── O QUE ELE NÃO FAZ ───────────────────────────────────────────────────────
+ * Agora o acesso é EXCLUSIVAMENTE por `rpc()`, contra as dezesseis funções de
+ * `public`, que é o único schema exposto ao PostgREST. Elas rodam como owner e
+ * alcançam `billing` por dentro; o `service_role` não tem nem `USAGE` no
+ * schema.
  *
- *   * não guarda credencial: a chave é lida por `createServiceClient()`, que já
- *     é `server-only` e falha alto se a variável não existir;
- *   * não registra URL, token, chave nem `connection string` em log algum —
- *     mensagens de erro do driver NÃO são propagadas, só o NOME do erro;
- *   * não autoriza: recebe uma organização já autorizada pelo caso de uso.
+ * ── `server-only` NA PRIMEIRA LINHA ─────────────────────────────────────────
  *
- * ── ISOLAMENTO ENTRE TENANTS ────────────────────────────────────────────────
+ * Este módulo usa a chave `service_role`. Importá-lo de um componente cliente
+ * colocaria a chave no bundle do browser. Com `server-only`, a tentativa é ERRO
+ * DE BUILD — não um risco a documentar.
  *
- * TODA consulta filtra `organization_id`, inclusive as que buscam por chave
- * primária. Uma cobrança encontrada por `id` mas de outra organização é
- * tratada como inexistente. RLS não substitui isso: `service_role` tem
- * BYPASSRLS, então o filtro no cliente é a barreira efetiva — e é por isso que
- * `scripts/ci/assert-billing-orchestration.sql` prova o isolamento com dois
- * tenants contra PostgreSQL de verdade.
+ * ── A ALLOWLIST É UM TIPO, NÃO UM COMENTÁRIO ────────────────────────────────
+ *
+ * `NomeDeRpc` é a união fechada dos dezesseis nomes. Chamar qualquer outra
+ * coisa não compila. É mais forte do que uma guarda textual: não há como
+ * escrever o nome errado, nem montá-lo dinamicamente.
+ *
+ * ── FAIL-CLOSED ────────────────────────────────────────────────────────────
+ *
+ * Erro do PostgREST, resposta ausente, `null` inesperado ou formato diferente
+ * do previsto viram `Result` de FALHA. Nenhum caminho deste arquivo converte
+ * falha em autorização, e a mensagem do driver NUNCA é propagada — só o
+ * `code`, porque mensagens de driver carregam host, usuário e às vezes a URL de
+ * conexão inteira.
  */
 
 import "server-only";
@@ -32,46 +43,106 @@ import { fail, fromThrown, ok, type Result } from "../core/errors";
 import type { BillingActionOrigin } from "../core/ports";
 import type {
   AuditEvent,
-  AuditEventInput,
-  BillingCustomer,
+  BillingLedger,
   BillingRepository,
+  BillingState,
   CatalogPrice,
+  ChangePlanInput,
   Charge,
-  CourtesyRevocation,
-  CreateChargeInput,
-  CreateSubscriptionInput,
-  IdempotencyRecord,
-  NewCourtesy,
+  ClaimInput,
+  ClaimOutcome,
+  ComandoContexto,
+  FinalizeCheckoutInput,
+  FinalizeOutcome,
+  GrandfatheringOutcome,
+  ProviderEventInput,
+  ProviderEventOutcome,
+  RevokeCourtesyOutcome,
+  SettleOutcome,
+  StartTrialInput,
   StoredCourtesy,
   StoredSubscription,
-  UpdateSubscriptionInput,
 } from "../core/repository";
-import type { Grandfathering, PriceSnapshot } from "../plans/model";
+import type {
+  Grandfathering,
+  PlanSlug,
+  PriceSnapshot,
+  SubscriptionState,
+  TierSlug,
+} from "../plans/model";
 
-/** Schema dedicado. Não é `public`, e é isso que mantém o cliente fora. */
-const SCHEMA = "billing";
+/**
+ * As dezesseis, e nada mais.
+ *
+ * Mantida em sincronia com `scripts/ci/billing-rpc-allowlist.mjs` por
+ * `BO-23` — que reprova se as duas divergirem.
+ */
+type NomeDeRpc =
+  | "fn_billing_read_state"
+  | "fn_billing_read_catalog"
+  | "fn_billing_read_ledger"
+  | "fn_billing_start_trial"
+  | "fn_billing_change_plan"
+  | "fn_billing_schedule_downgrade"
+  | "fn_billing_cancel_at_period_end"
+  | "fn_billing_transition_state"
+  | "fn_billing_record_worker_count"
+  | "fn_billing_claim_idempotency"
+  | "fn_billing_fail_idempotency"
+  | "fn_billing_finalize_checkout"
+  | "fn_billing_apply_provider_event"
+  | "fn_billing_grant_courtesy"
+  | "fn_billing_revoke_courtesy"
+  | "fn_billing_save_grandfathering";
 
 type Cliente = ReturnType<typeof createServiceClient>;
 
-/** Código do PostgreSQL para violação de unicidade. */
-const UNIQUE_VIOLATION = "23505";
+type Json = Record<string, unknown>;
 
-interface ErroSupabase {
-  message?: string;
-  code?: string;
+/** Erro do PostgREST, no formato mínimo que consumimos. */
+interface ErroPostgrest {
+  code?: string | null;
+  message?: string | null;
 }
 
 /**
- * Converte erro do driver em erro tipado.
+ * Códigos que a RPC pode levantar e que têm significado de domínio.
  *
- * A mensagem original NUNCA é propagada: mensagens de driver carregam host,
- * usuário e, em alguns casos, a URL de conexão inteira. Só o `code` sobrevive,
- * e ele não identifica ninguém.
+ * `42501` é a recusa de autorização — e ela é a MESMA para tenant alheio e
+ * inexistente, de propósito. `P0002` é `no_data_found`. `22023`/`23514` são
+ * entrada inválida. Qualquer outro é indisponibilidade.
  */
-function erroDeLeitura<T>(erro: ErroSupabase, contexto: string): Result<T> {
-  return fail("repository_unavailable", `${contexto}: leitura indisponível`, {
-    code: erro.code ?? null,
-  });
+function erroDeRpc<T>(erro: ErroPostgrest, contexto: string): Result<T> {
+  const code = erro.code ?? null;
+
+  if (code === "42501") {
+    return fail("not_owner", "somente o proprietário administra a assinatura");
+  }
+  if (code === "P0002") {
+    return fail("not_found", `${contexto}: registro inexistente`);
+  }
+  if (code === "22023" || code === "23514" || code === "22P02") {
+    return fail("invalid_input", `${contexto}: entrada rejeitada pelo banco`, { code });
+  }
+  if (code === "23505") {
+    return fail("conflict", `${contexto}: conflito de unicidade`, { code });
+  }
+  // Inclusive PGRST202 ("função não encontrada") e PGRST106 ("schema não
+  // exposto"): os dois significam que o caminho está quebrado, e caminho
+  // quebrado NEGA.
+  return fail("repository_unavailable", `${contexto}: indisponível`, { code });
+}
+
+function ehObjeto(v: unknown): v is Json {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function texto(v: unknown): string | null {
+  return typeof v === "string" ? v : null;
+}
+
+function inteiro(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
 export class SupabaseBillingRepository implements BillingRepository {
@@ -81,716 +152,670 @@ export class SupabaseBillingRepository implements BillingRepository {
     this.#db = cliente ?? createServiceClient();
   }
 
-  #from(tabela: string) {
-    // `.schema()` é o que mantém tudo fora de `public`.
-    return this.#db.schema(SCHEMA).from(tabela);
-  }
-
-  // ── Catálogo ─────────────────────────────────────────────────────────────
-
-  async listCatalogPrices(catalogVersion: string): Promise<Result<readonly CatalogPrice[]>> {
-    try {
-      const { data, error } = await this.#from("price_catalog")
-        .select("catalog_version, plan, tier, monthly_cents, yearly_cents")
-        .eq("catalog_version", catalogVersion)
-        .order("plan", { ascending: true })
-        .order("tier", { ascending: true });
-
-      if (error) return erroDeLeitura(error, "catálogo de preços");
-      return ok(
-        (data ?? []).map((l) => ({
-          catalogVersion: l.catalog_version as string,
-          plan: l.plan as CatalogPrice["plan"],
-          tier: l.tier as CatalogPrice["tier"],
-          monthlyCents: l.monthly_cents as number | null,
-          yearlyCents: l.yearly_cents as number | null,
-        }))
-      );
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "catálogo de preços");
-    }
-  }
-
-  // ── Assinatura ───────────────────────────────────────────────────────────
-
-  async findSubscription(organizationId: string): Promise<Result<StoredSubscription | null>> {
-    try {
-      const { data, error } = await this.#from("subscriptions")
-        .select("*")
-        .eq("organization_id", organizationId)
-        .maybeSingle();
-
-      if (error) return erroDeLeitura(error, "assinatura");
-      if (!data) return ok(null);
-
-      const snapshot = await this.#ultimoSnapshot(data.id as string);
-      if (!snapshot.ok) return snapshot;
-
-      return ok(paraAssinatura(data, snapshot.value));
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "assinatura");
-    }
-  }
-
   /**
-   * Último snapshot da assinatura.
+   * Único ponto de contato com o PostgREST no arquivo inteiro.
    *
-   * O filtro é por `subscription_id`, e não por organização: `price_snapshots`
-   * não tem coluna de organização — a 12A a amarrou à assinatura, que por sua
-   * vez é única por organização. O isolamento se mantém porque o
-   * `subscriptionId` usado aqui SEMPRE vem de uma assinatura já buscada por
-   * `organization_id`.
+   * `nome` é do tipo fechado `NomeDeRpc`: não há como chamar função fora da
+   * allowlist, e não há como montar o nome dinamicamente.
    */
-  async #ultimoSnapshot(subscriptionId: string): Promise<Result<PriceSnapshot | null>> {
-    const { data, error } = await this.#from("price_snapshots")
-      .select("plan, tier, period, amount_cents, catalog_version, captured_at")
-      .eq("subscription_id", subscriptionId)
-      .order("captured_at", { ascending: false })
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (error) return erroDeLeitura(error, "snapshot de preço");
-    if (!data) return ok(null);
-    return ok(paraSnapshot(data));
-  }
-
-  /** Resolve a assinatura da organização, para amarrar leituras por id. */
-  async #idDaAssinatura(organizationId: string): Promise<Result<string | null>> {
-    const { data, error } = await this.#from("subscriptions")
-      .select("id")
-      .eq("organization_id", organizationId)
-      .maybeSingle();
-    if (error) return erroDeLeitura(error, "assinatura");
-    return ok((data?.id as string | undefined) ?? null);
-  }
-
-  async createSubscription(input: CreateSubscriptionInput): Promise<Result<StoredSubscription>> {
+  async #chamar<T>(
+    nome: NomeDeRpc,
+    args: Json,
+    mapear: (bruto: unknown) => T | null,
+    contexto: string
+  ): Promise<Result<T>> {
     try {
-      const { data, error } = await this.#from("subscriptions")
-        .insert({
-          organization_id: input.organizationId,
-          plan: input.plan,
-          tier: input.tier,
-          period: input.period,
-          state: input.state,
-          worker_count: input.workerCount,
-          cnpj: input.cnpj,
-          current_period_start: input.currentPeriodStart,
-          current_period_end: input.currentPeriodEnd,
-          trial_ends_at: input.trialEndsAt,
-        })
-        .select("*")
-        .single();
+      const { data, error } = await this.#db.rpc(nome, args);
 
-      if (error) {
-        // Uma assinatura por organização — o UNIQUE do banco é quem decide.
-        if (error.code === UNIQUE_VIOLATION) {
-          return fail("conflict", "já existe assinatura para esta organização");
-        }
-        return erroDeLeitura(error, "criação de assinatura");
+      if (error) return erroDeRpc(error as ErroPostgrest, contexto);
+
+      // `data` ausente não é "vazio": é resposta que não entendemos.
+      if (data === null || data === undefined) {
+        return fail("repository_unavailable", `${contexto}: resposta vazia`);
       }
-      return ok(paraAssinatura(data, null));
+
+      const valor = mapear(data);
+      if (valor === null) {
+        // Formato inesperado. Adivinhar aqui seria transformar um defeito
+        // silencioso em comportamento.
+        return fail("repository_unavailable", `${contexto}: resposta em formato inesperado`);
+      }
+      return ok(valor);
     } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "criação de assinatura");
+      return fromThrown(causa, "repository_unavailable", contexto);
     }
   }
 
-  async updateSubscription(
+  // ── Leitura ──────────────────────────────────────────────────────────────
+
+  async readState(actorId: string, organizationId: string): Promise<Result<BillingState>> {
+    return this.#chamar(
+      "fn_billing_read_state",
+      { p_actor_id: actorId, p_organization_id: organizationId },
+      (bruto) => {
+        if (!ehObjeto(bruto)) return null;
+        const cortesias = Array.isArray(bruto.courtesies) ? bruto.courtesies : [];
+        const assinatura = ehObjeto(bruto.subscription)
+          ? paraAssinatura(bruto.subscription)
+          : null;
+        return {
+          subscription: assinatura,
+          courtesies: cortesias.map(paraCortesia).filter((c): c is StoredCourtesy => c !== null),
+          grandfathering: ehObjeto(bruto.grandfathering)
+            ? paraGrandfathering(bruto.grandfathering)
+            : null,
+          grandfatheringCutoff: texto(bruto.grandfatheringCutoff),
+        } satisfies BillingState;
+      },
+      "estado de billing"
+    );
+  }
+
+  async readCatalog(
+    actorId: string,
     organizationId: string,
-    patch: UpdateSubscriptionInput
+    catalogVersion: string
+  ): Promise<Result<readonly CatalogPrice[]>> {
+    return this.#chamar(
+      "fn_billing_read_catalog",
+      {
+        p_actor_id: actorId,
+        p_organization_id: organizationId,
+        p_catalog_version: catalogVersion,
+      },
+      (bruto) => {
+        if (!Array.isArray(bruto)) return null;
+        const linhas = bruto.map(paraPrecoDeCatalogo);
+        return linhas.some((l) => l === null)
+          ? null
+          : (linhas as CatalogPrice[]);
+      },
+      "catálogo de preços"
+    );
+  }
+
+  async readLedger(actorId: string, organizationId: string): Promise<Result<BillingLedger>> {
+    return this.#chamar(
+      "fn_billing_read_ledger",
+      { p_actor_id: actorId, p_organization_id: organizationId },
+      (bruto) => {
+        if (!ehObjeto(bruto)) return null;
+        if (
+          !Array.isArray(bruto.charges) ||
+          !Array.isArray(bruto.snapshots) ||
+          !Array.isArray(bruto.auditEvents)
+        ) {
+          return null;
+        }
+        return {
+          charges: bruto.charges
+            .map(paraCobranca)
+            .filter((c): c is Charge => c !== null),
+          snapshots: bruto.snapshots
+            .map(paraSnapshot)
+            .filter((s): s is PriceSnapshot => s !== null),
+          auditEvents: bruto.auditEvents
+            .map(paraAuditoria)
+            .filter((a): a is AuditEvent => a !== null),
+        } satisfies BillingLedger;
+      },
+      "trilha de billing"
+    );
+  }
+
+  // ── Ciclo de vida ────────────────────────────────────────────────────────
+
+  async startTrial(input: StartTrialInput): Promise<Result<StoredSubscription>> {
+    return this.#chamar(
+      "fn_billing_start_trial",
+      {
+        p_actor_id: input.actorId,
+        p_organization_id: input.organizationId,
+        p_plan: input.plan,
+        p_tier: input.tier,
+        p_period: input.period,
+        p_worker_count: input.workerCount,
+        p_cnpj: input.cnpj,
+        p_period_start: input.periodStart,
+        p_period_end: input.periodEnd,
+        p_trial_ends_at: input.trialEndsAt,
+        p_amount_cents: input.amountCents,
+        p_catalog_version: input.catalogVersion,
+        p_correlation_id: input.correlationId,
+      },
+      (b) => (ehObjeto(b) ? paraAssinatura(b) : null),
+      "início de trial"
+    );
+  }
+
+  async changePlan(input: ChangePlanInput): Promise<Result<StoredSubscription>> {
+    return this.#chamar(
+      "fn_billing_change_plan",
+      {
+        p_actor_id: input.actorId,
+        p_organization_id: input.organizationId,
+        p_plan: input.plan,
+        p_tier: input.tier,
+        p_period: input.period,
+        p_state: input.state,
+        p_period_start: input.periodStart,
+        p_period_end: input.periodEnd,
+        p_amount_cents: input.amountCents,
+        p_catalog_version: input.catalogVersion,
+        p_subject: input.subject,
+        p_reason: input.reason,
+        p_idempotency_key: input.idempotencyKey,
+        p_correlation_id: input.correlationId,
+        p_now: input.now,
+      },
+      (b) => (ehObjeto(b) ? paraAssinatura(b) : null),
+      "troca de plano"
+    );
+  }
+
+  async scheduleDowngrade(
+    ctx: ComandoContexto,
+    plan: PlanSlug,
+    tier: TierSlug,
+    reason: string | null,
+    now: string
   ): Promise<Result<StoredSubscription>> {
-    try {
-      const payload: Record<string, unknown> = {};
-      if (patch.plan !== undefined) payload.plan = patch.plan;
-      if (patch.tier !== undefined) payload.tier = patch.tier;
-      if (patch.state !== undefined) payload.state = patch.state;
-      if (patch.workerCount !== undefined) payload.worker_count = patch.workerCount;
-      if (patch.currentPeriodStart !== undefined) {
-        payload.current_period_start = patch.currentPeriodStart;
-      }
-      if (patch.currentPeriodEnd !== undefined) {
-        payload.current_period_end = patch.currentPeriodEnd;
-      }
-      if (patch.trialEndsAt !== undefined) payload.trial_ends_at = patch.trialEndsAt;
-      if (patch.paymentFailedAt !== undefined) {
-        payload.payment_failed_at = patch.paymentFailedAt;
-      }
-      if (patch.scheduledDowngrade !== undefined) {
-        payload.scheduled_downgrade_plan = patch.scheduledDowngrade?.plan ?? null;
-        payload.scheduled_downgrade_tier = patch.scheduledDowngrade?.tier ?? null;
-      }
-
-      const { data, error } = await this.#from("subscriptions")
-        .update(payload)
-        // O filtro de organização vai junto com o UPDATE: sem ele, um id
-        // trocado alcançaria a assinatura de outro tenant.
-        .eq("organization_id", organizationId)
-        .select("*")
-        .maybeSingle();
-
-      if (error) return erroDeLeitura(error, "atualização de assinatura");
-      if (!data) return fail("not_found", "assinatura inexistente para esta organização");
-
-      const snapshot = await this.#ultimoSnapshot(data.id as string);
-      if (!snapshot.ok) return snapshot;
-      return ok(paraAssinatura(data, snapshot.value));
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "atualização de assinatura");
-    }
+    return this.#chamar(
+      "fn_billing_schedule_downgrade",
+      {
+        p_actor_id: ctx.actorId,
+        p_organization_id: ctx.organizationId,
+        p_plan: plan,
+        p_tier: tier,
+        p_reason: reason,
+        p_correlation_id: ctx.correlationId,
+        p_now: now,
+      },
+      (b) => (ehObjeto(b) ? paraAssinatura(b) : null),
+      "agendamento de downgrade"
+    );
   }
 
-  // ── Snapshot ─────────────────────────────────────────────────────────────
-
-  async appendPriceSnapshot(
-    organizationId: string,
-    subscriptionId: string,
-    snapshot: PriceSnapshot
-  ): Promise<Result<PriceSnapshot>> {
-    try {
-      // A assinatura precisa ser DESTA organização — sem isto, um
-      // `subscriptionId` alheio gravaria snapshot no tenant errado.
-      const meu = await this.#idDaAssinatura(organizationId);
-      if (!meu.ok) return meu;
-      if (meu.value !== subscriptionId) {
-        return fail("not_found", "assinatura inexistente para esta organização");
-      }
-
-      const { data, error } = await this.#from("price_snapshots")
-        .insert({
-          subscription_id: subscriptionId,
-          plan: snapshot.plan,
-          tier: snapshot.tier,
-          period: snapshot.period,
-          amount_cents: snapshot.amountCents,
-          catalog_version: snapshot.catalogVersion,
-          captured_at: snapshot.capturedAt,
-        })
-        .select("plan, tier, period, amount_cents, catalog_version, captured_at")
-        .single();
-
-      if (error) return erroDeLeitura(error, "snapshot de preço");
-      return ok(paraSnapshot(data));
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "snapshot de preço");
-    }
+  async cancelAtPeriodEnd(
+    ctx: ComandoContexto,
+    reason: string | null,
+    now: string
+  ): Promise<Result<StoredSubscription>> {
+    return this.#chamar(
+      "fn_billing_cancel_at_period_end",
+      {
+        p_actor_id: ctx.actorId,
+        p_organization_id: ctx.organizationId,
+        p_reason: reason,
+        p_correlation_id: ctx.correlationId,
+        p_now: now,
+      },
+      (b) => (ehObjeto(b) ? paraAssinatura(b) : null),
+      "cancelamento"
+    );
   }
 
-  async listPriceSnapshots(organizationId: string): Promise<Result<readonly PriceSnapshot[]>> {
-    try {
-      const meu = await this.#idDaAssinatura(organizationId);
-      if (!meu.ok) return meu;
-      if (meu.value === null) return ok([]);
-
-      const { data, error } = await this.#from("price_snapshots")
-        .select("plan, tier, period, amount_cents, catalog_version, captured_at")
-        .eq("subscription_id", meu.value)
-        .order("captured_at", { ascending: true });
-
-      if (error) return erroDeLeitura(error, "histórico de preços");
-      return ok((data ?? []).map(paraSnapshot));
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "histórico de preços");
-    }
+  async transitionState(
+    ctx: ComandoContexto,
+    state: SubscriptionState,
+    origin: Extract<BillingActionOrigin, "owner" | "scheduler">,
+    reason: string | null,
+    now: string
+  ): Promise<Result<StoredSubscription>> {
+    return this.#chamar(
+      "fn_billing_transition_state",
+      {
+        p_actor_id: ctx.actorId,
+        p_organization_id: ctx.organizationId,
+        p_state: state,
+        p_origin: origin,
+        p_reason: reason,
+        p_correlation_id: ctx.correlationId,
+        p_now: now,
+      },
+      (b) => (ehObjeto(b) ? paraAssinatura(b) : null),
+      "transição de estado"
+    );
   }
 
-  // ── Cliente ──────────────────────────────────────────────────────────────
-
-  async findCustomer(
-    organizationId: string,
-    provider: string
-  ): Promise<Result<BillingCustomer | null>> {
-    try {
-      const { data, error } = await this.#from("customers")
-        .select("organization_id, provider, external_customer_id, created_at")
-        .eq("organization_id", organizationId)
-        .eq("provider", provider)
-        .maybeSingle();
-
-      if (error) return erroDeLeitura(error, "cliente do provider");
-      if (!data) return ok(null);
-      return ok({
-        organizationId: data.organization_id as string,
-        provider: data.provider as string,
-        externalCustomerId: data.external_customer_id as string,
-        createdAt: data.created_at as string,
-      });
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "cliente do provider");
-    }
-  }
-
-  async saveCustomer(customer: BillingCustomer): Promise<Result<BillingCustomer>> {
-    try {
-      const { error } = await this.#from("customers").insert({
-        organization_id: customer.organizationId,
-        provider: customer.provider,
-        external_customer_id: customer.externalCustomerId,
-        created_at: customer.createdAt,
-      });
-
-      // Corrida: outro processo criou o mesmo cliente. O vencedor é quem já
-      // está gravado — trocar o identificador abandonaria o cliente criado no
-      // provider.
-      if (error && error.code === UNIQUE_VIOLATION) {
-        return this.findCustomer(customer.organizationId, customer.provider) as Promise<
-          Result<BillingCustomer>
-        >;
-      }
-      if (error) return erroDeLeitura(error, "gravação de cliente");
-      return ok(customer);
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "gravação de cliente");
-    }
-  }
-
-  // ── Cobranças ────────────────────────────────────────────────────────────
-
-  async createCharge(input: CreateChargeInput): Promise<Result<Charge>> {
-    try {
-      const { data, error } = await this.#from("charges")
-        .insert({
-          organization_id: input.organizationId,
-          subscription_id: input.subscriptionId,
-          provider: input.provider,
-          external_charge_id: input.externalChargeId,
-          method: input.method,
-          amount_cents: input.amountCents,
-          period_start: input.periodStart,
-          period_end: input.periodEnd,
-          created_at: input.createdAt,
-          idempotency_key: input.idempotencyKey,
-        })
-        .select("*")
-        .single();
-
-      if (error) {
-        if (error.code === UNIQUE_VIOLATION) {
-          return fail("conflict", "cobrança já registrada para este identificador");
-        }
-        return erroDeLeitura(error, "criação de cobrança");
-      }
-      return ok(paraCobranca(data));
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "criação de cobrança");
-    }
-  }
-
-  async findChargeByExternalId(
-    organizationId: string,
-    provider: string,
-    externalChargeId: string
-  ): Promise<Result<Charge | null>> {
-    try {
-      const { data, error } = await this.#from("charges")
-        .select("*")
-        .eq("organization_id", organizationId)
-        .eq("provider", provider)
-        .eq("external_charge_id", externalChargeId)
-        .maybeSingle();
-
-      if (error) return erroDeLeitura(error, "cobrança");
-      return ok(data ? paraCobranca(data) : null);
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "cobrança");
-    }
-  }
-
-  async findChargeByIdempotencyKey(
-    organizationId: string,
-    idempotencyKey: string
-  ): Promise<Result<Charge | null>> {
-    try {
-      const { data, error } = await this.#from("charges")
-        .select("*")
-        .eq("organization_id", organizationId)
-        .eq("idempotency_key", idempotencyKey)
-        .maybeSingle();
-      if (error) return erroDeLeitura(error, "cobrança por chave de comando");
-      return ok(data ? paraCobranca(data) : null);
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "cobrança por chave de comando");
-    }
-  }
-
-  async listCharges(organizationId: string): Promise<Result<readonly Charge[]>> {
-    try {
-      const { data, error } = await this.#from("charges")
-        .select("*")
-        .eq("organization_id", organizationId)
-        .order("created_at", { ascending: true });
-
-      if (error) return erroDeLeitura(error, "cobranças");
-      return ok((data ?? []).map(paraCobranca));
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "cobranças");
-    }
-  }
-
-  async markChargePaid(
-    organizationId: string,
-    chargeId: string,
-    paidAt: string
-  ): Promise<Result<Charge>> {
-    return this.#marcarCobranca(organizationId, chargeId, "paid", paidAt);
-  }
-
-  async markChargeFailed(
-    organizationId: string,
-    chargeId: string,
-    failedAt: string
-  ): Promise<Result<Charge>> {
-    return this.#marcarCobranca(organizationId, chargeId, "failed", failedAt);
-  }
-
-  async #marcarCobranca(
-    organizationId: string,
-    chargeId: string,
-    status: "paid" | "failed",
-    quando: string
-  ): Promise<Result<Charge>> {
-    try {
-      // As constraints `charges_pago_tem_data` e `charges_falha_tem_data`
-      // exigem que estado e carimbo andem juntos: gravá-los na mesma sentença
-      // é o que impede um estado sem data.
-      const payload =
-        status === "paid"
-          ? { status, paid_at: quando, updated_at: quando }
-          : { status, failed_at: quando, updated_at: quando };
-
-      const { data, error } = await this.#from("charges")
-        .update(payload)
-        .eq("id", chargeId)
-        // Sem este filtro, um id de outra organização seria atualizado.
-        .eq("organization_id", organizationId)
-        .select("*")
-        .maybeSingle();
-
-      if (error) return erroDeLeitura(error, "atualização de cobrança");
-      if (!data) return fail("not_found", "cobrança inexistente para esta organização");
-      return ok(paraCobranca(data));
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "atualização de cobrança");
-    }
-  }
-
-  // ── Grandfathering e cortesia ────────────────────────────────────────────
-
-  async findGrandfatheringCutoff(): Promise<Result<string | null>> {
-    try {
-      const { data, error } = await this.#from("grandfathering_cutoff")
-        .select("cutoff_at")
-        .maybeSingle();
-      if (error) return erroDeLeitura(error, "data de corte");
-      return ok((data?.cutoff_at as string | undefined) ?? null);
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "data de corte");
-    }
-  }
-
-  async findGrandfathering(organizationId: string): Promise<Result<Grandfathering | null>> {
-    try {
-      const { data, error } = await this.#from("grandfathered_organizations")
-        .select("organization_id, cutoff_at, granted_at")
-        .eq("organization_id", organizationId)
-        .maybeSingle();
-      if (error) return erroDeLeitura(error, "direito adquirido");
-      if (!data) return ok(null);
-      return ok({
-        organizationId: data.organization_id as string,
-        cutoffAt: data.cutoff_at as string,
-        grantedAt: data.granted_at as string,
-      });
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "direito adquirido");
-    }
-  }
-
-  async saveGrandfathering(record: Grandfathering): Promise<Result<Grandfathering>> {
-    try {
-      const { error } = await this.#from("grandfathered_organizations").insert({
-        organization_id: record.organizationId,
-        cutoff_at: record.cutoffAt,
-        granted_at: record.grantedAt,
-        reason: "organização existente na data de corte",
-      });
-      if (error && error.code === UNIQUE_VIOLATION) {
-        return this.findGrandfathering(record.organizationId) as Promise<
-          Result<Grandfathering>
-        >;
-      }
-      if (error) return erroDeLeitura(error, "gravação de direito adquirido");
-      return ok(record);
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "gravação de direito adquirido");
-    }
-  }
-
-  async listCourtesies(organizationId: string): Promise<Result<readonly StoredCourtesy[]>> {
-    try {
-      const { data, error } = await this.#from("courtesies")
-        .select("id, organization_id, plan, starts_at, ends_at, reason, granted_by")
-        .eq("organization_id", organizationId)
-        .order("starts_at", { ascending: true });
-      if (error) return erroDeLeitura(error, "cortesias");
-
-      const { data: revogadas, error: erroRev } = await this.#from("courtesy_revocations")
-        .select("courtesy_id, revoked_at")
-        .eq("organization_id", organizationId);
-      if (erroRev) return erroDeLeitura(erroRev, "revogações de cortesia");
-
-      const mapa = new Map(
-        (revogadas ?? []).map((r) => [r.courtesy_id as string, r.revoked_at as string])
-      );
-
-      return ok(
-        (data ?? []).map((c) => ({
-          id: c.id as string,
-          organizationId: c.organization_id as string,
-          plan: c.plan as StoredCourtesy["plan"],
-          startsAt: c.starts_at as string,
-          endsAt: c.ends_at as string,
-          reason: c.reason as string,
-          grantedBy: c.granted_by as string,
-          revokedAt: mapa.get(c.id as string) ?? null,
-        }))
-      );
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "cortesias");
-    }
-  }
-
-  async saveCourtesy(courtesy: NewCourtesy): Promise<Result<StoredCourtesy>> {
-    try {
-      // Sem `id` no payload: a coluna é `uuid DEFAULT gen_random_uuid()`, e
-      // quem atribui a identidade é o banco.
-      const { data, error } = await this.#from("courtesies")
-        .insert({
-          organization_id: courtesy.organizationId,
-          plan: courtesy.plan,
-          starts_at: courtesy.startsAt,
-          ends_at: courtesy.endsAt,
-          reason: courtesy.reason,
-          granted_by: courtesy.grantedBy,
-        })
-        .select("id")
-        .single();
-      if (error) return erroDeLeitura(error, "gravação de cortesia");
-      return ok({ ...courtesy, id: data.id as string, revokedAt: null });
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "gravação de cortesia");
-    }
-  }
-
-  async revokeCourtesy(input: CourtesyRevocation): Promise<Result<CourtesyRevocation>> {
-    try {
-      // A cortesia precisa ser DESTA organização — conferido antes de gravar.
-      const { data: alvo, error: erroAlvo } = await this.#from("courtesies")
-        .select("id")
-        .eq("id", input.courtesyId)
-        .eq("organization_id", input.organizationId)
-        .maybeSingle();
-      if (erroAlvo) return erroDeLeitura(erroAlvo, "cortesia");
-      if (!alvo) return fail("not_found", "cortesia inexistente para esta organização");
-
-      const { error } = await this.#from("courtesy_revocations").insert({
-        courtesy_id: input.courtesyId,
-        organization_id: input.organizationId,
-        revoked_at: input.revokedAt,
-        revoked_by: input.revokedBy,
-        reason: input.reason,
-      });
-      if (error && error.code === UNIQUE_VIOLATION) {
-        return fail("conflict", "cortesia já revogada");
-      }
-      if (error) return erroDeLeitura(error, "revogação de cortesia");
-      return ok(input);
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "revogação de cortesia");
-    }
+  async recordWorkerCount(
+    ctx: ComandoContexto,
+    workerCount: number,
+    now: string
+  ): Promise<Result<StoredSubscription>> {
+    return this.#chamar(
+      "fn_billing_record_worker_count",
+      {
+        p_actor_id: ctx.actorId,
+        p_organization_id: ctx.organizationId,
+        p_worker_count: workerCount,
+        p_correlation_id: ctx.correlationId,
+        p_now: now,
+      },
+      (b) => (ehObjeto(b) ? paraAssinatura(b) : null),
+      "registro de trabalhadores"
+    );
   }
 
   // ── Idempotência ─────────────────────────────────────────────────────────
 
-  /**
-   * Reserva ATÔMICA.
-   *
-   * A decisão entre "criei" e "já existia" é do banco, pela violação do
-   * `UNIQUE`. Não há `SELECT` antes do `INSERT`: entre o select e o insert
-   * cabe outra transação, e é exatamente aí que a duplicata nasceria.
-   */
-  async reserveIdempotency(
-    record: IdempotencyRecord
-  ): Promise<Result<{ created: boolean; record: IdempotencyRecord }>> {
-    try {
-      const { error } = await this.#from("idempotency_records").insert({
-        organization_id: record.organizationId,
-        scope: record.scope,
-        provider: record.provider,
-        key: record.key,
-        result: record.result,
-        created_at: record.createdAt,
-      });
-
-      if (!error) return ok({ created: true, record });
-
-      if (error.code !== UNIQUE_VIOLATION) {
-        return erroDeLeitura(error, "reserva de idempotência");
-      }
-
-      const { data, error: erroLeitura } = await this.#from("idempotency_records")
-        .select("organization_id, scope, provider, key, result, created_at")
-        .eq("organization_id", record.organizationId)
-        .eq("scope", record.scope)
-        .eq("provider", record.provider)
-        .eq("key", record.key)
-        .maybeSingle();
-
-      if (erroLeitura) return erroDeLeitura(erroLeitura, "leitura de idempotência");
-      if (!data) return fail("conflict", "chave de idempotência em disputa");
-
-      return ok({
-        created: false,
-        record: {
-          organizationId: data.organization_id as string,
-          scope: data.scope as IdempotencyRecord["scope"],
-          provider: data.provider as string,
-          key: data.key as string,
-          result: (data.result ?? {}) as Record<string, unknown>,
-          createdAt: data.created_at as string,
-        },
-      });
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "reserva de idempotência");
-    }
+  async claimIdempotency(input: ClaimInput): Promise<Result<ClaimOutcome>> {
+    return this.#chamar(
+      "fn_billing_claim_idempotency",
+      {
+        p_actor_id: input.actorId,
+        p_organization_id: input.organizationId,
+        p_scope: input.scope,
+        p_provider: input.provider,
+        p_key: input.key,
+        p_fingerprint: input.fingerprint,
+        p_correlation_id: input.correlationId,
+        p_now: input.now,
+      },
+      (b) => {
+        if (!ehObjeto(b)) return null;
+        switch (texto(b.outcome)) {
+          case "claimed":
+            return { kind: "claimed" } as const;
+          case "in_progress":
+            return { kind: "in_progress" } as const;
+          case "fingerprint_conflict":
+            return { kind: "fingerprint_conflict" } as const;
+          case "completed":
+            return {
+              kind: "completed",
+              result: ehObjeto(b.result) ? b.result : {},
+            } as const;
+          default:
+            // Desfecho desconhecido é falha, nunca "siga em frente".
+            return null;
+        }
+      },
+      "reserva de idempotência"
+    );
   }
 
-  // ── Auditoria ────────────────────────────────────────────────────────────
-
-  async appendAuditEvent(event: AuditEventInput): Promise<Result<AuditEvent>> {
-    try {
-      const { data, error } = await this.#from("audit_events")
-        .insert({
-          organization_id: event.organizationId,
-          subscription_id: event.subscriptionId,
-          subject: event.subject,
-          actor_id: event.actorId,
-          origin: event.origin,
-          occurred_at: event.occurredAt,
-          previous_value: event.previousValue,
-          new_value: event.newValue,
-          reason: event.reason,
-          idempotency_key: event.idempotencyKey,
-          correlation_id: event.correlationId,
-        })
-        .select("id")
-        .single();
-
-      if (error) return erroDeLeitura(error, "gravação de auditoria");
-      return ok({ ...event, id: String(data.id) });
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "gravação de auditoria");
-    }
+  async failIdempotency(input: ClaimInput, errorCode: string): Promise<Result<SettleOutcome>> {
+    return this.#chamar(
+      "fn_billing_fail_idempotency",
+      {
+        p_actor_id: input.actorId,
+        p_organization_id: input.organizationId,
+        p_scope: input.scope,
+        p_provider: input.provider,
+        p_key: input.key,
+        p_fingerprint: input.fingerprint,
+        p_error_code: errorCode,
+        p_now: input.now,
+      },
+      (b) => {
+        if (!ehObjeto(b)) return null;
+        switch (texto(b.outcome)) {
+          case "failed":
+            return { kind: "failed" } as const;
+          case "in_progress":
+            return { kind: "in_progress" } as const;
+          case "fingerprint_conflict":
+            return { kind: "fingerprint_conflict" } as const;
+          case "completed":
+            return {
+              kind: "completed",
+              result: ehObjeto(b.result) ? b.result : {},
+            } as const;
+          default:
+            return null;
+        }
+      },
+      "marcação de falha"
+    );
   }
 
-  async listAuditEvents(organizationId: string): Promise<Result<readonly AuditEvent[]>> {
-    try {
-      const { data, error } = await this.#from("audit_events")
-        .select("*")
-        .eq("organization_id", organizationId)
-        .order("id", { ascending: true });
+  async finalizeCheckout(input: FinalizeCheckoutInput): Promise<Result<FinalizeOutcome>> {
+    return this.#chamar(
+      "fn_billing_finalize_checkout",
+      {
+        p_actor_id: input.actorId,
+        p_organization_id: input.organizationId,
+        p_provider: input.provider,
+        p_provider_account_id: input.providerAccountId,
+        p_external_customer_id: input.externalCustomerId,
+        p_external_charge_id: input.externalChargeId,
+        p_method: input.method,
+        p_amount_cents: input.amountCents,
+        p_period_start: input.periodStart,
+        p_period_end: input.periodEnd,
+        p_idempotency_key: input.idempotencyKey,
+        p_fingerprint: input.fingerprint,
+        p_correlation_id: input.correlationId,
+        p_now: input.now,
+      },
+      (b) => {
+        if (!ehObjeto(b)) return null;
+        if (texto(b.outcome) === "fingerprint_conflict") {
+          return { kind: "fingerprint_conflict" } as const;
+        }
+        if (texto(b.outcome) !== "completed") return null;
+        const cobranca = ehObjeto(b.charge) ? paraCobranca(b.charge) : null;
+        if (cobranca === null) return null;
+        return {
+          kind: "completed",
+          result: ehObjeto(b.result) ? b.result : {},
+          charge: cobranca,
+        } as const;
+      },
+      "finalização de checkout"
+    );
+  }
 
-      if (error) return erroDeLeitura(error, "auditoria");
-      return ok(
-        (data ?? []).map((e) => ({
-          id: String(e.id),
-          organizationId: e.organization_id as string,
-          subscriptionId: (e.subscription_id as string | null) ?? null,
-          subject: e.subject as AuditEvent["subject"],
-          actorId: (e.actor_id as string | null) ?? null,
-          origin: (e.origin as BillingActionOrigin | null) ?? "scheduler",
-          occurredAt: e.occurred_at as string,
-          previousValue: (e.previous_value as Record<string, unknown> | null) ?? null,
-          newValue: (e.new_value as Record<string, unknown> | null) ?? null,
-          reason: (e.reason as string | null) ?? null,
-          idempotencyKey: (e.idempotency_key as string | null) ?? null,
-          correlationId: (e.correlation_id as string | null) ?? null,
-        }))
-      );
-    } catch (causa) {
-      return fromThrown(causa, "repository_unavailable", "auditoria");
-    }
+  async applyProviderEvent(input: ProviderEventInput): Promise<Result<ProviderEventOutcome>> {
+    return this.#chamar(
+      "fn_billing_apply_provider_event",
+      {
+        p_provider: input.provider,
+        p_provider_account_id: input.providerAccountId,
+        p_external_event_id: input.externalEventId,
+        p_external_charge_id: input.externalChargeId,
+        p_event_type: input.eventType,
+        p_occurred_at: input.occurredAt,
+        p_correlation_id: input.correlationId,
+        p_now: input.now,
+      },
+      (b) => {
+        if (!ehObjeto(b)) return null;
+        const desfecho = texto(b.outcome);
+        if (desfecho === "duplicate") return { kind: "duplicate" } as const;
+        if (desfecho === "out_of_order") {
+          return { kind: "out_of_order", reason: texto(b.reason) ?? "fora de ordem" } as const;
+        }
+        if (desfecho !== "applied") return null;
+
+        const org = texto(b.organizationId);
+        const cobranca = ehObjeto(b.charge) ? paraCobranca(b.charge) : null;
+        const assinatura = ehObjeto(b.subscription) ? paraAssinatura(b.subscription) : null;
+        if (org === null || cobranca === null || assinatura === null) return null;
+        return {
+          kind: "applied",
+          organizationId: org,
+          charge: cobranca,
+          subscription: assinatura,
+        } as const;
+      },
+      "evento do provider"
+    );
+  }
+
+  // ── Acesso ───────────────────────────────────────────────────────────────
+
+  async grantCourtesy(
+    ctx: ComandoContexto,
+    plan: PlanSlug,
+    startsAt: string,
+    endsAt: string,
+    reason: string
+  ): Promise<Result<StoredCourtesy>> {
+    return this.#chamar(
+      "fn_billing_grant_courtesy",
+      {
+        p_actor_id: ctx.actorId,
+        p_organization_id: ctx.organizationId,
+        p_plan: plan,
+        p_starts_at: startsAt,
+        p_ends_at: endsAt,
+        p_reason: reason,
+        p_correlation_id: ctx.correlationId,
+      },
+      (b) => (ehObjeto(b) ? paraCortesia(b) : null),
+      "concessão de cortesia"
+    );
+  }
+
+  async revokeCourtesy(
+    ctx: ComandoContexto,
+    courtesyId: string,
+    revokedAt: string,
+    reason: string
+  ): Promise<Result<RevokeCourtesyOutcome>> {
+    return this.#chamar(
+      "fn_billing_revoke_courtesy",
+      {
+        p_actor_id: ctx.actorId,
+        p_organization_id: ctx.organizationId,
+        p_courtesy_id: courtesyId,
+        p_revoked_at: revokedAt,
+        p_reason: reason,
+        p_correlation_id: ctx.correlationId,
+      },
+      (b) => {
+        if (!ehObjeto(b)) return null;
+        const desfecho = texto(b.outcome);
+        if (desfecho === "already_revoked") return { kind: "already_revoked" } as const;
+        if (desfecho !== "revoked") return null;
+        const id = texto(b.courtesyId);
+        const quando = texto(b.revokedAt);
+        if (id === null || quando === null) return null;
+        return { kind: "revoked", courtesyId: id, revokedAt: quando } as const;
+      },
+      "revogação de cortesia"
+    );
+  }
+
+  async saveGrandfathering(
+    ctx: ComandoContexto,
+    cutoffAt: string,
+    grantedAt: string
+  ): Promise<Result<GrandfatheringOutcome>> {
+    return this.#chamar(
+      "fn_billing_save_grandfathering",
+      {
+        p_actor_id: ctx.actorId,
+        p_organization_id: ctx.organizationId,
+        p_cutoff_at: cutoffAt,
+        p_granted_at: grantedAt,
+        p_correlation_id: ctx.correlationId,
+      },
+      (b) => {
+        if (!ehObjeto(b)) return null;
+        const desfecho = texto(b.outcome);
+        if (desfecho === "already_granted") return { kind: "already_granted" } as const;
+        if (desfecho !== "granted") return null;
+        const registro = paraGrandfathering(b);
+        if (registro === null) return null;
+        return { kind: "granted", record: registro } as const;
+      },
+      "direito adquirido"
+    );
   }
 }
 
 // ─── Conversões ────────────────────────────────────────────────────────────
+//
+// Cada uma devolve `null` quando a forma não bate. `null` vira
+// `repository_unavailable` no `#chamar` — nunca um objeto meio preenchido.
 
-type Linha = Record<string, unknown>;
-
-function paraSnapshot(l: Linha): PriceSnapshot {
+function paraSnapshot(bruto: unknown): PriceSnapshot | null {
+  if (!ehObjeto(bruto)) return null;
+  const valor = inteiro(bruto.amount_cents);
+  const plan = texto(bruto.plan);
+  const tier = texto(bruto.tier);
+  const period = texto(bruto.period);
+  const versao = texto(bruto.catalog_version);
+  const quando = texto(bruto.captured_at);
+  if (valor === null || !plan || !tier || !period || !versao || !quando) return null;
   return Object.freeze({
-    plan: l.plan as PriceSnapshot["plan"],
-    tier: l.tier as PriceSnapshot["tier"],
-    period: l.period as PriceSnapshot["period"],
-    amountCents: l.amount_cents as number,
-    catalogVersion: l.catalog_version as string,
-    capturedAt: l.captured_at as string,
+    plan: plan as PriceSnapshot["plan"],
+    tier: tier as PriceSnapshot["tier"],
+    period: period as PriceSnapshot["period"],
+    amountCents: valor,
+    catalogVersion: versao,
+    capturedAt: quando,
   });
 }
 
-function paraAssinatura(l: Linha, snapshot: PriceSnapshot | null): StoredSubscription {
-  const plan = l.plan as StoredSubscription["plan"];
-  const tier = l.tier as StoredSubscription["tier"];
-  const period = l.period as StoredSubscription["period"];
+function paraAssinatura(bruto: Json): StoredSubscription | null {
+  const id = texto(bruto.id);
+  const org = texto(bruto.organization_id);
+  const plan = texto(bruto.plan);
+  const tier = texto(bruto.tier);
+  const period = texto(bruto.period);
+  const state = texto(bruto.state);
+  const trabalhadores = inteiro(bruto.worker_count);
+  const cnpj = texto(bruto.cnpj);
+  const inicio = texto(bruto.current_period_start);
+  const fim = texto(bruto.current_period_end);
+  if (
+    !id || !org || !plan || !tier || !period || !state ||
+    trabalhadores === null || !cnpj || !inicio || !fim
+  ) {
+    return null;
+  }
+
+  const downPlan = texto(bruto.scheduled_downgrade_plan);
+  const downTier = texto(bruto.scheduled_downgrade_tier);
 
   return {
-    id: l.id as string,
-    organizationId: l.organization_id as string,
-    plan,
-    tier,
-    period,
-    state: l.state as StoredSubscription["state"],
-    workerCount: l.worker_count as number,
-    cnpj: l.cnpj as string,
-    currentPeriodStart: l.current_period_start as string,
-    currentPeriodEnd: l.current_period_end as string,
-    trialEndsAt: (l.trial_ends_at as string | null) ?? null,
-    paymentFailedAt: (l.payment_failed_at as string | null) ?? null,
+    id,
+    organizationId: org,
+    plan: plan as StoredSubscription["plan"],
+    tier: tier as StoredSubscription["tier"],
+    period: period as StoredSubscription["period"],
+    state: state as StoredSubscription["state"],
+    workerCount: trabalhadores,
+    cnpj,
+    currentPeriodStart: inicio,
+    currentPeriodEnd: fim,
+    trialEndsAt: texto(bruto.trial_ends_at),
+    paymentFailedAt: texto(bruto.payment_failed_at),
     scheduledDowngrade:
-      l.scheduled_downgrade_plan && l.scheduled_downgrade_tier
+      downPlan && downTier
         ? {
-            plan: l.scheduled_downgrade_plan as StoredSubscription["plan"],
-            tier: l.scheduled_downgrade_tier as StoredSubscription["tier"],
+            plan: downPlan as StoredSubscription["plan"],
+            tier: downTier as StoredSubscription["tier"],
           }
         : null,
     priceSnapshot:
-      snapshot ??
+      paraSnapshot(bruto.price_snapshot) ??
       Object.freeze({
-        plan,
-        tier,
-        period,
+        plan: plan as StoredSubscription["plan"],
+        tier: tier as StoredSubscription["tier"],
+        period: period as StoredSubscription["period"],
         amountCents: 0,
         catalogVersion: "pendente",
-        capturedAt: l.current_period_start as string,
+        capturedAt: inicio,
       }),
   };
 }
 
-function paraCobranca(l: Linha): Charge {
+function paraCobranca(bruto: unknown): Charge | null {
+  if (!ehObjeto(bruto)) return null;
+  const id = texto(bruto.id);
+  const org = texto(bruto.organization_id);
+  const sub = texto(bruto.subscription_id);
+  const provider = texto(bruto.provider);
+  const conta = texto(bruto.provider_account_id);
+  const cliente = texto(bruto.external_customer_id);
+  const externo = texto(bruto.external_charge_id);
+  const metodo = texto(bruto.method);
+  const valor = inteiro(bruto.amount_cents);
+  const moeda = texto(bruto.currency);
+  const periodicidade = texto(bruto.billing_period);
+  const status = texto(bruto.status);
+  const inicio = texto(bruto.period_start);
+  const fim = texto(bruto.period_end);
+  const criada = texto(bruto.created_at);
+  if (
+    !id || !org || !sub || !provider || !conta || !cliente || !externo ||
+    !metodo || valor === null || !moeda || !periodicidade || !status ||
+    !inicio || !fim || !criada
+  ) {
+    return null;
+  }
   return {
-    id: l.id as string,
-    organizationId: l.organization_id as string,
-    subscriptionId: l.subscription_id as string,
-    provider: l.provider as string,
-    externalChargeId: l.external_charge_id as string,
-    method: l.method as Charge["method"],
-    amountCents: l.amount_cents as number,
-    status: l.status as Charge["status"],
-    periodStart: l.period_start as string,
-    periodEnd: l.period_end as string,
-    createdAt: l.created_at as string,
-    paidAt: (l.paid_at as string | null) ?? null,
-    failedAt: (l.failed_at as string | null) ?? null,
-    idempotencyKey: (l.idempotency_key as string | null) ?? null,
+    id,
+    organizationId: org,
+    subscriptionId: sub,
+    provider,
+    providerAccountId: conta,
+    externalCustomerId: cliente,
+    externalChargeId: externo,
+    method: metodo as Charge["method"],
+    amountCents: valor,
+    currency: moeda,
+    billingPeriod: periodicidade as Charge["billingPeriod"],
+    status: status as Charge["status"],
+    periodStart: inicio,
+    periodEnd: fim,
+    createdAt: criada,
+    paidAt: texto(bruto.paid_at),
+    failedAt: texto(bruto.failed_at),
+    cancelledAt: texto(bruto.cancelled_at),
+    idempotencyKey: texto(bruto.idempotency_key),
+  };
+}
+
+function paraCortesia(bruto: unknown): StoredCourtesy | null {
+  if (!ehObjeto(bruto)) return null;
+  const id = texto(bruto.id);
+  const org = texto(bruto.organizationId) ?? texto(bruto.organization_id);
+  const plan = texto(bruto.plan);
+  const inicio = texto(bruto.startsAt) ?? texto(bruto.starts_at);
+  const fim = texto(bruto.endsAt) ?? texto(bruto.ends_at);
+  const motivo = texto(bruto.reason);
+  const autor = texto(bruto.grantedBy) ?? texto(bruto.granted_by);
+  if (!id || !org || !plan || !inicio || !fim || !motivo || !autor) return null;
+  return {
+    id,
+    organizationId: org,
+    plan: plan as StoredCourtesy["plan"],
+    startsAt: inicio,
+    endsAt: fim,
+    reason: motivo,
+    grantedBy: autor,
+    revokedAt: texto(bruto.revokedAt) ?? texto(bruto.revoked_at),
+  };
+}
+
+function paraGrandfathering(bruto: Json): Grandfathering | null {
+  const org = texto(bruto.organizationId) ?? texto(bruto.organization_id);
+  const corte = texto(bruto.cutoffAt) ?? texto(bruto.cutoff_at);
+  const concedido = texto(bruto.grantedAt) ?? texto(bruto.granted_at);
+  if (!org || !corte || !concedido) return null;
+  return { organizationId: org, cutoffAt: corte, grantedAt: concedido };
+}
+
+function paraPrecoDeCatalogo(bruto: unknown): CatalogPrice | null {
+  if (!ehObjeto(bruto)) return null;
+  const versao = texto(bruto.catalog_version);
+  const plan = texto(bruto.plan);
+  const tier = texto(bruto.tier);
+  if (!versao || !plan || !tier) return null;
+  return {
+    catalogVersion: versao,
+    plan: plan as CatalogPrice["plan"],
+    tier: tier as CatalogPrice["tier"],
+    monthlyCents: inteiro(bruto.monthly_cents),
+    yearlyCents: inteiro(bruto.yearly_cents),
+  };
+}
+
+function paraAuditoria(bruto: unknown): AuditEvent | null {
+  if (!ehObjeto(bruto)) return null;
+  const id = texto(bruto.id);
+  const org = texto(bruto.organization_id);
+  const assunto = texto(bruto.subject);
+  const quando = texto(bruto.occurred_at);
+  if (!id || !org || !assunto || !quando) return null;
+  return {
+    id,
+    organizationId: org,
+    subscriptionId: texto(bruto.subscription_id),
+    subject: assunto as AuditEvent["subject"],
+    actorId: texto(bruto.actor_id),
+    origin: (texto(bruto.origin) ?? "scheduler") as BillingActionOrigin,
+    occurredAt: quando,
+    previousValue: ehObjeto(bruto.previous_value) ? bruto.previous_value : null,
+    newValue: ehObjeto(bruto.new_value) ? bruto.new_value : null,
+    reason: texto(bruto.reason),
+    idempotencyKey: texto(bruto.idempotency_key),
+    correlationId: texto(bruto.correlation_id),
   };
 }

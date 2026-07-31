@@ -18,6 +18,10 @@ import { fileURLToPath } from "node:url";
 
 import { parseManifest } from "./lib/manifest.mjs";
 import { classificarMigrations } from "./lib/migrations.mjs";
+import {
+  NOMES_DE_RPC,
+  RPCS_DE_BILLING,
+} from "../scripts/ci/billing-rpc-allowlist.mjs";
 
 const raiz = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ler = (p) => fs.readFileSync(path.join(raiz, p), "utf8").replace(/\r\n?/g, "\n");
@@ -184,9 +188,17 @@ test("BO-06: todo comando confere o tenant informado pelo cliente", () => {
     "assertTenant deixou de comparar a organização"
   );
   assert.match(shared, /auth\.role !== "owner"/, "assertTenant deixou de exigir owner");
-  // Recusa indistinguível: `not_owner` para alheia E para inexistente.
+
+  // Recusa indistinguível: `not_owner` para alheia E para inexistente. A
+  // asserção é amarrada ao CORPO de `assertTenant` — medir o arquivo inteiro
+  // reprovaria o `not_found` legítimo de `exigirAssinatura`, que significa
+  // "esta organização não tem assinatura" e só é alcançável por quem já foi
+  // autorizado nela.
+  const iAssert = shared.indexOf("export function assertTenant");
+  assert.ok(iAssert > 0, "assertTenant sumiu");
+  const corpoAssert = shared.slice(iAssert, shared.indexOf("export ", iAssert + 10));
   assert.doesNotMatch(
-    shared,
+    corpoAssert,
     /return fail\("not_found"/,
     "a recusa por tenant virou 'not_found' — vira oráculo de enumeração"
   );
@@ -202,6 +214,23 @@ test("BO-06: todo comando confere o tenant informado pelo cliente", () => {
     const exportados = [...src.matchAll(/export async function (\w+)/g)].map((m) => m[1]);
     assert.ok(exportados.length > 0, `${arquivo} não exporta caso de uso`);
     for (const nome of exportados) {
+      // EXCEÇÃO NOMINAL, e única: `applyProviderEvent` não confere tenant
+      // porque NÃO TEM tenant a conferir. O webhook não traz sessão, e a
+      // organização é resolvida pelo banco a partir do identificador externo,
+      // que é único globalmente. Um `assertTenant` aqui exigiria que alguém
+      // informasse a organização — e é exatamente isso que o desenho recusa.
+      //
+      // A exceção é por NOME. Qualquer outro caso de uso sem guarda reprova.
+      if (nome === "applyProviderEvent") {
+        const corpoEvento = src.slice(src.indexOf(`export async function ${nome}`));
+        assert.doesNotMatch(
+          corpoEvento.slice(0, 900),
+          /organizationId:\s*input\./,
+          "applyProviderEvent passou a aceitar organização vinda de fora"
+        );
+        continue;
+      }
+
       const i = src.indexOf(`export async function ${nome}`);
       const corpo = src.slice(i, i + 900);
       const passaPorGuarda =
@@ -211,25 +240,48 @@ test("BO-06: todo comando confere o tenant informado pelo cliente", () => {
   }
 });
 
-test("BO-07: o ator da auditoria vem do contexto, nunca do argumento", () => {
+test("BO-07: a auditoria é escrita na mesma transação do efeito", () => {
+  // ── O QUE MUDOU, E POR QUÊ ────────────────────────────────────────────────
+  //
+  // Antes existia `auditar()` em shared.ts: os casos de uso gravavam a trilha
+  // numa chamada SEPARADA, depois do efeito. Eram duas requisições HTTP, logo
+  // duas transações — "cobrança criada, auditoria falhou" era alcançável.
+  //
+  // Agora a trilha é escrita DENTRO da RPC do efeito. Esta guarda deixou de
+  // procurar a função e passou a exigir que ela NÃO exista: um `appendAuditEvent`
+  // no contrato seria a peça com a qual se remonta a escrita em duas etapas.
+  const contrato = tsExecutavel("src/lib/billing/core/repository.ts");
+  assert.doesNotMatch(
+    contrato,
+    /appendAuditEvent|listAuditEvents\s*\(/,
+    "o contrato reintroduziu escrita de auditoria separada do efeito"
+  );
+
   const shared = tsExecutavel("src/lib/billing/usecases/shared.ts");
-  assert.match(shared, /actorId:\s*env\.origin === "owner"/, "o ator deixou de vir do contexto");
   assert.doesNotMatch(
     shared,
-    /actorId:\s*input\./,
-    "o ator passou a vir do argumento — daria para atribuir a ação a outra pessoa"
+    /export async function auditar/,
+    "auditar voltou — a trilha precisa ir junto com o efeito, na mesma transação"
   );
-  // Falha de auditoria FALHA a operação — e a asserção precisa estar amarrada
-  // à função `auditar`, não a qualquer `if (!r.ok)` do arquivo. A primeira
-  // versão media o `reservar`, que tem o mesmo trecho, e aprovava um `auditar`
-  // sem propagação (encontrado por MUT-B24).
-  const iAuditar = shared.indexOf("export async function auditar");
-  assert.ok(iAuditar > 0, "a função auditar sumiu");
-  const corpoAuditar = shared.slice(iAuditar, shared.indexOf("export ", iAuditar + 10));
+
+  // O ator vem do CONTEXTO, nunca do argumento — no dublê e na RPC.
+  const memoria = tsExecutavel("src/lib/billing/repositories/in-memory.ts");
   assert.match(
-    corpoAuditar,
-    /const r = await env\.repo\.appendAuditEvent\([\s\S]*?if \(!r\.ok\) return r;/,
-    "auditar deixou de propagar a falha — a escrita seguiria sem trilha"
+    memoria,
+    /actorId:\s*origin === "owner" \|\| origin === "admin" \? actorId : null/,
+    "o dublê deixou de derivar o ator da origem"
+  );
+  assert.doesNotMatch(
+    memoria,
+    /actorId:\s*input\.actorId\s*,?\s*\/\/\s*do argumento/,
+    "o ator passou a vir do argumento"
+  );
+
+  const migration = sqlExecutavel(MIGRATION);
+  assert.match(
+    migration,
+    /CASE WHEN p_origin IN \('owner', 'admin'\) THEN p_actor_id ELSE NULL END/,
+    "a RPC de auditoria deixou de anular o ator em origem não humana"
   );
 });
 
@@ -306,16 +358,27 @@ test("BO-10: o repositório real é server-only e não guarda credencial", () =>
   assert.doesNotMatch(executavel, /postgres(ql)?:\/\//, "connection string embutida");
   // E nenhum log.
   assert.doesNotMatch(executavel, /console\.(log|warn|error|info)/, "o repositório registra log");
-  // A mensagem do driver não é propagada — só o código.
+  // A mensagem do driver não é propagada — só o código. Mensagens de
+  // PostgREST e do driver carregam host, usuário e às vezes a URL de conexão
+  // inteira; o `code` não identifica ninguém.
   assert.match(
     executavel,
-    /code: erro\.code \?\? null/,
-    "o erro do driver deixou de ser reduzido ao código"
+    /const code = erro\.code \?\? null;/,
+    "o erro do PostgREST deixou de ser reduzido ao código"
   );
   assert.doesNotMatch(
     executavel,
     /erro\.message/,
     "a mensagem do driver é propagada — pode carregar host e usuário"
+  );
+
+  // PGRST106 (schema não exposto) e PGRST202 (função inexistente) precisam
+  // cair no ramo de indisponibilidade. Foram exatamente esses dois códigos que
+  // a versão anterior teria recebido em toda chamada, sem que nada acusasse.
+  assert.match(
+    executavel,
+    /return fail\("repository_unavailable"/,
+    "erro desconhecido do PostgREST não nega"
   );
 });
 
@@ -383,22 +446,225 @@ test("BO-13: a migration da 12B é forward-only e posterior à 12A", () => {
   );
 });
 
-test("BO-14: a migration é aditiva e não toca a 12A nem public", () => {
+test("BO-24: a state machine do checkout propaga falha e não chama o provider à toa", () => {
+  const src = tsExecutavel("src/lib/billing/usecases/payments.ts");
+
+  // ── AMBIGUIDADE DO PROVIDER ───────────────────────────────────────────────
+  //
+  // "Indisponível" e "não respondeu" NÃO dizem se o recurso externo foi criado.
+  // Marcar `failed` neles afirmaria "nada aconteceu", e a retomada imediata
+  // criaria a SEGUNDA cobrança. Estes dois códigos precisam continuar fora do
+  // caminho que marca falha.
+  assert.match(
+    src,
+    /const AMBIGUOS[^=]*=\s*new Set\(\["provider_unavailable", "provider_timeout"\]\)/,
+    "a lista de erros ambíguos do provider mudou sem revisão"
+  );
+  assert.match(
+    src,
+    /if \(AMBIGUOS\.has\(code\)\) return;/,
+    "erro ambíguo do provider voltou a marcar a reserva como falha"
+  );
+
+  // Falha do `finalize` PROPAGA — e deliberadamente NÃO marca `failed`.
+  const iFinal = src.indexOf("const finalizado = await env.repo.finalizeCheckout");
+  assert.ok(iFinal > 0, "o finalize sumiu do checkout");
+  const depoisDoFinal = src.slice(iFinal, iFinal + 700);
+  assert.match(
+    depoisDoFinal,
+    /if \(!finalizado\.ok\) \{[\s\S]*?return finalizado;/,
+    "a falha do finalize deixou de ser propagada"
+  );
+  assert.doesNotMatch(
+    depoisDoFinal,
+    /failIdempotency/,
+    "o finalize que falhou passou a marcar `failed` — o recurso externo existe"
+  );
+
+  // Os quatro desfechos que RETORNAM antes do provider.
+  const iClaim = src.indexOf("switch (claim.value.kind)");
+  assert.ok(iClaim > 0, "o switch de desfechos do claim sumiu");
+  const iProvider = src.indexOf("env.provider.createCustomer");
+  assert.ok(iProvider > iClaim, "o provider é chamado antes de avaliar o claim");
+
+  const entreClaimEProvider = src.slice(iClaim, iProvider);
+  for (const desfecho of ["fingerprint_conflict", "in_progress", "completed"]) {
+    assert.match(
+      entreClaimEProvider,
+      new RegExp(`case "${desfecho}"`),
+      `o desfecho ${desfecho} deixou de ser tratado antes do provider`
+    );
+  }
+  // E a autorização vem antes de tudo.
+  assert.ok(
+    src.indexOf("assertTenant") < iProvider,
+    "o provider é chamado antes da checagem de autorização"
+  );
+});
+
+test("BO-23: o repositório real alcança billing SÓ por RPC", () => {
+  // ── O DEFEITO QUE ESTA GUARDA EXISTE PARA IMPEDIR ─────────────────────────
+  //
+  // `.schema("billing").from(...)` NÃO abre conexão SQL: o supabase-js traduz
+  // isso no cabeçalho HTTP `Accept-Profile: billing` para o PostgREST, que
+  // recusa qualquer schema fora de `db-schemas` com PGRST106. Como `billing`
+  // nunca esteve exposto — e continua não estando, por decisão — toda chamada
+  // por esse caminho falha, sempre.
+  //
+  // A camada inteira foi entregue assim e passou por todas as suítes, porque
+  // nenhum teste instanciava a classe. É por isso que esta guarda é textual E
+  // existe a suíte de contrato: uma pega a reintrodução, a outra pega a
+  // regressão de comportamento.
+  const repo = "src/lib/billing/repositories/supabase.ts";
+  assert.ok(existe(repo), `${repo} ausente`);
+  const src = tsExecutavel(repo);
+
+  assert.doesNotMatch(
+    src,
+    /\.schema\(\s*["'`]billing["'`]\s*\)/,
+    "o repositório voltou a endereçar o schema billing pelo PostgREST — " +
+      "esse caminho não funciona e nunca funcionou"
+  );
+  assert.doesNotMatch(
+    src,
+    /\.from\(\s*["'`](?:subscriptions|charges|idempotency_records|customers|audit_events|price_snapshots|courtesies|provider_events)["'`]/,
+    "o repositório acessa tabela de billing diretamente"
+  );
+
+  // ── A ALLOWLIST É UM TIPO ─────────────────────────────────────────────────
+  //
+  // `NomeDeRpc` é a união fechada dos dezesseis nomes, e `#chamar` só aceita
+  // esse tipo. Nome fora da lista, ou montado dinamicamente, NÃO COMPILA — é
+  // garantia mais forte do que qualquer varredura textual. Esta guarda confere
+  // que a união e a allowlist versionada continuam iguais.
+  const uniao = /type\s+NomeDeRpc\s*=([\s\S]*?);/.exec(src)?.[1] ?? "";
+  const declarados = [...uniao.matchAll(/"(fn_billing_\w+)"/g)].map((m) => m[1]);
+
+  assert.ok(declarados.length > 0, "o repositório não declara a união NomeDeRpc");
+  assert.deepEqual(
+    [...declarados].sort(),
+    [...NOMES_DE_RPC].sort(),
+    "a união NomeDeRpc divergiu da allowlist versionada"
+  );
+
+  // Um único ponto de contato com o PostgREST, e ele recebe o nome TIPADO.
+  const pontos = [...src.matchAll(/\.rpc\(/g)].length;
+  assert.equal(pontos, 1, `há ${pontos} chamadas .rpc(); deve haver exatamente uma`);
+  assert.match(
+    src,
+    /this\.#db\.rpc\(\s*nome\s*,/,
+    "a chamada .rpc não recebe o nome tipado de #chamar"
+  );
+
+  // Nada de nome montado em tempo de execução.
+  assert.doesNotMatch(src, /\.rpc\(\s*`/, "RPC chamada com template literal");
+  assert.doesNotMatch(src, /\.rpc\(\s*[a-z]\w*\s*\+/i, "RPC chamada com nome concatenado");
+
+  // E todas as dezesseis são efetivamente usadas — uma declarada e nunca
+  // chamada seria allowlist inflada.
+  const usadas = [...src.matchAll(/#chamar\(\s*\n?\s*"(fn_billing_\w+)"/g)].map((m) => m[1]);
+  const naoUsadas = NOMES_DE_RPC.filter((n) => !usadas.includes(n));
+  assert.deepEqual(naoUsadas, [], `RPC declarada e nunca chamada: ${naoUsadas.join(", ")}`);
+
+  // Sem `any`: resposta do PostgREST é `unknown` até ser validada.
+  assert.doesNotMatch(src, /:\s*any\b|\bas\s+any\b/, "o repositório usa any");
+
+  // Fail-closed explícito: resposta vazia e formato inesperado NEGAM.
+  assert.match(src, /resposta vazia/, "resposta ausente não é tratada como falha");
+  assert.match(src, /formato inesperado/, "resposta malformada não é tratada como falha");
+
+  // Nenhum fallback para o dublê.
+  assert.doesNotMatch(
+    src,
+    /InMemoryBillingRepository/,
+    "o repositório real referencia o dublê — fallback silencioso"
+  );
+});
+
+test("BO-14: em public a migration só cria as RPCs nominalmente autorizadas", () => {
   const sql = sqlExecutavel(MIGRATION);
 
   assert.doesNotMatch(sql, /DROP TABLE|DROP TYPE|DROP SCHEMA/i, "a migration remove objeto");
   assert.doesNotMatch(sql, /DROP COLUMN/i, "a migration remove coluna");
-  assert.doesNotMatch(
-    sql,
-    /\b(CREATE|ALTER|DROP)\s+(TABLE|TYPE|FUNCTION|VIEW|INDEX|TRIGGER|POLICY)\s+(IF\s+(NOT\s+)?EXISTS\s+)?public\./i,
-    "a migration faz DDL em public"
-  );
   assert.doesNotMatch(sql, /UPDATE\s+public\./i, "a migration faz DML em public");
   assert.doesNotMatch(sql, /CREATE\s+POLICY/i, "a fundação exige zero policies");
   assert.doesNotMatch(sql, /ALTER\s+DEFAULT\s+PRIVILEGES/i, "exige superusuário");
 
-  // As quatro tabelas novas, com RLS.
-  for (const t of ["customers", "charges", "idempotency_records", "courtesy_revocations"]) {
+  // ── O FURO QUE ESTA GUARDA TINHA ──────────────────────────────────────────
+  //
+  // A versão anterior proibia DDL em `public` com
+  //   /(CREATE|ALTER|DROP)\s+(TABLE|TYPE|FUNCTION|…)\s+…public\./
+  // e passava quando a migration escrevia `CREATE OR REPLACE FUNCTION
+  // public.x`, porque "OR REPLACE" fica ENTRE `CREATE` e `FUNCTION` e o `\s+`
+  // não casa. A guarda que deveria vigiar a fronteira nunca a vigiou.
+  //
+  // Agora a fronteira é uma allowlist: DDL de função em `public` é permitida
+  // SOMENTE para os nomes declarados, e qualquer outro DDL continua proibido.
+
+  // 1. Nenhum DDL de objeto NÃO-função em public.
+  assert.doesNotMatch(
+    sql,
+    /\b(CREATE|ALTER|DROP)\s+(OR\s+REPLACE\s+)?(TABLE|TYPE|VIEW|INDEX|TRIGGER|POLICY|SEQUENCE|SCHEMA)\s+(IF\s+(NOT\s+)?EXISTS\s+)?(public\.|"public"\.)/i,
+    "a migration cria objeto não-função em public"
+  );
+
+  // 2. Toda função criada em public está na allowlist — inclusive as escritas
+  //    com OR REPLACE, que é a forma que escapava.
+  const criadasEmPublic = [
+    ...sql.matchAll(
+      /\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:public\.|"public"\.)(\w+)/gi
+    ),
+  ].map((m) => m[1]);
+
+  assert.ok(criadasEmPublic.length > 0, "a migration não cria RPC alguma em public");
+
+  const foraDaAllowlist = criadasEmPublic.filter((n) => !NOMES_DE_RPC.includes(n));
+  assert.deepEqual(
+    foraDaAllowlist,
+    [],
+    `função em public fora da allowlist: ${foraDaAllowlist.join(", ")}`
+  );
+
+  // 3. E todas as declaradas são realmente criadas — remover uma reprova.
+  const naoCriadas = NOMES_DE_RPC.filter((n) => !criadasEmPublic.includes(n));
+  assert.deepEqual(naoCriadas, [], `RPC declarada e não criada: ${naoCriadas.join(", ")}`);
+
+  assert.equal(
+    new Set(criadasEmPublic).size,
+    criadasEmPublic.length,
+    "há definição duplicada de RPC — sobrecarga acidental"
+  );
+
+  // 4. Cada RPC é SECURITY DEFINER com search_path VAZIO.
+  const blocos = sql.split(/\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+/i).slice(1);
+  for (const bloco of blocos) {
+    const nome = /^(?:public\.|"public"\.)?(\w+)/.exec(bloco)?.[1];
+    if (!nome || !NOMES_DE_RPC.includes(nome)) continue;
+    const cabeca = bloco.slice(0, bloco.search(/\bAS\s+\$/i));
+    assert.match(cabeca, /SECURITY\s+DEFINER/i, `${nome} não é SECURITY DEFINER`);
+    assert.match(
+      cabeca,
+      /SET\s+search_path\s*=\s*''/i,
+      `${nome} não fixa search_path vazio`
+    );
+  }
+
+  // 5. Nenhuma RPC aceita fragmento de SQL ou nome de objeto como parâmetro,
+  //    e nenhuma monta comando com entrada.
+  assert.doesNotMatch(
+    sql,
+    /EXECUTE\s+format\([^)]*\bp_[a-z_]+/i,
+    "há SQL dinâmico montado com parâmetro de entrada"
+  );
+
+  // As cinco tabelas novas, com RLS.
+  for (const t of [
+    "customers",
+    "charges",
+    "idempotency_records",
+    "courtesy_revocations",
+    "provider_events",
+  ]) {
     assert.match(
       sql,
       new RegExp(`CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+billing\\.${t}\\b`, "i"),
@@ -434,17 +700,47 @@ test("BO-15: as unicidades que sustentam a idempotência existem", () => {
     /CONSTRAINT idempotency_chave_unica UNIQUE \(organization_id, scope, provider, key\)/,
     "a chave de idempotência precisa incluir tenant E provider"
   );
+  // ── UNICIDADE DO EVENTO EXTERNO É GLOBAL, NÃO POR TENANT ──────────────────
+  //
+  // Era `(organization_id, provider, external_charge_id)`. Com `organization_id`
+  // na chave, o MESMO identificador do MESMO provider podia existir em duas
+  // organizações — e um evento seria aplicável ao tenant errado. A resolução do
+  // tenant a partir do identificador externo depende desta unicidade ser global.
   assert.match(
     sql,
-    /CONSTRAINT charges_externo_unico UNIQUE \(organization_id, provider, external_charge_id\)/
+    /CONSTRAINT charges_externo_unico\s*\n?\s*UNIQUE \(provider, provider_account_id, external_charge_id\)/,
+    "a unicidade do identificador externo voltou a ser por tenant"
+  );
+  assert.match(
+    sql,
+    /CONSTRAINT provider_events_unico\s*\n?\s*UNIQUE \(provider, provider_account_id, external_event_id\)/,
+    "o evento externo precisa ser único globalmente"
+  );
+  assert.match(
+    sql,
+    /CONSTRAINT customers_externo_unico\s*\n?\s*UNIQUE \(provider, provider_account_id, external_customer_id\)/,
+    "sem esta unicidade não há como resolver o tenant pelo cliente externo"
   );
   assert.match(
     sql,
     /CONSTRAINT charges_comando_unico UNIQUE \(organization_id, idempotency_key\)/,
     "sem esta unicidade o checkout repetido criaria segunda cobrança"
   );
+
+  // Idempotência com ESTADO e FINGERPRINT — sem os dois, a reserva grava
+  // resultado antes do efeito e a chave fica presa quando o efeito falha.
+  assert.match(sql, /status\s+billing\.idempotency_state\s+NOT NULL/i);
+  assert.match(sql, /request_fingerprint\s+text\s+NOT NULL/i);
+  assert.match(
+    sql,
+    /CONSTRAINT idempotency_resultado_so_completo/,
+    "falta a constraint que impede resultado em registro não concluído"
+  );
+
   // E o verificador independente confere as colunas exatas.
-  assert.match(ler(VERIFICADOR), /organization_id,scope,provider,key/);
+  const ver = ler(VERIFICADOR);
+  assert.match(ver, /charges_externo_unico voltou a ser por tenant/);
+  assert.match(ver, /request_fingerprint/);
 });
 
 test("BO-16: rollback, verificador e rota acompanham a migration", () => {
@@ -498,26 +794,69 @@ test("BO-17: o CI executa a integração e o ensaio das DUAS migrations", () => 
     "a reaplicação não cobre a 12B"
   );
 
-  // A integração precisa continuar sendo COMPORTAMENTO, não só catálogo.
+  // A integração precisa continuar sendo COMPORTAMENTO, não só catálogo — e
+  // agora exercita as RPCs, que são o caminho real da aplicação.
   const sql = ler(INTEGRACAO);
-  assert.match(sql, /unique_violation/, "falta a prova de unicidade");
   assert.match(sql, /restrict_violation/, "falta a prova de imutabilidade");
-  assert.match(sql, /cobrança órfã sobreviveu/, "falta a prova de transação");
-  assert.match(sql, /isolamento A×B|apareceu para B/, "falta a prova de isolamento entre tenants");
+  assert.match(sql, /fingerprint_conflict/, "falta a prova de conflito de fingerprint");
+  assert.match(sql, /recusas distinguíveis/, "falta a prova de recusa indistinguível");
+  assert.match(sql, /tenant resolvido/, "falta a prova de resolução de tenant pelo externo");
+  assert.match(sql, /paid → failed foi aceito/, "falta a prova de transição inválida");
+  assert.match(
+    sql,
+    /public\.fn_billing_claim_idempotency/,
+    "a integração precisa chamar as RPCs, não escrever direto nas tabelas"
+  );
   assert.match(sql, /^ROLLBACK;$/m, "o bloco comportamental precisa terminar em ROLLBACK");
+
+  // A CORRIDA não cabe numa sessão psql. O arquivo anterior afirmava provar
+  // concorrência com INSERT duplicado sequencial — não provava.
+  const corrida = "scripts/ci/assert-billing-concurrency.sh";
+  assert.ok(existe(corrida), `${corrida} ausente`);
+  const sh = ler(corrida);
+  // Uma barreira POR corrida. Contar importa: uma disputa sem portão de
+  // largada não é disputa — a primeira conexão termina antes de a segunda
+  // abrir, e o teste vira prova de constraint, que é o que a revisão reprovou.
+  const barreiras = (sh.match(/pg_advisory_xact_lock_shared/g) ?? []).length;
+  assert.ok(
+    barreiras >= 3,
+    `a corrida tem ${barreiras} barreira(s); são três disputas e cada uma precisa da sua`
+  );
+  assert.match(sh, /esperado exatamente 1 vencedor/, "a corrida não confere o vencedor único");
+  assert.ok(verify.includes(corrida), "o CI não executa a corrida real");
 });
 
-test("BO-18: a allowlist de UPDATE é exatamente {subscriptions, charges}", () => {
-  // `charges` entrou na 12B. Uma terceira tabela exige alterar este teste, e
-  // isso aparece no diff do PR.
-  const seg = ler("scripts/ci/assert-billing-security.sql");
+test("BO-18: o service_role não tem escrita direta em billing — a porta é a RPC", () => {
+  // Não existe mais allowlist de UPDATE, porque não existe mais UPDATE
+  // concedido. A 12B revoga TUDO do service_role, inclusive SELECT e o USAGE
+  // no schema: ele passa a executar as dezesseis funções e nada mais.
+  //
+  // Enquanto havia escrita direta e o service_role tem BYPASSRLS, o filtro por
+  // organização escrito no cliente era a única barreira entre dois tenants.
+  // Agora a barreira é a revalidação no banco, dentro da mesma transação do
+  // efeito.
+  const sql = sqlExecutavel(MIGRATION);
+
   assert.match(
-    seg,
-    /c\.relname NOT IN \('subscriptions', 'charges'\)/,
-    "a allowlist de UPDATE mudou sem revisão"
+    sql,
+    /REVOKE ALL ON TABLE billing\.%I FROM service_role/,
+    "a migration não revoga o acesso direto do service_role"
   );
+  assert.match(
+    sql,
+    /REVOKE USAGE ON SCHEMA billing FROM service_role/,
+    "o service_role continua com USAGE no schema billing"
+  );
+  assert.doesNotMatch(
+    sql,
+    /GRANT\s+[^;']*\b(INSERT|UPDATE|DELETE)\b[^;']*ON TABLE billing/i,
+    "a migration devolveu escrita direta ao service_role"
+  );
+
+  // E o verificador independente pergunta ao PostgreSQL, não ao texto.
   const ver = ler(VERIFICADOR);
-  assert.match(ver, /c\.relname NOT IN \('subscriptions', 'charges'\)/);
+  assert.match(ver, /has_schema_privilege\('service_role', 'billing', 'USAGE'\)/);
+  assert.match(ver, /privilegio direto sobrevivente/);
 });
 
 test("BO-19: a guarda e as mutações rodam no verify", () => {
@@ -549,13 +888,22 @@ test("BO-22: cortesia exige prazo, motivo e autor do contexto", () => {
   const src = tsExecutavel("src/lib/billing/usecases/access.ts");
   assert.match(
     src,
-    /if \(!Number\.isInteger\(input\.days\) \|\| input\.days <= 0\)/,
+    /if \(!Number\.isInteger\(input\.days\) \|\| input\.days < 1\)/,
     "grantCourtesy deixou de exigir prazo positivo inteiro"
   );
   assert.match(src, /input\.reason\.trim\(\) === ""/, "grantCourtesy deixou de exigir motivo");
+  // O autor vem do CONTEXTO. Ele não é mais montado aqui: `contexto(env)`
+  // carrega `actorId`, e é o dublê/RPC que o grava como `grantedBy` — o que
+  // torna impossível o caso de uso atribuir a concessão a outra pessoa.
   assert.match(
     src,
-    /grantedBy: env\.auth\.userId/,
+    /env\.repo\.grantCourtesy\(contexto\(env\)/,
+    "a cortesia deixou de ser concedida com o contexto do servidor"
+  );
+  const memoria = tsExecutavel("src/lib/billing/repositories/in-memory.ts");
+  assert.match(
+    memoria,
+    /grantedBy: ctx\.actorId/,
     "o autor da cortesia deixou de vir do contexto"
   );
   // Revogar também exige motivo.
@@ -574,28 +922,49 @@ test("BO-21: grandfathering e cortesia são sempre resolvidos por ORGANIZAÇÃO"
   // A guarda mede a CHAMADA, não a intenção (encontrado por MUT-B21).
   const src = tsExecutavel("src/lib/billing/usecases/access.ts");
 
-  for (const [re, motivo] of [
-    [/findGrandfathering\(env\.auth\.organizationId\)/, "leitura do direito adquirido"],
-    [/saveGrandfathering\(\{\s*organizationId: env\.auth\.organizationId/, "gravação do direito adquirido"],
-    [/listCourtesies\(env\.auth\.organizationId\)/, "leitura de cortesias"],
-  ]) {
-    assert.match(src, re, `${motivo} deixou de usar a organização do contexto`);
-  }
-
-  // E nenhuma delas pode receber o usuário NO LUGAR da organização.
-  //
-  // A asserção é específica de propósito: `revokedBy: env.auth.userId` e
-  // `grantedBy: env.auth.userId` são CORRETOS — registram o autor. O que não
-  // pode acontecer é o usuário ocupar a posição da organização.
+  // A leitura é uma só — `readState` — e ela recebe ator E organização, nessa
+  // ordem. Trocar a ordem faria a organização ser procurada pelo identificador
+  // do usuário.
+  assert.match(
+    src,
+    /readState\(env\.auth\.userId, env\.auth\.organizationId\)/,
+    "leitura do direito adquirido deixou de usar a organização do contexto"
+  );
   assert.doesNotMatch(
     src,
-    /(findGrandfathering|saveGrandfathering|listCourtesies)\(\s*env\.auth\.userId/,
-    "o benefício passou a ser buscado por usuário — o corte deixaria de valer"
+    /readState\(env\.auth\.organizationId/,
+    "ator e organização foram trocados de posição na leitura"
   );
+
+  // Cortesia e direito adquirido são gravados pelo `ComandoContexto`, que
+  // carrega a organização resolvida no servidor.
+  for (const nome of ["grantCourtesy", "revokeCourtesy", "saveGrandfathering"]) {
+    const i = src.indexOf(`env.repo.${nome}(`);
+    assert.ok(i > 0, `${nome} não é chamado no caso de uso`);
+    assert.match(
+      src.slice(i, i + 120),
+      /contexto\(env\)/,
+      `${nome} deixou de receber o contexto do servidor`
+    );
+  }
+
+  // O usuário NUNCA ocupa a posição da organização.
+  //
+  // A asserção é específica de propósito: `grantedBy`/`revokedBy` derivados de
+  // `ctx.actorId` são CORRETOS — registram o autor. O que não pode acontecer é
+  // o usuário ser gravado COMO organização.
   assert.doesNotMatch(
     src,
     /organizationId:\s*env\.auth\.userId/,
     "o usuário está sendo gravado como organização"
+  );
+
+  // E o dublê grava o direito adquirido pela organização do contexto.
+  const memoria = tsExecutavel("src/lib/billing/repositories/in-memory.ts");
+  assert.match(
+    memoria,
+    /organizationId: ctx\.organizationId,\s*cutoffAt,/,
+    "o direito adquirido deixou de ser gravado por organização"
   );
 });
 

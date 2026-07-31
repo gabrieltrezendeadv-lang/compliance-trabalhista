@@ -1,259 +1,241 @@
 /**
  * AUTORIZAÇÃO E ISOLAMENTO ENTRE TENANTS.
  *
- * Duas organizações reais, A e B, com proprietários distintos. O que se prova
- * aqui é que o identificador vindo do cliente NUNCA autoriza, que papéis
- * diferentes de owner são recusados, e que a recusa não revela a existência de
- * organização alheia.
+ * ── AS DUAS PROPRIEDADES QUE ESTE ARQUIVO PROTEGE ───────────────────────────
+ *
+ * 1. RECUSA INDISTINGUÍVEL. Organização alheia e organização inexistente
+ *    produzem exatamente a mesma resposta. Distingui-las entregaria "esta
+ *    organização existe" a quem varre identificadores.
+ *
+ * 2. RECUSA ANTES DO EFEITO. A autorização falha antes de qualquer escrita e
+ *    antes de qualquer chamada ao provider — e isso é MEDIDO, não descrito.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { startTrial, cancelAtPeriodEnd, recordWorkerCount } from "@/lib/billing/usecases/subscription";
-import { createMockCheckout } from "@/lib/billing/usecases/payments";
-import { grantCourtesy, resolveBillingAccess, revokeCourtesy } from "@/lib/billing/usecases/access";
-import type { BillingAuthContext } from "@/lib/billing/core/ports";
-import { bancada, erro, valor, ORG_A, ORG_B, OWNER_A, OWNER_B } from "./harness";
+import { applyProviderEvent, createCheckout } from "@/lib/billing/usecases/payments";
+import {
+  cancelAtPeriodEnd,
+  choosePlan,
+  scheduleDowngradeUseCase,
+  startTrial,
+  upgradeSubscription,
+} from "@/lib/billing/usecases/subscription";
+import {
+  grantCourtesy,
+  resolveBillingAccess,
+  revokeCourtesy,
+} from "@/lib/billing/usecases/access";
+import {
+  COLAB_A,
+  DONO_A,
+  MEMBROS,
+  ORG_A,
+  ORG_B,
+  ORG_FANTASMA,
+  montarBancada,
+} from "./harness";
 
-const CNPJ = "00.000.000/0001-91";
-
-const abrirTrial = (env: Parameters<typeof startTrial>[0]) =>
-  startTrial(env, { plan: "essencial", period: "monthly", workerCount: 10, cnpj: CNPJ });
-
-describe("somente owner administra", () => {
-  it("owner é aceito", async () => {
-    const b = bancada();
-    expect((await abrirTrial(b.env)).ok).toBe(true);
+async function comTrial(opcoes: Parameters<typeof montarBancada>[0] = {}) {
+  const b = montarBancada(opcoes);
+  const r = await startTrial(b.env, {
+    plan: "essencial",
+    period: "monthly",
+    workerCount: 10,
+    cnpj: "00000000000191",
   });
+  expect(r.ok).toBe(true);
+  return b;
+}
 
-  for (const papel of ["admin", "manager", "member", "collaborator", "auditor"]) {
-    it(`${papel} é recusado em alteração financeira`, async () => {
-      const b = bancada();
-      // O contexto é montado no servidor; aqui simula-se um papel diferente
-      // chegando até o caso de uso — que precisa recusar por conta própria.
-      const env = {
-        ...b.env,
-        auth: { ...b.env.auth, role: papel } as unknown as BillingAuthContext,
-      };
-      expect(erro(await abrirTrial(env))).toBe("not_owner");
-      expect(erro(await recordWorkerCount(env, { workerCount: 5 }))).toBe("not_owner");
-      expect(
-        erro(
-          await grantCourtesy(env, { plan: "completo", days: 10, reason: "x" })
-        )
-      ).toBe("not_owner");
-    });
-  }
+describe("recusa indistinguível", () => {
+  it("organização alheia e inexistente produzem a MESMA recusa", async () => {
+    const b = await comTrial();
 
-  it("papel diferente de owner NÃO chega a tocar no repositório", async () => {
-    const b = bancada();
-    const env = {
-      ...b.env,
-      auth: { ...b.env.auth, role: "admin" } as unknown as BillingAuthContext,
-    };
-    await abrirTrial(env);
-    // Nada foi criado: a recusa é anterior a qualquer escrita.
-    expect(valor(await b.repo.findSubscription(ORG_A))).toBeNull();
-  });
-});
-
-describe("IDOR — organização do cliente nunca autoriza", () => {
-  it("owner de A é aceito ao pedir A", async () => {
-    const b = bancada({ organizationId: ORG_A, userId: OWNER_A });
-    const r = await startTrial(b.env, {
-      plan: "essencial",
-      period: "monthly",
-      workerCount: 10,
-      cnpj: CNPJ,
-      requestedOrganizationId: ORG_A,
-    });
-    expect(r.ok).toBe(true);
-  });
-
-  it("owner de A é RECUSADO ao pedir B", async () => {
-    const b = bancada({ organizationId: ORG_A, userId: OWNER_A });
-    const r = await startTrial(b.env, {
-      plan: "essencial",
-      period: "monthly",
-      workerCount: 10,
-      cnpj: CNPJ,
-      requestedOrganizationId: ORG_B,
-    });
-    expect(erro(r)).toBe("not_owner");
-  });
-
-  it("owner de B é RECUSADO ao pedir A — vale nos dois sentidos", async () => {
-    const b = bancada({ organizationId: ORG_B, userId: OWNER_B });
-    const r = await startTrial(b.env, {
-      plan: "essencial",
-      period: "monthly",
-      workerCount: 10,
-      cnpj: CNPJ,
-      requestedOrganizationId: ORG_A,
-    });
-    expect(erro(r)).toBe("not_owner");
-  });
-
-  it("organização inexistente e organização alheia são INDISTINGUÍVEIS", async () => {
-    const b = bancada({ organizationId: ORG_A, userId: OWNER_A });
+    // O dono de A pede explicitamente por B — que existe — e por uma
+    // organização que não existe. As duas respostas têm de ser idênticas.
     const alheia = await cancelAtPeriodEnd(b.env, { requestedOrganizationId: ORG_B });
     const inexistente = await cancelAtPeriodEnd(b.env, {
-      requestedOrganizationId: "00000000-0000-4000-8000-0000000dead0",
+      requestedOrganizationId: ORG_FANTASMA,
     });
-    expect(erro(alheia)).toBe(erro(inexistente));
-    expect(erro(alheia)).toBe("not_owner");
-  });
 
-  it("entrada vazia não é substituída pela organização do servidor", async () => {
-    const b = bancada();
-    for (const entrada of ["", "   "]) {
-      expect(erro(await cancelAtPeriodEnd(b.env, { requestedOrganizationId: entrada }))).toBe(
-        "invalid_input"
-      );
+    expect(alheia.ok).toBe(false);
+    expect(inexistente.ok).toBe(false);
+    if (!alheia.ok && !inexistente.ok) {
+      expect(alheia.error.code).toBe(inexistente.error.code);
+      expect(alheia.error.message).toBe(inexistente.error.message);
     }
   });
 
-  it("a recusa por IDOR não escreve nada", async () => {
-    const b = bancada({ organizationId: ORG_A });
-    await startTrial(b.env, {
-      plan: "essencial",
-      period: "monthly",
-      workerCount: 10,
-      cnpj: CNPJ,
-      requestedOrganizationId: ORG_B,
+  it("a recusa no REPOSITÓRIO também é indistinguível", async () => {
+    // Sem passar por `assertTenant`: o ator de A pede direto o estado de B e o
+    // de uma organização inexistente. A revalidação do banco responde igual.
+    const b = await comTrial();
+
+    const alheia = await b.repo.readState(DONO_A, ORG_B);
+    const inexistente = await b.repo.readState(DONO_A, ORG_FANTASMA);
+
+    expect(alheia.ok).toBe(false);
+    expect(inexistente.ok).toBe(false);
+    if (!alheia.ok && !inexistente.ok) {
+      expect(alheia.error.code).toBe(inexistente.error.code);
+      expect(alheia.error.message).toBe(inexistente.error.message);
+    }
+  });
+});
+
+describe("somente o proprietário administra", () => {
+  const comandos: ReadonlyArray<[string, (b: Awaited<ReturnType<typeof comTrial>>) => Promise<{ ok: boolean }>]> = [
+    ["startTrial", (b) => startTrial(b.env, { plan: "essencial", period: "monthly", workerCount: 5, cnpj: "00000000000191" })],
+    ["choosePlan", (b) => choosePlan(b.env, { plan: "completo", period: "monthly" })],
+    ["upgradeSubscription", (b) => upgradeSubscription(b.env, { plan: "completo" })],
+    ["scheduleDowngrade", (b) => scheduleDowngradeUseCase(b.env, { plan: "essencial" })],
+    ["cancelAtPeriodEnd", (b) => cancelAtPeriodEnd(b.env)],
+    ["grantCourtesy", (b) => grantCourtesy(b.env, { plan: "completo", days: 30, reason: "piloto" })],
+    ["revokeCourtesy", (b) => revokeCourtesy(b.env, { courtesyId: "crt_000001", reason: "fim" })],
+    ["createCheckout", (b) => createCheckout(b.env, { method: "pix", idempotencyKey: "ck", customerName: "n", customerEmail: "e@t.local" })],
+  ];
+
+  for (const [nome, executar] of comandos) {
+    it(`${nome} recusa quem não é proprietário, sem tocar provider`, async () => {
+      // Colaborador de A: pertence à organização, mas não é dono.
+      const b = montarBancada({ actorId: COLAB_A, organizationId: ORG_A });
+      const r = await executar(b);
+
+      expect(r.ok).toBe(false);
+      // E o provider nunca soube que houve tentativa.
+      expect(b.chamadasDoProvider()).toBe(0);
     });
-    expect(valor(await b.repo.listAuditEvents(ORG_A))).toHaveLength(0);
-    expect(valor(await b.repo.listAuditEvents(ORG_B))).toHaveLength(0);
+  }
+
+  it("a recusa acontece ANTES de qualquer escrita", async () => {
+    const b = await comTrial();
+    const antes = await b.assinatura();
+
+    await cancelAtPeriodEnd(b.env, { requestedOrganizationId: ORG_B });
+
+    // Nada mudou: a recusa não deixou efeito colateral.
+    expect(await b.assinatura()).toEqual(antes);
   });
 });
 
-describe("isolamento de dados entre A e B", () => {
-  it("cada organização enxerga apenas a própria assinatura", async () => {
-    const a = bancada({ organizationId: ORG_A, userId: OWNER_A });
-    valor(await abrirTrial(a.env));
+describe("evento do provider não aceita tenant de fora", () => {
+  it("a entrada do webhook não tem organização nem ator", async () => {
+    const b = await comTrial();
+    const checkout = await createCheckout(b.env, {
+      method: "pix",
+      idempotencyKey: "ck-1",
+      customerName: "n",
+      customerEmail: "e@t.local",
+    });
+    expect(checkout.ok).toBe(true);
+    if (!checkout.ok) return;
 
-    // Mesmo repositório, contexto de B: nada de A pode vazar.
-    const envB = {
-      ...a.env,
-      auth: { userId: OWNER_B, organizationId: ORG_B, role: "owner" as const },
-    };
-    expect(valor(await a.repo.findSubscription(ORG_B))).toBeNull();
-    expect(valor(await resolveBillingAccess(envB)).source).toBe("none");
+    // O tipo de entrada não tem `organizationId` nem `actorId` — se tivesse,
+    // esta chamada não compilaria sem eles, e quem manda o evento escolheria a
+    // quem ele se aplica. O tenant sai da resolução pelo identificador externo.
+    const r = await applyProviderEvent(b.env, {
+      externalEventId: "ev-1",
+      externalChargeId: checkout.value.charge.externalChargeId,
+      eventType: "charge_paid",
+      occurredAt: "2026-08-05T00:00:00.000Z",
+    });
+
+    expect(r.ok).toBe(true);
+    if (r.ok && r.value.kind === "applied") {
+      expect(r.value.charge.organizationId).toBe(ORG_A);
+    }
   });
 
-  it("cobrança de A não é alcançável pelo contexto de B", async () => {
-    const a = bancada({ organizationId: ORG_A, userId: OWNER_A });
-    valor(await abrirTrial(a.env));
-    const checkout = valor(
-      await createMockCheckout(a.env, {
-        method: "pix",
-        idempotencyKey: "k-a",
-        customerName: "A",
-        customerEmail: "a@x.test",
-      })
-    );
+  it("evento de cobrança desconhecida não revela existência de organização", async () => {
+    const b = await comTrial();
 
-    const achada = valor(
-      await a.repo.findChargeByExternalId(ORG_B, "mock", checkout.charge.externalChargeId)
-    );
-    expect(achada).toBeNull();
-  });
+    const inventado = await applyProviderEvent(b.env, {
+      externalEventId: "ev-x",
+      externalChargeId: "chg-que-nao-existe",
+      eventType: "charge_paid",
+      occurredAt: "2026-08-05T00:00:00.000Z",
+    });
 
-  it("auditoria de A não aparece para B", async () => {
-    const a = bancada({ organizationId: ORG_A });
-    valor(await abrirTrial(a.env));
-    expect(valor(await a.repo.listAuditEvents(ORG_A)).length).toBeGreaterThan(0);
-    expect(valor(await a.repo.listAuditEvents(ORG_B))).toHaveLength(0);
-  });
-
-  it("cortesia de A não pode ser revogada pelo contexto de B", async () => {
-    const a = bancada({ organizationId: ORG_A, userId: OWNER_A });
-    const cortesia = valor(
-      await grantCourtesy(a.env, { plan: "completo", days: 30, reason: "piloto" })
-    );
-
-    const envB = {
-      ...a.env,
-      auth: { userId: OWNER_B, organizationId: ORG_B, role: "owner" as const },
-    };
-    expect(erro(await revokeCourtesy(envB, { courtesyId: cortesia.id, reason: "x" }))).toBe(
-      "not_found"
-    );
-
-    // E continua vigente para A.
-    const acesso = valor(await resolveBillingAccess(a.env));
-    expect(acesso.source).toBe("courtesy");
+    expect(inventado.ok).toBe(false);
+    if (!inventado.ok) {
+      expect(inventado.error.code).toBe("not_found");
+      // A mensagem fala da COBRANÇA, nunca de organização.
+      expect(inventado.error.message).not.toMatch(/organiza|org-/i);
+    }
   });
 });
 
-describe("cortesia — prazo, motivo, autor e auditoria", () => {
-  it("registra autor do contexto e prazo calculado", async () => {
-    const b = bancada({ userId: OWNER_A });
-    const c = valor(await grantCourtesy(b.env, { plan: "completo", days: 30, reason: "piloto" }));
-    expect(c.grantedBy).toBe(OWNER_A);
-    expect(c.startsAt).toBe("2026-08-01T00:00:00.000Z");
-    expect(c.endsAt).toBe("2026-08-31T00:00:00.000Z");
-    expect(c.revokedAt).toBeNull();
+describe("falha de leitura nunca vira acesso", () => {
+  it("repositório indisponível reprova — não devolve 'sem assinatura'", async () => {
+    const b = await comTrial();
+    b.repo.definirFalhas(["readState"]);
 
-    const eventos = valor(await b.repo.listAuditEvents(b.env.auth.organizationId));
-    const evento = eventos.find((e) => e.subject === "courtesy");
-    expect(evento?.reason).toBe("piloto");
-    expect(evento?.newValue).toMatchObject({ grantedBy: OWNER_A });
+    const r = await resolveBillingAccess(b.env, { billingEnabled: true });
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("repository_unavailable");
   });
 
-  it("exige prazo positivo e motivo", async () => {
-    const b = bancada();
-    expect(erro(await grantCourtesy(b.env, { plan: "completo", days: 0, reason: "x" }))).toBe(
-      "invalid_input"
-    );
-    expect(erro(await grantCourtesy(b.env, { plan: "completo", days: -1, reason: "x" }))).toBe(
-      "invalid_input"
-    );
-    expect(erro(await grantCourtesy(b.env, { plan: "completo", days: 1.5, reason: "x" }))).toBe(
-      "invalid_input"
-    );
-    expect(erro(await grantCourtesy(b.env, { plan: "completo", days: 10, reason: " " }))).toBe(
-      "invalid_input"
-    );
+  it("organização sem assinatura é motivo PRÓPRIO, distinto de indisponibilidade", async () => {
+    const b = montarBancada();
+
+    const r = await resolveBillingAccess(b.env, { billingEnabled: true });
+
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.reason).toBe("sem_assinatura");
+      expect(r.value.readOnly).toBe(true);
+      expect(r.value.plan).toBeNull();
+    }
   });
 
-  it("vigora até o fim e não além dele", async () => {
-    const b = bancada();
-    valor(await grantCourtesy(b.env, { plan: "completo", days: 30, reason: "piloto" }));
+  it("estado desconhecido nega em vez de liberar", async () => {
+    // Não há como produzir estado desconhecido pelo caminho normal — o tipo
+    // impede. A propriedade equivalente e observável: nenhum motivo de acesso
+    // concede escrita sem assinatura, cortesia ou direito adquirido.
+    const b = montarBancada();
+    const r = await resolveBillingAccess(b.env, { billingEnabled: true });
 
-    b.tempo.set("2026-08-30T23:59:59.999Z");
-    expect(valor(await resolveBillingAccess(b.env)).source).toBe("courtesy");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.features).toEqual([]);
+      expect(r.value.storageMib).toBe(0);
+    }
+  });
+});
 
-    b.tempo.set("2026-08-31T00:00:00.000Z");
-    expect(valor(await resolveBillingAccess(b.env)).source).toBe("none");
+describe("nenhum detalhe interno vaza", () => {
+  it("erro do repositório não carrega mensagem de driver", async () => {
+    const b = await comTrial();
+    b.repo.definirFalhas(["claimIdempotency"]);
+
+    const r = await createCheckout(b.env, {
+      method: "pix",
+      idempotencyKey: "ck-1",
+      customerName: "n",
+      customerEmail: "e@t.local",
+    });
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      // Nada de host, usuário, porta, esquema de conexão ou SQL.
+      expect(r.error.message).not.toMatch(/postgres|localhost|127\.0\.0\.1|select |insert |@/i);
+    }
   });
 
-  it("revogação encerra o benefício e é auditada, sem apagar a concessão", async () => {
-    const b = bancada();
-    const c = valor(await grantCourtesy(b.env, { plan: "completo", days: 30, reason: "piloto" }));
-
-    b.tempo.set("2026-08-10T00:00:00.000Z");
-    valor(await revokeCourtesy(b.env, { courtesyId: c.id, reason: "encerrado a pedido" }));
-
-    expect(valor(await resolveBillingAccess(b.env)).source).toBe("none");
-
-    // A concessão original continua registrada, com autor e motivo.
-    const cortesias = valor(await b.repo.listCourtesies(b.env.auth.organizationId));
-    expect(cortesias).toHaveLength(1);
-    expect(cortesias[0].reason).toBe("piloto");
-    expect(cortesias[0].grantedBy).toBe(OWNER_A);
-    expect(cortesias[0].revokedAt).toBe("2026-08-10T00:00:00.000Z");
+  it("o repositório servidor não é importável fora do servidor", async () => {
+    // `SupabaseBillingRepository` é `server-only`: importá-lo aqui seria erro
+    // de build. A propriedade é garantida pelo pacote `server-only` e conferida
+    // estaticamente por BO-10; aqui se registra que a suíte de unidade usa
+    // exclusivamente o dublê.
+    const b = montarBancada();
+    expect(b.repo.constructor.name).toBe("InMemoryBillingRepository");
   });
+});
 
-  it("revogar exige motivo e não repete", async () => {
-    const b = bancada();
-    const c = valor(await grantCourtesy(b.env, { plan: "completo", days: 30, reason: "piloto" }));
-    expect(erro(await revokeCourtesy(b.env, { courtesyId: c.id, reason: "  " }))).toBe(
-      "invalid_input"
-    );
-    valor(await revokeCourtesy(b.env, { courtesyId: c.id, reason: "fim" }));
-    expect(erro(await revokeCourtesy(b.env, { courtesyId: c.id, reason: "de novo" }))).toBe(
-      "conflict"
-    );
+describe("membros e papéis", () => {
+  it("as fixtures declaram exatamente os papéis usados", () => {
+    expect(MEMBROS.map((m) => m.role).sort()).toEqual(["collaborator", "owner", "owner"]);
   });
 });

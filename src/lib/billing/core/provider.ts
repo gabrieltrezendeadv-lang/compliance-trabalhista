@@ -41,6 +41,15 @@ export interface ProviderChargeInput {
   readonly dueAt: string;
   /** Chave de idempotência do comando, para o provider dedupe do lado dele. */
   readonly idempotencyKey: string;
+  /**
+   * Fingerprint canônico do pedido.
+   *
+   * A chave sozinha diz "é a mesma tentativa"; ela NÃO diz "é o mesmo pedido".
+   * Sem o fingerprint aqui, o provider não teria como distinguir uma RETOMADA
+   * legítima — que precisa devolver o mesmo recurso externo — de um reuso de
+   * chave com outro valor, que precisa ser recusado.
+   */
+  readonly fingerprint: string;
 }
 
 export type ProviderChargeStatus = "pending" | "paid" | "failed" | "cancelled";

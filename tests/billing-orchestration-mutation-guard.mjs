@@ -130,15 +130,18 @@ test("MUT-B03: registry caindo no mock em vez de abortar é DETECTADO", () => {
 
 // ── 2. Erro de repository retornando allowed ───────────────────────────────
 
-test("MUT-B04: catch devolvendo sucesso no repositório é DETECTADO", () => {
+test("MUT-B04: resposta vazia convertida em sucesso é DETECTADA", () => {
+  // `data` ausente não é "nada encontrado": é resposta que não entendemos.
+  // Tratá-la como vazio bem-sucedido faria a camada superior decidir acesso
+  // sobre um estado que ninguém leu.
   const r = mutar(
     "src/lib/billing/repositories/supabase.ts",
-    '      return fromThrown(causa, "repository_unavailable", "assinatura");\n    }\n  }\n\n  /**\n   * Último snapshot',
-    '      return ok(null);\n    }\n  }\n\n  /**\n   * Último snapshot',
+    "        return fail(\"repository_unavailable\", `${contexto}: resposta vazia`);",
+    "        return ok(mapear({}) as T);",
     GUARDA
   );
-  assert.equal(r.code, 1, `o catch positivo passou:\n${r.out}`);
-  assert.match(r.out, /BO-05/);
+  assert.equal(r.code, 1, `resposta vazia virando sucesso passou:\n${r.out}`);
+  assert.match(r.out, /BO-23/);
 });
 
 test("MUT-B05: fromThrown aceitando código de sucesso é DETECTADO", () => {
@@ -191,15 +194,18 @@ test("MUT-B08: recusa por tenant virando not_found é DETECTADA", () => {
   assert.match(r.out, /BO-06/);
 });
 
-test("MUT-B09: repositório lendo sem filtrar organização é DETECTADO", () => {
+test("MUT-B09: RPC chamada por nome fixo, fora do tipo fechado, é DETECTADA", () => {
+  // O ponto único de contato recebe `nome: NomeDeRpc`. Fixar um nome aqui
+  // desliga a garantia de compilação — passaria a existir um caminho em que o
+  // nome não vem da união fechada.
   const r = mutar(
     "src/lib/billing/repositories/supabase.ts",
-    '        .eq("organization_id", organizationId)\n        .eq("provider", provider)\n        .eq("external_charge_id", externalChargeId)',
-    '        .eq("external_charge_id", externalChargeId)',
+    "      const { data, error } = await this.#db.rpc(nome, args);",
+    '      const { data, error } = await this.#db.rpc("fn_billing_read_state", args);',
     GUARDA
   );
-  assert.equal(r.code, 1, `a leitura sem tenant passou:\n${r.out}`);
-  assert.match(r.out, /BO-11/);
+  assert.equal(r.code, 1, `o nome fixo fora do tipo passou:\n${r.out}`);
+  assert.match(r.out, /BO-23/);
 });
 
 // ── 5 e 6. Idempotência e ordem ────────────────────────────────────────────
@@ -243,11 +249,11 @@ test("MUT-B13: esvaziar a prova de transação no CI é DETECTADO", () => {
   // só se provam contra PostgreSQL. Remover a prova é remover a garantia.
   const r = mutar(
     "scripts/ci/assert-billing-orchestration.sql",
-    "      'ASSERÇÃO REPROVADA: cobrança órfã sobreviveu à falha (% linha(s)) — '",
-    "      'ok (% linha(s)) — '",
+    "    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: paid → failed foi aceito';",
+    "    RAISE NOTICE 'tudo bem';",
     GUARDA
   );
-  assert.equal(r.code, 1, `a remoção da prova de transação passou:\n${r.out}`);
+  assert.equal(r.code, 1, `a remoção da prova de transição passou:\n${r.out}`);
   assert.match(r.out, /BO-17/);
 });
 
@@ -264,11 +270,11 @@ test("MUT-B14: tirar a integração da 12B do CI é DETECTADO", () => {
 
 // ── 7, 8 e 9. Determinismo e dinheiro ──────────────────────────────────────
 
-test("MUT-B15: Date.now() no domínio é DETECTADO", () => {
+test("MUT-B15: relógio implícito no lugar do Clock injetado é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/usecases/payments.ts",
-    "function ms(iso: string): number {\n  const t = Date.parse(iso);",
-    "function ms(iso: string): number {\n  const t = iso ? Date.parse(iso) : Date.now();",
+    "  const agora = env.clock.now();",
+    "  const agora = new Date().toISOString();",
     GUARDA
   );
   assert.equal(r.code, 1, `o relógio implícito passou:\n${r.out}`);
@@ -311,8 +317,8 @@ test("MUT-B18: cálculo monetário em ponto flutuante é DETECTADO", () => {
 test("MUT-B19: ler process.env dentro do caso de uso é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/usecases/access.ts",
-    "  const inicio = env.clock.now();\n  const fim = addDays(inicio, input.days);",
-    '  const inicio = process.env.AGORA ?? env.clock.now();\n  const fim = addDays(inicio, input.days);',
+    "  if (!input.billingEnabled) {",
+    '  if (process.env.BILLING_ENABLED !== "true") {',
     GUARDA
   );
   assert.equal(r.code, 1, `a leitura de ambiente passou:\n${r.out}`);
@@ -321,28 +327,30 @@ test("MUT-B19: ler process.env dentro do caso de uso é DETECTADO", () => {
 
 // ── 10 a 13. Snapshot, grandfathering, cortesia, auditoria ─────────────────
 
-test("MUT-B20: permitir UPDATE em price_snapshots é DETECTADO", () => {
+test("MUT-B20: devolver escrita direta ao service_role é DETECTADO", () => {
+  // A 12B fecha `billing` para todos os papéis do PostgREST: a porta é a RPC.
+  // Devolver o USAGE no schema reabriria o acesso direto — e, como o
+  // service_role tem BYPASSRLS, o filtro por organização escrito no cliente
+  // voltaria a ser a única barreira entre dois tenants.
   const r = mutar(
-    "scripts/ci/assert-billing-security.sql",
-    "       OR (a.privilege_type = 'UPDATE' AND c.relname NOT IN ('subscriptions', 'charges'))",
-    "       OR (a.privilege_type = 'UPDATE' AND c.relname NOT IN ('subscriptions', 'charges', 'price_snapshots'))",
+    "supabase/migrations/20260802093000_billing_orchestration.sql",
+    "REVOKE USAGE ON SCHEMA billing FROM service_role;",
+    "GRANT USAGE ON SCHEMA billing TO service_role;",
     GUARDA
   );
-  assert.equal(r.code, 1, `o snapshot mutável passou:\n${r.out}`);
+  assert.equal(r.code, 1, `o acesso direto restaurado passou:\n${r.out}`);
   assert.match(r.out, /BO-18/);
 });
 
 test("MUT-B21: grandfathering por usuário é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/usecases/access.ts",
-    "  const jaTem = await env.repo.findGrandfathering(env.auth.organizationId);",
-    "  const jaTem = await env.repo.findGrandfathering(env.auth.userId);",
+    "  const estado = await env.repo.readState(env.auth.userId, env.auth.organizationId);\n  if (!estado.ok) return estado;\n\n  if (estado.value.grandfathering !== null) {",
+    "  const estado = await env.repo.readState(env.auth.organizationId, env.auth.organizationId);\n  if (!estado.ok) return estado;\n\n  if (estado.value.grandfathering !== null) {",
     GUARDA
   );
   assert.equal(r.code, 1, `o grandfathering por usuário passou:\n${r.out}`);
-  // A guarda de 12A já proíbe `userId` na elegibilidade; aqui a detecção é a
-  // do alcance do domínio pela guarda de determinismo/tenant.
-  assert.match(r.out, /BO-0[16]/);
+  assert.match(r.out, /BO-21/);
 });
 
 test("MUT-B22: cortesia sem expiração é DETECTADA", () => {
@@ -351,7 +359,7 @@ test("MUT-B22: cortesia sem expiração é DETECTADA", () => {
   // vencida. Cortesia sem prazo é plano gratuito disfarçado.
   const r = mutar(
     "src/lib/billing/usecases/access.ts",
-    "  if (!Number.isInteger(input.days) || input.days <= 0) {",
+    "  if (!Number.isInteger(input.days) || input.days < 1) {",
     "  if (false) {",
     GUARDA
   );
@@ -362,9 +370,9 @@ ${r.out}`);
 
 test("MUT-B23b: cortesia sem autor do contexto é DETECTADA", () => {
   const r = mutar(
-    "src/lib/billing/usecases/access.ts",
-    "    grantedBy: env.auth.userId,",
-    '    grantedBy: "desconhecido",',
+    "src/lib/billing/repositories/in-memory.ts",
+    "      grantedBy: ctx.actorId,",
+    '      grantedBy: "desconhecido",',
     GUARDA
   );
   assert.equal(r.code, 1, `a cortesia sem autor passou:
@@ -372,26 +380,26 @@ ${r.out}`);
   assert.match(r.out, /BO-22/);
 });
 
-test("MUT-B23: auditoria sem ator do contexto é DETECTADA", () => {
+test("MUT-B23: auditoria com ator em origem não humana é DETECTADA", () => {
   const r = mutar(
-    "src/lib/billing/usecases/shared.ts",
-    '    actorId: env.origin === "owner" || env.origin === "admin" ? env.auth.userId : null,',
-    "    actorId: input.actorId ?? null,",
+    "src/lib/billing/repositories/in-memory.ts",
+    '      actorId: origin === "owner" || origin === "admin" ? actorId : null,',
+    "      actorId,",
     GUARDA
   );
-  assert.equal(r.code, 1, `o ator vindo do argumento passou:\n${r.out}`);
+  assert.equal(r.code, 1, `o ator sem filtro de origem passou:\n${r.out}`);
   assert.match(r.out, /BO-07/);
 });
 
-test("MUT-B24: falha de auditoria deixando a operação seguir é DETECTADA", () => {
+test("MUT-B24: marcar `failed` em erro ambíguo do provider é DETECTADO", () => {
   const r = mutar(
-    "src/lib/billing/usecases/shared.ts",
-    "  if (!r.ok) return r;\n  return ok(true);",
-    "  return ok(true);",
+    "src/lib/billing/usecases/payments.ts",
+    "  if (AMBIGUOS.has(code)) return;",
+    "  if (false) return;",
     GUARDA
   );
-  assert.equal(r.code, 1, `a escrita sem trilha passou:\n${r.out}`);
-  assert.match(r.out, /BO-07/);
+  assert.equal(r.code, 1, `marcar falha em erro ambíguo passou:\n${r.out}`);
+  assert.match(r.out, /BO-24/);
 });
 
 // ── 14, 15 e 16. Rede, alcance público e feature flag ──────────────────────
@@ -443,8 +451,8 @@ test("MUT-B28: repositório real deixando de ser server-only é DETECTADO", () =
 test("MUT-B29: propagar a mensagem do driver é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/repositories/supabase.ts",
-    "    code: erro.code ?? null,",
-    "    code: erro.message ?? null,",
+    "  const code = erro.code ?? null;",
+    "  const code = erro.message ?? null;",
     GUARDA
   );
   assert.equal(r.code, 1, `o vazamento da mensagem do driver passou:\n${r.out}`);
@@ -493,6 +501,119 @@ test("MUT-B33: tirar a 12B da rota de aplicação é DETECTADO", () => {
   );
   assert.equal(r.code, 1, `a lista divergente passou:\n${r.out}`);
   assert.match(r.out, /BO-16/);
+});
+
+// ─── A fronteira de `public`: allowlist, privilégio e search_path ───────────
+//
+// A 12B abre a única exceção à regra "nenhum objeto de billing em public".
+// As quatro mutações abaixo atacam essa fronteira pelos quatro lados por onde
+// ela pode ceder.
+
+test("MUT-B34: conceder EXECUTE a authenticated é DETECTADO", () => {
+  // As RPCs são SECURITY DEFINER e rodam como owner. Um EXECUTE para
+  // `authenticated` entregaria a qualquer usuário logado, pelo PostgREST, uma
+  // função que escreve em billing como dono do schema.
+  const r = mutar(
+    "supabase/migrations/20260802093000_billing_orchestration.sql",
+    "    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM authenticated', r.assinatura);\n    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role', r.assinatura);",
+    "    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO authenticated', r.assinatura);",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `EXECUTE para authenticated passou:\n${r.out}`);
+});
+
+test("MUT-B35: RPC sem search_path fixado é DETECTADA", () => {
+  // Sem `SET search_path = ''`, uma função SECURITY DEFINER resolve nomes pelo
+  // caminho de QUEM CHAMA. Quem chama pode criar um `billing` falso à frente e
+  // fazer a função escrever no lugar errado, com privilégio de dono.
+  const r = mutar(
+    "supabase/migrations/20260802093000_billing_orchestration.sql",
+    "CREATE OR REPLACE FUNCTION public.fn_billing_read_state(\n  p_actor_id uuid,\n  p_organization_id uuid\n) RETURNS jsonb\nLANGUAGE plpgsql\nSTABLE\nSECURITY DEFINER\nSET search_path = ''",
+    "CREATE OR REPLACE FUNCTION public.fn_billing_read_state(\n  p_actor_id uuid,\n  p_organization_id uuid\n) RETURNS jsonb\nLANGUAGE plpgsql\nSTABLE\nSECURITY DEFINER",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `RPC sem search_path passou:\n${r.out}`);
+  assert.match(r.out, /BO-14/);
+});
+
+test("MUT-B36: RPC extra fora da allowlist é DETECTADA", () => {
+  // Acrescentar função a `public` sem declará-la é exatamente o que a exceção
+  // nominal existe para impedir.
+  const r = mutar(
+    "supabase/migrations/20260802093000_billing_orchestration.sql",
+    "-- ─── 9.6 CORTESIA E DIREITO ADQUIRIDO ───────────────────────────────────────",
+    "CREATE OR REPLACE FUNCTION public.fn_billing_backdoor(p_x uuid)\nRETURNS jsonb LANGUAGE sql SECURITY DEFINER SET search_path = ''\nAS $bd$ SELECT '{}'::jsonb $bd$;\n\n-- ─── 9.6 CORTESIA E DIREITO ADQUIRIDO ───────────────────────────────────────",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `RPC não declarada passou:\n${r.out}`);
+  assert.match(r.out, /BO-14/);
+});
+
+test("MUT-B37: sobrecarga de RPC autorizada é DETECTADA", () => {
+  // `fn_billing_read_state(uuid, uuid, text)` seria outra função, com o mesmo
+  // nome — e o PostgREST escolhe entre as duas pelos parâmetros que o chamador
+  // mandar. Por isso a allowlist é por ASSINATURA, não por nome.
+  const r = mutar(
+    "supabase/migrations/20260802093000_billing_orchestration.sql",
+    "-- ─── 9.2 CICLO DE VIDA ──────────────────────────────────────────────────────",
+    "CREATE OR REPLACE FUNCTION public.fn_billing_read_state(p_a uuid, p_b uuid, p_c text)\nRETURNS jsonb LANGUAGE sql SECURITY DEFINER SET search_path = ''\nAS $ov$ SELECT '{}'::jsonb $ov$;\n\n-- ─── 9.2 CICLO DE VIDA ──────────────────────────────────────────────────────",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `sobrecarga passou:\n${r.out}`);
+  assert.match(r.out, /BO-14/);
+});
+
+test("MUT-B38: unicidade do evento externo voltando a ser por tenant é DETECTADA", () => {
+  // Com `organization_id` na chave, o mesmo identificador do mesmo provider
+  // pode existir em duas organizações — e a resolução do tenant pelo
+  // identificador externo deixa de ser única.
+  const r = mutar(
+    "supabase/migrations/20260802093000_billing_orchestration.sql",
+    "  CONSTRAINT charges_externo_unico\n    UNIQUE (provider, provider_account_id, external_charge_id),",
+    "  CONSTRAINT charges_externo_unico\n    UNIQUE (organization_id, provider, provider_account_id, external_charge_id),",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `unicidade por tenant passou:\n${r.out}`);
+  assert.match(r.out, /BO-15/);
+});
+
+test("MUT-B39: remover o fingerprint da idempotência é DETECTADO", () => {
+  // Sem fingerprint, a mesma chave com OUTRO pedido devolve o resultado do
+  // primeiro, e o segundo pedido some sem aviso.
+  const r = mutar(
+    "supabase/migrations/20260802093000_billing_orchestration.sql",
+    "  request_fingerprint text NOT NULL CHECK (btrim(request_fingerprint) <> ''),",
+    "  request_fingerprint text NULL,",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `idempotência sem fingerprint passou:\n${r.out}`);
+  assert.match(r.out, /BO-15/);
+});
+
+test("MUT-B40: remover o estado in_progress é DETECTADO", () => {
+  // Sem estado, o resultado volta a ser gravado ANTES do efeito, e uma falha no
+  // meio prende a chave com um resultado que nunca aconteceu.
+  const r = mutar(
+    "supabase/migrations/20260802093000_billing_orchestration.sql",
+    "  status              billing.idempotency_state NOT NULL DEFAULT 'in_progress',",
+    "",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `idempotência sem estado passou:\n${r.out}`);
+  assert.match(r.out, /BO-15/);
+});
+
+test("MUT-B41: transformar a corrida real em INSERT sequencial é DETECTADO", () => {
+  // Uma sessão não disputa nada consigo mesma. Sem a barreira, o teste volta a
+  // ser o que a revisão reprovou: prova de constraint, não de concorrência.
+  const r = mutar(
+    "scripts/ci/assert-billing-concurrency.sh",
+    "SELECT pg_advisory_xact_lock_shared(918273);",
+    "SELECT 1;",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `corrida sem barreira passou:\n${r.out}`);
+  assert.match(r.out, /BO-17/);
 });
 
 // ─── Limpeza ────────────────────────────────────────────────────────────────

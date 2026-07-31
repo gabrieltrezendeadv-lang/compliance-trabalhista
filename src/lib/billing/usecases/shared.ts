@@ -1,18 +1,31 @@
 /**
  * PEÇAS COMUNS DOS CASOS DE USO
  *
- * Autorização, auditoria e idempotência entram por aqui, uma vez, em vez de
- * serem reescritas em cada caso de uso. Repetir a checagem dezesseis vezes
- * significa dezesseis chances de esquecer uma.
+ * ── O QUE SUMIU DAQUI, E POR QUÊ ────────────────────────────────────────────
+ *
+ * A versão anterior tinha `auditar()`: os casos de uso gravavam a trilha numa
+ * chamada SEPARADA, depois do efeito. Eram duas requisições HTTP, logo duas
+ * transações — e "a cobrança foi criada mas a auditoria falhou" era um estado
+ * alcançável.
+ *
+ * Agora a auditoria acontece DENTRO da mesma RPC do efeito, na mesma
+ * transação. Não há mais o que orquestrar aqui, e por isso a função deixou de
+ * existir em vez de virar um invólucro.
+ *
+ * ── O QUE PERMANECE ─────────────────────────────────────────────────────────
+ *
+ * A autorização de fronteira: comparar o que o cliente pediu com o que o
+ * servidor resolveu, ANTES de tocar repositório ou provider. O banco revalida
+ * depois — as duas checagens são deliberadas, e nenhuma substitui a outra.
  */
 
 import { fail, ok, type Result } from "../core/errors";
-import type { BillingActionOrigin, BillingAuthContext, BillingDeps } from "../core/ports";
+import type { BillingAuthContext, BillingDeps } from "../core/ports";
 import type { BillingProviderPort } from "../core/provider";
 import type {
-  AuditSubject,
   BillingRepository,
-  IdempotencyScope,
+  ComandoContexto,
+  StoredSubscription,
 } from "../core/repository";
 
 /** Tudo o que um caso de uso recebe. Nada é buscado de variável global. */
@@ -20,25 +33,29 @@ export interface UseCaseEnv extends BillingDeps {
   readonly repo: BillingRepository;
   readonly provider: BillingProviderPort;
   readonly auth: BillingAuthContext;
-  readonly origin: BillingActionOrigin;
+  /** Conta do provider. Entra na identidade global do recurso externo. */
+  readonly providerAccountId: string;
   /** Liga todos os eventos de uma mesma operação. */
   readonly correlationId: string;
+}
+
+/** Campos que todo comando aceita do cliente. */
+export interface ComandoBase {
+  /**
+   * A organização que o CLIENTE afirma. Nunca autoriza — só é comparada com a
+   * que o servidor resolveu.
+   */
+  readonly requestedOrganizationId?: string;
 }
 
 /**
  * Confere que a organização pedida pelo cliente é a resolvida no servidor.
  *
- * ── POR QUE ISTO É UMA FUNÇÃO, E OBRIGATÓRIA ────────────────────────────────
- *
- * Todo comando recebe `requestedOrganizationId` — o valor que veio do
- * formulário, da rota ou do corpo da requisição. Ele NUNCA autoriza: só é
- * comparado com `auth.organizationId`, que o servidor resolveu a partir da
- * sessão.
- *
  * A recusa é `not_owner`, e não `not_found`, mesmo quando a organização não
  * existe. Distinguir os dois casos entregaria ao chamador a informação "esta
  * organização existe" — que é exatamente o que uma varredura de identificadores
- * procura.
+ * procura. O banco usa a MESMA mensagem, e o teste de contrato compara as duas
+ * para garantir que continue assim.
  */
 export function assertTenant<T>(
   auth: BillingAuthContext,
@@ -48,10 +65,7 @@ export function assertTenant<T>(
     return fail("not_owner", "somente o proprietário administra a assinatura");
   }
   if (requestedOrganizationId === undefined) return null;
-  if (
-    typeof requestedOrganizationId !== "string" ||
-    requestedOrganizationId.trim() === ""
-  ) {
+  if (typeof requestedOrganizationId !== "string" || requestedOrganizationId.trim() === "") {
     return fail("invalid_input", "organização inválida");
   }
   if (requestedOrganizationId !== auth.organizationId) {
@@ -60,85 +74,59 @@ export function assertTenant<T>(
   return null;
 }
 
-export interface AuditoriaInput {
-  readonly subject: AuditSubject;
-  readonly subscriptionId: string | null;
-  readonly previousValue: Record<string, unknown> | null;
-  readonly newValue: Record<string, unknown> | null;
-  readonly reason?: string | null;
-  readonly idempotencyKey?: string | null;
-}
-
-/**
- * Grava o evento de auditoria da operação.
- *
- * O ator vem do contexto — nunca do argumento. Um caso de uso não escolhe quem
- * assinou a ação: isso é propriedade da sessão, e permitir sobrescrever seria
- * abrir caminho para atribuir a mudança a outra pessoa.
- *
- * Falha de auditoria FALHA a operação. Uma escrita relevante sem trilha é pior
- * do que a escrita não ter acontecido: fica um estado sem explicação.
- */
-export async function auditar(
-  env: UseCaseEnv,
-  input: AuditoriaInput
-): Promise<Result<true>> {
-  const r = await env.repo.appendAuditEvent({
+/** Contexto de comando, montado a partir do que o servidor resolveu. */
+export function contexto(env: UseCaseEnv): ComandoContexto {
+  return {
+    actorId: env.auth.userId,
     organizationId: env.auth.organizationId,
-    subscriptionId: input.subscriptionId,
-    subject: input.subject,
-    actorId: env.origin === "owner" || env.origin === "admin" ? env.auth.userId : null,
-    origin: env.origin,
-    occurredAt: env.clock.now(),
-    previousValue: input.previousValue,
-    newValue: input.newValue,
-    reason: input.reason ?? null,
-    idempotencyKey: input.idempotencyKey ?? null,
     correlationId: env.correlationId,
-  });
-  if (!r.ok) return r;
-  return ok(true);
-}
-
-export interface IdempotenciaInput {
-  readonly scope: IdempotencyScope;
-  readonly key: string;
-  readonly result: Record<string, unknown>;
-}
-
-/**
- * Reserva a chave de idempotência.
- *
- * Devolve `{ novo: false, anterior }` quando a chave já existia — e o caso de
- * uso deve devolver o resultado anterior SEM repetir o efeito. É esta função,
- * apoiada num `UNIQUE` do banco, que faz a diferença entre "conferi antes de
- * escrever" (que perde para concorrência) e "só um consegue escrever".
- */
-export async function reservar(
-  env: UseCaseEnv,
-  input: IdempotenciaInput
-): Promise<Result<{ novo: boolean; anterior: Record<string, unknown> }>> {
-  const r = await env.repo.reserveIdempotency({
-    organizationId: env.auth.organizationId,
-    scope: input.scope,
-    provider: env.provider.name,
-    key: input.key,
-    result: input.result,
-    createdAt: env.clock.now(),
-  });
-  if (!r.ok) return r;
-  return ok({ novo: r.value.created, anterior: { ...r.value.record.result } });
+  };
 }
 
 /** Lê a assinatura da organização autorizada, ou falha de forma tipada. */
-export async function exigirAssinatura(env: UseCaseEnv) {
-  const r = await env.repo.findSubscription(env.auth.organizationId);
-  if (!r.ok) return r;
-  if (r.value === null) {
-    return fail<NonNullable<typeof r.value>>(
-      "not_found",
-      "nenhuma assinatura para esta organização"
-    );
+export async function exigirAssinatura(
+  env: UseCaseEnv
+): Promise<Result<StoredSubscription>> {
+  const estado = await env.repo.readState(env.auth.userId, env.auth.organizationId);
+  if (!estado.ok) return estado;
+  if (estado.value.subscription === null) {
+    return fail("not_found", "nenhuma assinatura para esta organização");
   }
-  return ok(r.value);
+  return ok(estado.value.subscription);
+}
+
+/**
+ * Fingerprint canônico do pedido.
+ *
+ * ── POR QUE ISTO EXISTE ─────────────────────────────────────────────────────
+ *
+ * A chave de idempotência sozinha diz "é a mesma tentativa". Ela NÃO diz "é o
+ * mesmo pedido". Sem fingerprint, mandar a mesma chave com outro valor devolve
+ * silenciosamente o resultado do primeiro, e o segundo pedido some.
+ *
+ * ── POR QUE É UM HASH, E NÃO O PEDIDO ───────────────────────────────────────
+ *
+ * O fingerprint é gravado no banco. Guardar o pedido inteiro colocaria dado de
+ * pagamento numa tabela que não precisa dele. O hash basta para comparar, e não
+ * reconstrói nada.
+ *
+ * A canonicalização ordena as chaves: `{a,b}` e `{b,a}` são o MESMO pedido, e
+ * precisam produzir o mesmo fingerprint — senão um reenvio com outra ordem de
+ * campos viraria conflito falso.
+ */
+export function fingerprintDe(campos: Readonly<Record<string, string | number>>): string {
+  const canonico = Object.keys(campos)
+    .sort()
+    .map((k) => `${k}=${String(campos[k])}`)
+    .join("&");
+
+  // FNV-1a de 32 bits, determinístico e sem dependência. Não é criptográfico e
+  // não precisa ser: aqui se compara igualdade de pedido, não se protege
+  // segredo.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < canonico.length; i += 1) {
+    h ^= canonico.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `fp_${h.toString(16).padStart(8, "0")}`;
 }

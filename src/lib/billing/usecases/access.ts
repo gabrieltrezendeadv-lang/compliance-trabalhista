@@ -1,110 +1,267 @@
 /**
  * CASOS DE USO DE ACESSO — o que a organização pode fazer agora, e por quê.
  *
- * Também as concessões administrativas: cortesia e direito adquirido.
+ * ── OS MOTIVOS SÃO DISCRIMINADOS, E ISSO É A REGRA CENTRAL ──────────────────
+ *
+ * "Sem assinatura", "resposta malformada" e "repositório indisponível" NÃO
+ * podem cair no mesmo caminho. A primeira é uma resposta legítima e conhecida;
+ * as outras duas são ausência de informação. Colapsá-las num único `null`
+ * levaria a camada de cima a tratar um banco fora do ar como "conta sem plano"
+ * — e a decidir acesso sobre um estado que ninguém leu.
+ *
+ * Por isso `AccessDecision` carrega um `reason` fechado, e por isso a falha de
+ * leitura sobe como erro em vez de virar decisão.
+ *
+ * ── FAIL-CLOSED ────────────────────────────────────────────────────────────
+ *
+ * Nenhum caminho deste arquivo produz acesso a partir de erro. Plano
+ * desconhecido, estado desconhecido e falha de leitura NEGAM.
  */
 
 import { fail, ok, type Result } from "../core/errors";
-import type { FeatureKey, PlanSlug } from "../plans/model";
-import { canWrite, planIncludes, storageQuotaMib } from "../plans/entitlements";
-import {
-  GRANDFATHERED_PLAN,
-  isEligibleForGrandfathering,
-  resolveEligibility,
-} from "../plans/eligibility";
-import { addDays } from "../plans/pricing";
 import type { StoredCourtesy } from "../core/repository";
-import { assertTenant, auditar, type UseCaseEnv } from "./shared";
-import type { ComandoBase } from "./subscription";
+import { isCourtesyActive } from "../plans/eligibility";
+import {
+  canWrite,
+  lockedFeatures,
+  planFeatures,
+  storageQuotaMib,
+} from "../plans/entitlements";
+import { resolveState } from "../plans/lifecycle";
+import type { FeatureKey, Grandfathering, PlanSlug } from "../plans/model";
+import {
+  assertTenant,
+  contexto,
+  type ComandoBase,
+  type UseCaseEnv,
+} from "./shared";
 
-// ─── 13. resolveBillingAccess ──────────────────────────────────────────────
+// ─── Decisão de acesso ─────────────────────────────────────────────────────
 
-export interface BillingAccess {
-  readonly source: "courtesy" | "grandfathered" | "subscription" | "trial" | "none";
+/** De onde vem o direito vigente. Fechado: não há "outro". */
+export type AccessSource = "courtesy" | "grandfathered" | "subscription" | "trial" | "none";
+
+/**
+ * Por que o acesso é o que é.
+ *
+ * Cada motivo corresponde a uma situação DISTINTA que a camada de cima precisa
+ * distinguir — inclusive para escolher a mensagem certa.
+ */
+export type AccessReason =
+  | "flag_desligada"
+  | "cortesia_vigente"
+  | "trial_em_curso"
+  | "assinatura_ativa"
+  | "tolerancia_de_pagamento"
+  | "direito_adquirido"
+  | "downgrade_agendado"
+  | "cancelamento_agendado"
+  | "modo_leitura_trial_vencido"
+  | "modo_leitura_inadimplencia"
+  | "modo_leitura_encerrada"
+  | "sem_assinatura"
+  | "plano_desconhecido"
+  | "estado_desconhecido";
+
+export interface AccessDecision {
+  readonly source: AccessSource;
   readonly plan: PlanSlug | null;
   readonly readOnly: boolean;
   readonly free: boolean;
   readonly features: readonly FeatureKey[];
+  /** Módulos do Completo visíveis SÓ em leitura após downgrade. */
+  readonly readOnlyFeatures: readonly FeatureKey[];
   readonly storageMib: number;
+  readonly reason: AccessReason;
+}
+
+const NEGADO: AccessDecision = {
+  source: "none",
+  plan: null,
+  readOnly: true,
+  free: false,
+  features: [],
+  readOnlyFeatures: [],
+  storageMib: 0,
+  reason: "sem_assinatura",
+};
+
+function negar(reason: AccessReason): AccessDecision {
+  return { ...NEGADO, reason };
 }
 
 /**
- * Direito de acesso vigente, com precedência cortesia → assinatura → direito
- * adquirido → nada.
+ * Direito de acesso vigente.
+ *
+ * Precedência: bandeira → cortesia → assinatura → direito adquirido → nada.
  *
  * O direito adquirido é o PISO: é por ele que a organização beneficiada que
- * fez upgrade e cancelou volta ao Essencial gratuito, em vez de cair em modo
- * leitura.
- *
- * Falha de leitura NÃO vira acesso. Devolve erro, e o chamador nega.
+ * fez upgrade e depois cancelou volta ao Essencial gratuito em vez de cair em
+ * modo leitura. O direito não se extingue por ter sido superado.
  */
 export async function resolveBillingAccess(
   env: UseCaseEnv,
-  input: ComandoBase = {}
-): Promise<Result<BillingAccess>> {
-  const negado = assertTenant<BillingAccess>(env.auth, input.requestedOrganizationId);
+  input: ComandoBase & { readonly billingEnabled: boolean }
+): Promise<Result<AccessDecision>> {
+  const negado = assertTenant<AccessDecision>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
-  const assinatura = await env.repo.findSubscription(env.auth.organizationId);
-  if (!assinatura.ok) return assinatura;
+  // Com a bandeira desligada, billing não governa nada — e é assim que a 12B
+  // permanece inalcançável para o usuário final.
+  if (!input.billingEnabled) {
+    return ok({
+      ...negar("flag_desligada"),
+      readOnly: false,
+      free: true,
+    });
+  }
 
-  const beneficio = await env.repo.findGrandfathering(env.auth.organizationId);
-  if (!beneficio.ok) return beneficio;
-
-  const cortesias = await env.repo.listCourtesies(env.auth.organizationId);
-  if (!cortesias.ok) return cortesias;
+  // Falha de leitura SOBE como erro. Não vira decisão, não vira `none`.
+  const estado = await env.repo.readState(env.auth.userId, env.auth.organizationId);
+  if (!estado.ok) return estado;
 
   const agora = env.clock.now();
-  // Cortesia revogada não conta. Entre as vigentes, a que termina mais tarde.
-  const vigentes = cortesias.value
-    .filter((c) => c.revokedAt === null)
-    .slice()
-    .sort((a, b) => a.endsAt.localeCompare(b.endsAt));
-  const cortesia = vigentes.at(-1) ?? null;
+  const { subscription, courtesies, grandfathering } = estado.value;
 
-  const elegibilidade = resolveEligibility({
-    organizationId: env.auth.organizationId,
-    subscription: assinatura.value,
-    grandfathering: beneficio.value,
-    courtesy: cortesia,
-    now: agora,
-  });
+  // 1. CORTESIA vigente e não revogada.
+  const cortesia = cortesiaVigente(courtesies, env.auth.organizationId, agora);
+  if (cortesia !== null) {
+    return ok(comPlano("courtesy", cortesia.plan, false, true, "cortesia_vigente", null));
+  }
 
-  const plano = elegibilidade.plan;
-  return ok({
-    source: elegibilidade.source,
-    plan: plano,
-    readOnly: !canWrite(elegibilidade.state),
-    free: elegibilidade.free,
-    features: plano ? listarRecursos(plano) : [],
-    storageMib: plano ? storageQuotaMib(plano) : 0,
-  });
+  // 2. ASSINATURA.
+  if (subscription !== null) {
+    const estadoVigente = resolveState(subscription, agora);
+    const plano = subscription.plan;
+
+    // Plano fora do conjunto conhecido NEGA. Um `default` que liberasse o
+    // Essencial transformaria dado corrompido em acesso.
+    if (plano !== "essencial" && plano !== "completo") {
+      return ok(negar("plano_desconhecido"));
+    }
+
+    const agendado = subscription.scheduledDowngrade;
+
+    switch (estadoVigente) {
+      case "trialing":
+        return ok(comPlano("trial", plano, false, true, "trial_em_curso", agendado?.plan ?? null));
+      case "active":
+        return ok(
+          comPlano(
+            "subscription",
+            plano,
+            false,
+            false,
+            agendado ? "downgrade_agendado" : "assinatura_ativa",
+            agendado?.plan ?? null
+          )
+        );
+      case "past_due_tolerance":
+        // Tolerância é ACESSO NORMAL por 7 dias — não é degradação.
+        return ok(
+          comPlano("subscription", plano, false, false, "tolerancia_de_pagamento", null)
+        );
+      case "cancel_scheduled":
+        return ok(
+          comPlano("subscription", plano, false, false, "cancelamento_agendado", null)
+        );
+      case "read_only":
+        return ok(
+          comPlano(
+            "subscription",
+            plano,
+            true,
+            false,
+            subscription.paymentFailedAt !== null
+              ? "modo_leitura_inadimplencia"
+              : "modo_leitura_trial_vencido",
+            null
+          )
+        );
+      case "terminated":
+        // 12 meses de leitura após o encerramento. Nada é apagado.
+        return ok(comPlano("subscription", plano, true, false, "modo_leitura_encerrada", null));
+      default:
+        // Estado fora do conjunto conhecido NEGA.
+        return ok(negar("estado_desconhecido"));
+    }
+  }
+
+  // 3. DIREITO ADQUIRIDO — o piso.
+  if (grandfathering !== null) {
+    return ok(comPlano("grandfathered", "essencial", false, true, "direito_adquirido", null));
+  }
+
+  // 4. Nada.
+  return ok(negar("sem_assinatura"));
 }
 
-/** Recursos do plano, na ordem do catálogo. */
-function listarRecursos(plan: PlanSlug): readonly FeatureKey[] {
-  const todos: FeatureKey[] = [
-    "establishments",
-    "departments",
-    "users",
-    "documents",
-    "evidence",
-    "action_plans",
-    "campaigns_manual",
-    "reports_basic",
-    "risks",
-    "complaints",
-    "campaigns_automatic",
-    "alerts",
-    "reports_advanced",
-    "history",
-    "seal_hash",
-    "priority_support",
-  ];
-  return todos.filter((f) => planIncludes(plan, f));
+/** Cortesia vigente da organização, ignorando as revogadas. */
+function cortesiaVigente(
+  cortesias: readonly StoredCourtesy[],
+  organizationId: string,
+  agora: string
+): StoredCourtesy | null {
+  for (const c of cortesias) {
+    if (c.revokedAt !== null) continue;
+    if (isCourtesyActive(organizationId, c, agora)) return c;
+  }
+  return null;
 }
 
-// ─── 14. resolveGrandfatheredAccess ────────────────────────────────────────
+/**
+ * Monta a decisão a partir do plano VIGENTE.
+ *
+ * ── DOWNGRADE AGENDADO NÃO É DOWNGRADE ──────────────────────────────────────
+ *
+ * Enquanto o downgrade está apenas AGENDADO, o plano vigente ainda é o
+ * Completo, e `lockedFeatures("completo")` é vazio: acesso integral até o fim
+ * do período já pago. Nada é reduzido por antecipação — o ciclo foi comprado.
+ *
+ * Depois que a renovação EFETIVA o downgrade, o plano vigente passa a ser o
+ * Essencial, e `lockedFeatures("essencial")` são os módulos exclusivos do
+ * Completo. Eles entram em `readOnlyFeatures`: os dados continuam VISÍVEIS,
+ * mas nenhum registro novo é aceito. Apagá-los seria destruir dado do cliente
+ * por mudança de plano, e o modelo aprovado é explícito em que nada desaparece.
+ *
+ * O parâmetro `downgradeAlvo` serve só ao motivo relatado; ele NÃO reduz
+ * acesso.
+ */
+function comPlano(
+  source: AccessSource,
+  plan: PlanSlug,
+  readOnly: boolean,
+  free: boolean,
+  reason: AccessReason,
+  _downgradeAlvo: PlanSlug | null
+): AccessDecision {
+  return {
+    source,
+    plan,
+    readOnly,
+    free,
+    // Em modo leitura os módulos continuam listados: o acesso existe, a
+    // escrita é que não. `canWrite` é a fonte dessa distinção.
+    features: planFeatures(plan),
+    readOnlyFeatures: readOnly ? planFeatures(plan) : lockedFeatures(plan),
+    storageMib: storageQuotaMib(plan),
+    reason,
+  };
+}
+
+/** Conveniência para a camada de cima: pode escrever agora? */
+export function podeEscrever(decisao: AccessDecision): boolean {
+  return !decisao.readOnly;
+}
+
+/** Módulo exclusivo do Completo disponível para ESCRITA? */
+export function podeUsarModulo(decisao: AccessDecision, feature: FeatureKey): boolean {
+  if (decisao.readOnly) return false;
+  if (decisao.readOnlyFeatures.includes(feature)) return false;
+  return decisao.features.includes(feature);
+}
+
+// ─── Direito adquirido ─────────────────────────────────────────────────────
 
 export interface GrandfatheredDecision {
   readonly eligible: boolean;
@@ -118,7 +275,7 @@ export interface GrandfatheredDecision {
  * Sem data de corte registrada, NINGUÉM é elegível — o padrão nega, porque
  * conceder gratuidade permanente indevida é irreversível na prática.
  *
- * O benefício é da ORGANIZAÇÃO. Esta função não recebe `userId`, e é
+ * O benefício é da ORGANIZAÇÃO. Esta função não usa `userId` para decidir, e é
  * deliberado: não há como vinculá-lo ao usuário por engano.
  */
 export async function resolveGrandfatheredAccess(
@@ -128,46 +285,52 @@ export async function resolveGrandfatheredAccess(
   const negado = assertTenant<GrandfatheredDecision>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
-  const jaTem = await env.repo.findGrandfathering(env.auth.organizationId);
-  if (!jaTem.ok) return jaTem;
-  if (jaTem.value !== null) {
-    return ok({ eligible: true, plan: GRANDFATHERED_PLAN, reason: "ja_registrado" });
+  const estado = await env.repo.readState(env.auth.userId, env.auth.organizationId);
+  if (!estado.ok) return estado;
+
+  if (estado.value.grandfathering !== null) {
+    return ok({ eligible: true, plan: "essencial", reason: "ja_registrado" });
   }
 
-  const corte = await env.repo.findGrandfatheringCutoff();
-  if (!corte.ok) return corte;
-  if (corte.value === null) {
+  const corte = estado.value.grandfatheringCutoff;
+  if (corte === null) {
     return ok({ eligible: false, plan: null, reason: "sem_corte" });
   }
-
-  if (!isEligibleForGrandfathering(input.organizationCreatedAt, corte.value)) {
+  if (Date.parse(input.organizationCreatedAt) >= Date.parse(corte)) {
     return ok({ eligible: false, plan: null, reason: "posterior_ao_corte" });
   }
 
-  const salvo = await env.repo.saveGrandfathering({
-    organizationId: env.auth.organizationId,
-    cutoffAt: corte.value,
-    grantedAt: env.clock.now(),
-  });
-  if (!salvo.ok) return salvo;
-
-  const trilha = await auditar(env, {
-    subject: "grandfathering",
-    subscriptionId: null,
-    previousValue: null,
-    newValue: {
-      plan: GRANDFATHERED_PLAN,
-      cutoffAt: corte.value,
-      organizationCreatedAt: input.organizationCreatedAt,
-    },
-    reason: "organização existente na data de corte",
-  });
-  if (!trilha.ok) return trilha;
-
-  return ok({ eligible: true, plan: GRANDFATHERED_PLAN, reason: "elegivel" });
+  return ok({ eligible: true, plan: "essencial", reason: "elegivel" });
 }
 
-// ─── 15. grantCourtesy ─────────────────────────────────────────────────────
+/** Registra o direito adquirido. Idempotente: repetir devolve o mesmo. */
+export async function saveGrandfathering(
+  env: UseCaseEnv,
+  input: ComandoBase & { readonly cutoffAt: string }
+): Promise<Result<Grandfathering>> {
+  const negado = assertTenant<Grandfathering>(env.auth, input.requestedOrganizationId);
+  if (negado) return negado;
+
+  const gravado = await env.repo.saveGrandfathering(
+    contexto(env),
+    input.cutoffAt,
+    env.clock.now()
+  );
+  if (!gravado.ok) return gravado;
+
+  if (gravado.value.kind === "already_granted") {
+    const estado = await env.repo.readState(env.auth.userId, env.auth.organizationId);
+    if (!estado.ok) return estado;
+    if (estado.value.grandfathering === null) {
+      return fail("conflict", "direito adquirido registrado e ausente na leitura");
+    }
+    return ok(estado.value.grandfathering);
+  }
+
+  return ok(gravado.value.record);
+}
+
+// ─── Cortesia ──────────────────────────────────────────────────────────────
 
 export interface GrantCourtesyInput extends ComandoBase {
   readonly plan: PlanSlug;
@@ -176,11 +339,10 @@ export interface GrantCourtesyInput extends ComandoBase {
 }
 
 /**
- * Concede cortesia administrativa.
+ * Concede cortesia por prazo determinado.
  *
- * Prazo, motivo e autor são obrigatórios — cortesia sem prazo é plano gratuito
- * disfarçado, e cortesia sem autor é concessão que ninguém assinou. O autor vem
- * do contexto, nunca do argumento.
+ * Prazo é OBRIGATÓRIO e positivo: cortesia sem prazo é plano gratuito
+ * disfarçado, e nunca aparece num relatório de receita.
  */
 export async function grantCourtesy(
   env: UseCaseEnv,
@@ -189,49 +351,18 @@ export async function grantCourtesy(
   const negado = assertTenant<StoredCourtesy>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
-  if (!Number.isInteger(input.days) || input.days <= 0) {
-    return fail("invalid_input", "cortesia exige prazo em dias inteiros positivos");
+  if (!Number.isInteger(input.days) || input.days < 1) {
+    return fail("invalid_input", "cortesia exige prazo em dias inteiro e positivo");
   }
   if (input.reason.trim() === "") {
     return fail("invalid_input", "cortesia exige motivo");
   }
 
-  // `addDays` da 12A, e não aritmética solta aqui: a soma de dias já é uma
-  // função testada, e duplicá-la abriria espaço para as duas divergirem.
   const inicio = env.clock.now();
-  const fim = addDays(inicio, input.days);
+  const fim = new Date(Date.parse(inicio) + input.days * 86_400_000).toISOString();
 
-  const salva = await env.repo.saveCourtesy({
-    organizationId: env.auth.organizationId,
-    plan: input.plan,
-    startsAt: inicio,
-    endsAt: fim,
-    reason: input.reason,
-    // O autor vem do CONTEXTO. Aceitá-lo por argumento permitiria atribuir a
-    // concessão a outra pessoa.
-    grantedBy: env.auth.userId,
-  });
-  if (!salva.ok) return salva;
-
-  const trilha = await auditar(env, {
-    subject: "courtesy",
-    subscriptionId: null,
-    previousValue: null,
-    newValue: {
-      courtesyId: salva.value.id,
-      plan: salva.value.plan,
-      startsAt: salva.value.startsAt,
-      endsAt: salva.value.endsAt,
-      grantedBy: salva.value.grantedBy,
-    },
-    reason: salva.value.reason,
-  });
-  if (!trilha.ok) return trilha;
-
-  return ok(salva.value);
+  return env.repo.grantCourtesy(contexto(env), input.plan, inicio, fim, input.reason);
 }
-
-// ─── 16. revokeCourtesy ────────────────────────────────────────────────────
 
 export interface RevokeCourtesyInput extends ComandoBase {
   readonly courtesyId: string;
@@ -239,17 +370,14 @@ export interface RevokeCourtesyInput extends ComandoBase {
 }
 
 /**
- * Revoga uma cortesia.
- *
- * A revogação é um registro NOVO, append-only: a cortesia original permanece,
- * com quem a concedeu e por quê. Apagar a concessão apagaria a prova de que
- * ela existiu — e a auditoria de cortesias é justamente o ponto.
+ * Revoga cortesia. APPEND-ONLY: a concessão original permanece, com autor e
+ * motivo — apagá-la apagaria a prova de que existiu.
  */
 export async function revokeCourtesy(
   env: UseCaseEnv,
   input: RevokeCourtesyInput
-): Promise<Result<{ courtesyId: string; revokedAt: string }>> {
-  const negado = assertTenant<{ courtesyId: string; revokedAt: string }>(
+): Promise<Result<{ readonly revoked: boolean }>> {
+  const negado = assertTenant<{ readonly revoked: boolean }>(
     env.auth,
     input.requestedOrganizationId
   );
@@ -259,24 +387,17 @@ export async function revokeCourtesy(
     return fail("invalid_input", "revogação exige motivo");
   }
 
-  const agora = env.clock.now();
-  const r = await env.repo.revokeCourtesy({
-    courtesyId: input.courtesyId,
-    organizationId: env.auth.organizationId,
-    revokedAt: agora,
-    revokedBy: env.auth.userId,
-    reason: input.reason,
-  });
+  const r = await env.repo.revokeCourtesy(
+    contexto(env),
+    input.courtesyId,
+    env.clock.now(),
+    input.reason
+  );
   if (!r.ok) return r;
 
-  const trilha = await auditar(env, {
-    subject: "courtesy",
-    subscriptionId: null,
-    previousValue: { courtesyId: input.courtesyId, revokedAt: null },
-    newValue: { courtesyId: input.courtesyId, revokedAt: agora, revokedBy: env.auth.userId },
-    reason: input.reason,
-  });
-  if (!trilha.ok) return trilha;
-
-  return ok({ courtesyId: input.courtesyId, revokedAt: agora });
+  // Repetir a revogação não é erro: o estado desejado já vale.
+  return ok({ revoked: r.value.kind === "revoked" });
 }
+
+/** Reexportado para a camada de cima decidir escrita sem reimplementar. */
+export { canWrite };
