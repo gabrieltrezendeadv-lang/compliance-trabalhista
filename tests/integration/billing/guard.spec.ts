@@ -176,6 +176,75 @@ describe("feature flag ligada — fail-closed", () => {
   });
 });
 
+describe("nenhuma falha vira autorização por acidente", () => {
+  // A lista do item 3 da revisão, uma a uma. O que se prova aqui é que TODAS
+  // convergem para negação — e nenhuma delas escapa como exceção não tratada.
+
+  it("exceção ao criar o cliente NEGA", async () => {
+    ligarBilling();
+    vi.mocked(createClient).mockRejectedValue(new Error("boom"));
+    const r = await enforceFeature("risks");
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toBe("verification_failed");
+  });
+
+  it("timeout NEGA", async () => {
+    ligarBilling();
+    vi.mocked(createClient).mockRejectedValue(
+      Object.assign(new Error("connect ETIMEDOUT"), { code: "ETIMEDOUT" })
+    );
+    const r = await enforceWriteAccess();
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toBe("verification_failed");
+  });
+
+  it("erro de leitura da membership NEGA", async () => {
+    ligarBilling();
+    install(ownerA, {
+      from: {
+        organization_members: {
+          data: null,
+          error: { message: "could not read", code: "57014" },
+        },
+      },
+    });
+    const r = await enforceFeature("documents");
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toBe("verification_failed");
+  });
+
+  it("resposta malformada NEGA — e não é confundida com ausência de organização", async () => {
+    ligarBilling();
+    install(ownerA, {
+      from: {
+        organization_members: { data: { tenant_id: null }, error: null },
+      },
+    });
+    const r = await enforceFeature("documents");
+    expect(r.allowed).toBe(false);
+    // "veio algo que não dá para usar" é diferente de "não há organização".
+    expect(r.reason).toBe("verification_failed");
+  });
+
+  it("entitlement desconhecido NEGA", async () => {
+    ligarBilling();
+    install(ownerA);
+    const r = await enforceFeature("recurso_que_nao_existe" as never);
+    expect(r.allowed).toBe(false);
+    expect(r.bypass).toBeUndefined();
+  });
+
+  it("com a flag DESLIGADA, nem a exceção muda o resultado — o desvio é anterior", async () => {
+    // O desvio da flag acontece antes de qualquer I/O, então não há como uma
+    // falha de infraestrutura alterar o comportamento atual da aplicação.
+    vi.mocked(createClient).mockRejectedValue(new Error("boom"));
+    const r = await enforceFeature("risks");
+    expect(r.allowed).toBe(true);
+    expect(r.reason).toBe("billing_disabled");
+    expect(r.bypass).toBe(true);
+  });
+});
+
 describe("SEC-002 continua valendo", () => {
   it("o guard NÃO chama check_plan_limit", async () => {
     // A função está com EXECUTE revogado de todos os papéis. Chamá-la só

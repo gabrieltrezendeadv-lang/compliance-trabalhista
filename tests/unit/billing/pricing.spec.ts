@@ -61,9 +61,23 @@ describe("seleção de faixa", () => {
   });
 
   it("recusa entrada inválida em vez de escolher uma faixa qualquer", () => {
+    // Escolher uma faixa "por perto" para entrada inválida cobraria o valor
+    // errado em silêncio. Recusar é a única saída honesta.
     expect(() => selectTier(0)).toThrow(/ao menos 1/);
     expect(() => selectTier(-3)).toThrow(/ao menos 1/);
     expect(() => selectTier(12.5)).toThrow(/inteiro/);
+    expect(() => selectTier(20.0001)).toThrow(/inteiro/);
+    expect(() => selectTier(null as unknown as number)).toThrow(/inteiro/);
+    expect(() => selectTier(undefined as unknown as number)).toThrow(/inteiro/);
+    expect(() => selectTier(NaN)).toThrow(/inteiro/);
+    expect(() => selectTier(Infinity)).toThrow(/inteiro/);
+    expect(() => selectTier(-Infinity)).toThrow(/inteiro/);
+    expect(() => selectTier("30" as unknown as number)).toThrow(/inteiro/);
+  });
+
+  it("valores excessivos caem em Enterprise, sem estourar", () => {
+    expect(selectTier(1_000_000)).toBe("enterprise");
+    expect(selectTier(Number.MAX_SAFE_INTEGER)).toBe("enterprise");
   });
 
   it("as faixas cobrem 1..∞ sem lacuna e sem sobreposição", () => {

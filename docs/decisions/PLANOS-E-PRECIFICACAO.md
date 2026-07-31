@@ -152,6 +152,29 @@ schema ao PostgREST ou criar funções `SECURITY DEFINER` em `public` como facha
 Registrado aqui para que a escolha seja consciente, e não descoberta no meio da
 implementação da interface.
 
+### 8.1.1 `FORCE ROW LEVEL SECURITY`: ausência deliberada
+
+RLS é habilitada em todas as tabelas, com **zero policies** — que no PostgreSQL
+é negação total. `FORCE` **não** é usado, e a decisão é explícita.
+
+`FORCE` faz a RLS valer também para o **dono** da tabela. Aqui isso quebraria
+dois consumidores legítimos que se conectam como dono: o verificador
+independente da rota de aplicação (`scripts/ci/verify-applied/20260801120000.sql`),
+que lê `billing.price_catalog` e `billing.tiers` para conferir o efeito da
+migration — com `FORCE` leria vazio e reprovaria uma aplicação correta —, e a
+própria rota de migrations, que conecta com o usuário `postgres`.
+
+O que `FORCE` acrescentaria seria proteção contra acesso em contexto de dono, e
+nenhum caminho da aplicação usa esse contexto: o cliente PostgREST não alcança o
+schema, e o servidor usará `service_role`.
+
+A ausência de `FORCE` só é aceitável porque **`service_role` tem `BYPASSRLS`** —
+é isso que torna "RLS ligada + zero policies" utilizável pelo servidor na Etapa
+12B sem que nenhuma policy precise existir, e portanto sem nenhuma brecha para
+`anon` ou `authenticated`. A migration **aborta** se essa premissa não valer no
+banco onde for aplicada (pós-condição 12.8c), e a asserção do CI verifica as
+duas condições juntas, porque só juntas fazem sentido.
+
 ### 8.2 Planos antigos: desativados, não removidos
 
 `public.subscription_plans` (Starter / Professional / Enterprise, R$ 199 / 499 /
@@ -160,7 +183,19 @@ migration os marca `is_active = false`.
 
 Não são removidos: `public.tenant_subscriptions.plan_id` os referencia, e a
 regra do repositório é forward-only não destrutivo. Desativar preserva toda
-referência existente e é reversível pelo rollback.
+referência existente.
+
+**O estado anterior é capturado antes da desativação**, linha a linha, em
+`billing.legacy_plan_state`. `is_active` é `boolean DEFAULT true` e **não** é
+`NOT NULL`: os valores possíveis são `true`, `false` e `NULL`. Um rollback que
+fizesse `SET is_active = true` para os slugs conhecidos estaria errado em dois
+casos reais — plano que já estivesse desativado antes da migration voltaria
+ativo, e plano com `NULL` viraria `true`. O banco terminaria num estado que
+nunca existiu, e o defeito seria invisível.
+
+Por isso o rollback restaura a partir da captura (`billing.fn_restore_legacy_plans()`),
+e não de uma suposição. O comportamento é exercido contra PostgreSQL real,
+incluindo os dois cenários que a versão ingênua errava.
 
 ### 8.3 Fim do fail-open
 
@@ -188,6 +223,35 @@ nenhum `GRANT` é reconcedido.
 Somente `organization_members.role = 'owner'` administra billing. A verificação é
 server-side (`src/lib/billing/authorization.ts`) **e** estrutural (o schema é
 inalcançável pelo cliente). A interface nunca é o único controle.
+
+O papel é **conferido no objeto devolvido**, além de filtrado na consulta. Não é
+redundância: um filtro que deixasse de ser aplicado — por refatoração, por RLS
+ausente — passaria despercebido se a decisão dependesse só dele.
+
+**O identificador de organização vindo do cliente nunca autoriza.** A Etapa 12B
+receberá `organizationId` de formulário, de rota ou de corpo de requisição, e
+esse é o formato clássico do IDOR: o servidor confirma "é owner de alguma
+coisa" e depois opera sobre o identificador que o cliente mandou. Por isso
+`requireBillingOwnerFor()` já é entregue nesta etapa: ela resolve a organização
+no servidor e **compara**; divergência é recusa, com `not_owner` tanto para
+organização alheia quanto para inexistente — uma mensagem distinta viraria
+oráculo de enumeração.
+
+### 8.4.1 Fail-closed também para exceção e timeout
+
+Toda entrada de verificação está dentro de `try`, e **todo `catch` nega**.
+
+Sem isso, uma exceção — `createClient` falhando, `fetch` estourando por timeout,
+resposta malformada quebrando a desestruturação — sairia por cima da decisão. O
+chamador típico é `if (!guard.allowed) return { error }`, que nunca roda quando
+a promessa rejeita: a operação aborta com erro não tratado. Abortar não
+autoriza, então já era fail-closed — mas fail-closed **por acidente**, dependendo
+de como cada chamador reage. Agora a exceção vira negação explícita, com motivo
+nomeado, que todo chamador trata igual.
+
+Resposta malformada (linha sem `tenant_id` utilizável) é `verification_failed`,
+e não `no_organization`: "não consigo confiar no que recebi" é um estado
+diferente de "não há organização".
 
 ### 8.5 Versionamento de preço
 

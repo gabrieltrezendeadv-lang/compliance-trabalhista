@@ -48,7 +48,7 @@ BEGIN
     FROM unnest(ARRAY[
       'tiers', 'price_catalog', 'subscriptions', 'price_snapshots',
       'grandfathering_cutoff', 'grandfathered_organizations',
-      'courtesies', 'audit_events'
+      'courtesies', 'audit_events', 'legacy_plan_state'
     ]) AS t(esperada)
    WHERE to_regclass('billing.' || quote_ident(t.esperada)) IS NULL;
 
@@ -59,8 +59,8 @@ BEGIN
   SELECT count(*) INTO v_tabelas
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 'billing' AND c.relkind = 'r';
-  IF v_tabelas <> 8 THEN
-    RAISE EXCEPTION 'VERIF 20260801120000: billing tem % tabela(s), esperadas 8', v_tabelas;
+  IF v_tabelas <> 9 THEN
+    RAISE EXCEPTION 'VERIF 20260801120000: billing tem % tabela(s), esperadas 9', v_tabelas;
   END IF;
 
   SELECT count(*) INTO v_sem_rls
@@ -81,9 +81,55 @@ BEGIN
       v_policies;
   END IF;
 
-  RAISE NOTICE 'VERIF 20260801120000 OK: 8 tabelas, RLS em todas, 0 policies';
+  RAISE NOTICE 'VERIF 20260801120000 OK: 9 tabelas, RLS em todas, 0 policies';
 END
 $estrutura$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 1b. `search_path` fixado, FORCE ausente por decisão, service_role com BYPASSRLS
+-- ─────────────────────────────────────────────────────────────────────────────
+--
+-- As três condições formam um conjunto: RLS ligada com zero policies só é
+-- utilizável porque `service_role` contorna RLS, e FORCE está ausente porque
+-- este próprio verificador lê as tabelas conectado como dono.
+
+DO $configuracao$
+DECLARE
+  v_lista text;
+  v_int   integer;
+BEGIN
+  SELECT string_agg(p.oid::regprocedure::text, ', ')
+    INTO v_lista
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'billing'
+     AND NOT EXISTS (
+       SELECT 1 FROM unnest(COALESCE(p.proconfig, ARRAY[]::text[])) cfg
+        WHERE cfg LIKE 'search\_path=%'
+     );
+  IF v_lista IS NOT NULL THEN
+    RAISE EXCEPTION
+      'VERIF 20260801120000: rotina(s) de billing sem search_path fixado: %', v_lista;
+  END IF;
+
+  SELECT count(*) INTO v_int
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'billing' AND c.relkind = 'r' AND c.relforcerowsecurity;
+  IF v_int <> 0 THEN
+    RAISE EXCEPTION
+      'VERIF 20260801120000: % tabela(s) com FORCE RLS — a decisão da 12A é não usar FORCE',
+      v_int;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname = 'service_role' AND rolbypassrls
+  ) THEN
+    RAISE EXCEPTION
+      'VERIF 20260801120000: service_role sem BYPASSRLS — a fundação ficaria inacessível ao servidor';
+  END IF;
+
+  RAISE NOTICE 'VERIF 20260801120000 OK: search_path fixado, sem FORCE, service_role contorna RLS';
+END
+$configuracao$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. anon e authenticated não alcançam nada — perguntado ao próprio PostgreSQL
@@ -273,7 +319,21 @@ BEGIN
       'VERIF 20260801120000: % plano(s) antigo(s) continuam ativos', v_int;
   END IF;
 
-  RAISE NOTICE 'VERIF 20260801120000 OK: faixas conferem, corte não fixado, planos antigos inativos';
+  -- Sem uma linha de estado anterior por plano, o rollback teria de presumir o
+  -- valor de is_active — e presumir `true` estaria errado para plano que já era
+  -- inativo e para plano com valor nulo.
+  SELECT count(*) INTO v_int
+    FROM public.subscription_plans p
+   WHERE NOT EXISTS (
+     SELECT 1 FROM billing.legacy_plan_state s WHERE s.plan_id = p.id
+   );
+  IF v_int <> 0 THEN
+    RAISE EXCEPTION
+      'VERIF 20260801120000: % plano(s) sem estado anterior capturado — o rollback '
+      'não teria como restaurar o valor real', v_int;
+  END IF;
+
+  RAISE NOTICE 'VERIF 20260801120000 OK: faixas conferem, corte não fixado, planos inativos com estado capturado';
 END
 $estado$;
 
@@ -297,18 +357,21 @@ BEGIN
      AND c.relname IN (
        'tiers', 'price_catalog', 'subscriptions', 'price_snapshots',
        'grandfathering_cutoff', 'grandfathered_organizations',
-       'courtesies', 'audit_events'
+       'courtesies', 'audit_events', 'legacy_plan_state'
      );
   IF v_int <> 0 THEN
     RAISE EXCEPTION
       'VERIF 20260801120000: objeto da fundação criado em public: %', v_lista;
   END IF;
 
-  SELECT count(*) INTO v_int
+  SELECT count(*), string_agg(p.proname, ', ')
+    INTO v_int, v_lista
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-   WHERE n.nspname = 'public' AND p.proname = 'fn_reject_mutation';
+   WHERE n.nspname = 'public'
+     AND p.proname IN ('fn_reject_mutation', 'fn_restore_legacy_plans');
   IF v_int <> 0 THEN
-    RAISE EXCEPTION 'VERIF 20260801120000: fn_reject_mutation foi criada em public';
+    RAISE EXCEPTION
+      'VERIF 20260801120000: rotina da fundação criada em public: %', v_lista;
   END IF;
 
   RAISE NOTICE 'VERIF 20260801120000 OK: nenhum objeto da fundação em public';

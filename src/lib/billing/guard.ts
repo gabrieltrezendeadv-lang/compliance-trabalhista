@@ -105,30 +105,52 @@ type ContextResult =
  * trecho final.
  */
 async function loadBillingContext(): Promise<ContextResult> {
-  const supabase = await createClient();
+  // A REDE, e ela fecha para o lado seguro.
+  //
+  // Sem este `try`, uma exceção — `createClient` falhando, `fetch` estourando
+  // por timeout, resposta malformada quebrando a desestruturação — sairia por
+  // cima de todas as decisões abaixo. O chamador típico é
+  // `if (!guard.allowed) return { error }`, que nunca roda quando a promessa
+  // rejeita: a operação aborta com erro não tratado.
+  //
+  // Abortar não autoriza, então isso já era fail-closed. Mas era fail-closed
+  // POR ACIDENTE, dependendo de como cada chamador reage. Aqui a exceção vira
+  // uma NEGAÇÃO explícita, com motivo nomeado, que todo chamador trata igual.
+  try {
+    const supabase = await createClient();
 
-  const { data: auth, error: authError } = await supabase.auth.getUser();
-  if (authError) return { ok: false, reason: "verification_failed" };
+    const { data: auth, error: authError } = await supabase.auth.getUser();
+    if (authError) return { ok: false, reason: "verification_failed" };
 
-  const user = auth?.user;
-  if (!user) return { ok: false, reason: "not_authenticated" };
+    const user = auth?.user;
+    if (!user) return { ok: false, reason: "not_authenticated" };
 
-  const { data: membership, error } = await supabase
-    .from("organization_members")
-    .select("tenant_id")
-    .eq("user_id", user.id)
-    .is("deleted_at", null)
-    .order("created_at", { ascending: true })
-    .order("id", { ascending: true })
-    .limit(1)
-    .maybeSingle();
+    const { data: membership, error } = await supabase
+      .from("organization_members")
+      .select("tenant_id")
+      .eq("user_id", user.id)
+      .is("deleted_at", null)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true })
+      .limit(1)
+      .maybeSingle();
 
-  if (error) return { ok: false, reason: "verification_failed" };
-  if (!membership) return { ok: false, reason: "no_organization" };
+    if (error) return { ok: false, reason: "verification_failed" };
+    if (!membership) return { ok: false, reason: "no_organization" };
+    // Resposta malformada: veio linha, mas sem o tenant. Não é "sem
+    // organização" — é "não consigo confiar no que recebi".
+    if (typeof membership.tenant_id !== "string" || membership.tenant_id === "") {
+      return { ok: false, reason: "verification_failed" };
+    }
 
-  // A assinatura vive em `billing`, inalcançável pelo cliente PostgREST. Sem
-  // fachada não há verificação possível — e "não consigo verificar" NEGA.
-  return { ok: false, reason: "verification_failed" };
+    // A assinatura vive em `billing`, inalcançável pelo cliente PostgREST. Sem
+    // fachada não há verificação possível — e "não consigo verificar" NEGA.
+    return { ok: false, reason: "verification_failed" };
+  } catch {
+    // Único `catch` do arquivo, e ele NEGA. Um `catch` que permitisse seria
+    // exatamente o defeito que este PR remove.
+    return { ok: false, reason: "verification_failed" };
+  }
 }
 
 // ─── API ───────────────────────────────────────────────────────────────────
@@ -147,9 +169,18 @@ export async function enforceFeature(
   const ctx = await loadBillingContext();
   if (!ctx.ok) return negar(ctx.reason);
 
-  if (!planIncludes(ctx.context.plan, feature)) {
-    return negar("feature_not_in_plan");
+  try {
+    // `planIncludes` LANÇA para plano desconhecido, de propósito: um plano fora
+    // do catálogo é dado corrompido, não um caso a tratar. Aqui isso vira
+    // negação — plano desconhecido não libera recurso nenhum.
+    if (!planIncludes(ctx.context.plan, feature)) {
+      return negar("feature_not_in_plan");
+    }
+  } catch {
+    return negar("verification_failed");
   }
+
+  // Estado desconhecido cai fora da lista de permissão e vira somente leitura.
   if (!canWrite(ctx.context.state)) return negar("read_only");
 
   return { allowed: true, reason: "ok" };

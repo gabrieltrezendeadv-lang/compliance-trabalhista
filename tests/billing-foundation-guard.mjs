@@ -42,7 +42,7 @@ const VERIFICADOR = `scripts/ci/verify-applied/${VERSAO}.sql`;
 const ASSERCAO = "scripts/ci/assert-billing-security.sql";
 const DECISAO = "docs/decisions/PLANOS-E-PRECIFICACAO.md";
 
-/** As oito tabelas da fundação. */
+/** As nove tabelas da fundação. */
 const TABELAS = [
   "tiers",
   "price_catalog",
@@ -52,6 +52,16 @@ const TABELAS = [
   "grandfathered_organizations",
   "courtesies",
   "audit_events",
+  "legacy_plan_state",
+];
+
+/** Módulos que precisam ser puros: sem I/O, sem ambiente e sem relógio. */
+const MODULOS_PUROS = [
+  "src/lib/billing/plans/catalog.ts",
+  "src/lib/billing/plans/pricing.ts",
+  "src/lib/billing/plans/entitlements.ts",
+  "src/lib/billing/plans/lifecycle.ts",
+  "src/lib/billing/plans/eligibility.ts",
 ];
 
 /**
@@ -258,8 +268,10 @@ test("BF-07: o rollback existe, remove o schema e reativa os planos antigos", ()
   assert.ok(existe(ROLLBACK), `${ROLLBACK} ausente`);
   const sql = sqlExecutavel(ROLLBACK);
   assert.match(sql, /DROP SCHEMA IF EXISTS billing CASCADE/i);
-  assert.match(sql, /UPDATE\s+public\.subscription_plans\s+SET\s+is_active\s*=\s*true/i);
-  assert.match(sql, /slug IN \('starter', 'professional', 'enterprise'\)/i);
+  // A restauração dos planos é verificada em profundidade por BF-29: aqui só
+  // se exige que ela EXISTA e que aborte se a captura tiver sumido.
+  assert.match(sql, /billing\.fn_restore_legacy_plans\(\)/i);
+  assert.match(sql, /RAISE EXCEPTION/i, "o rollback precisa abortar se não puder restaurar");
 
   // O limite tem de estar escrito no arquivo, e não só no commit: quem for
   // executá-lo lê o arquivo.
@@ -368,8 +380,34 @@ test("BF-12: catálogo TypeScript e seed da migration concordam com a tabela apr
 
   // Enterprise não pode ganhar preço de tabela: um valor ali passaria por
   // checkout automático, que o modelo aprovado proíbe.
-  assert.match(catalogo, /tier:\s*"enterprise",\s*monthlyCents:\s*null,\s*yearlyCents:\s*null/);
-  assert.match(migration, /'enterprise',\s*NULL,\s*NULL/);
+  //
+  // A conferência é POR PLANO, e não "existe ao menos uma linha nula". São
+  // dois planos, e a primeira versão desta asserção aprovava um catálogo em
+  // que só o Essencial tinha Enterprise sem preço — encontrado por MUT-30.
+  for (const plano of ["essencial", "completo"]) {
+    assert.match(
+      catalogo,
+      new RegExp(
+        `plan:\\s*"${plano}",\\s*tier:\\s*"enterprise",\\s*monthlyCents:\\s*null,\\s*yearlyCents:\\s*null`
+      ),
+      `catalog.ts dá preço de tabela ao Enterprise do ${plano}`
+    );
+    assert.match(
+      migration,
+      new RegExp(`'${plano}',\\s*'enterprise',\\s*NULL,\\s*NULL`),
+      `o seed dá preço de tabela ao Enterprise do ${plano}`
+    );
+  }
+
+  // E, por propriedade: nenhuma linha de Enterprise pode ter número.
+  const enterpriseComNumero = [
+    ...catalogo.matchAll(/tier:\s*"enterprise",\s*monthlyCents:\s*([^,]+),\s*yearlyCents:\s*([^\s}]+)/g),
+  ].filter(([, m, y]) => m.trim() !== "null" || y.trim() !== "null");
+  assert.deepEqual(
+    enterpriseComNumero.map((m) => m[0]),
+    [],
+    "Enterprise é sob proposta e não pode ter preço automático"
+  );
 });
 
 test("BF-13: o Verify executa a asserção de segurança do schema billing", () => {
@@ -422,6 +460,62 @@ test("BF-15: a feature flag nasce desligada e não liga por ausência", () => {
     .join("\n");
   assert.doesNotMatch(executavel, /BILLING_DISABLED/, "a flag não pode ser de desligar");
   assert.doesNotMatch(executavel, /!==\s*["']false["']/, "negar 'false' liga por ausência");
+
+  // Nenhuma normalização antes de comparar. `"TRUE"`, `" true"` e `"True"`
+  // NÃO podem ligar: o único valor documentado é `"true"`, literal. Tolerar
+  // variações amplia o conjunto de estados que ligam a cobrança, e cada
+  // ampliação é uma chance a mais de ligar sem querer.
+  for (const normalizacao of [/toLowerCase/, /toUpperCase/, /\.trim\(\)/, /localeCompare/]) {
+    assert.doesNotMatch(
+      executavel,
+      normalizacao,
+      `a flag normaliza o valor antes de comparar (${normalizacao}) — só o literal exato pode ligar`
+    );
+  }
+  assert.doesNotMatch(executavel, /\/i[\s;)]/, "comparação insensível a caixa na flag");
+});
+
+test("BF-35: desconhecido nunca libera — plano, recurso ou estado", () => {
+  const catalogo = tsExecutavel("src/lib/billing/plans/catalog.ts");
+  const entitlements = tsExecutavel("src/lib/billing/plans/entitlements.ts");
+
+  // Plano fora do catálogo é dado corrompido: `getPlan` LANÇA, e o guard
+  // converte em negação. Devolver um plano padrão seria escolher, em silêncio,
+  // quais recursos liberar para uma linha que ninguém entende.
+  assert.match(
+    catalogo,
+    /if \(!plan\) throw new Error\(`plano desconhecido no catálogo/,
+    "getPlan deixou de recusar plano desconhecido"
+  );
+  assert.match(catalogo, /if \(!tier\) throw new Error\(`faixa desconhecida/);
+  assert.match(catalogo, /if \(!entry\) throw new Error\(`preço ausente/);
+
+  // Recurso fora do plano é bloqueio: a decisão vem de pertencimento, nunca de
+  // um ramo default.
+  assert.match(
+    entitlements,
+    /return getPlan\(plan\)\.features\.includes\(feature\);/,
+    "planIncludes deixou de decidir por pertencimento"
+  );
+  assert.doesNotMatch(entitlements, /return true;\s*$/m, "há um caminho que libera por padrão");
+
+  // Estado é LISTA DE PERMISSÃO: um estado novo que alguém esqueça de
+  // classificar nasce somente leitura, que é o lado seguro do erro.
+  assert.match(
+    entitlements,
+    /const ESTADOS_COM_ESCRITA: readonly SubscriptionState\[\]/,
+    "a lista de permissão de estados sumiu"
+  );
+  assert.match(
+    entitlements,
+    /return ESTADOS_COM_ESCRITA\.includes\(state\);/,
+    "canWrite deixou de decidir por lista de permissão"
+  );
+  assert.doesNotMatch(
+    entitlements,
+    /ESTADOS_SEM_ESCRITA|ESTADOS_BLOQUEADOS|!.*BLOQUEAD.*\.includes/,
+    "a lista virou de NEGAÇÃO: estado novo passaria a nascer liberado"
+  );
 });
 
 test("BF-16: o guard não tem fail-open", () => {
@@ -724,6 +818,265 @@ test("BF-25: nenhum valor monetário é ponto flutuante", () => {
     (pricing.match(/assertIntegerCents\(/g) ?? []).length >= 5,
     "assertIntegerCents deixou de guardar as saídas monetárias"
   );
+});
+
+// ── Endurecimento da revisão final ─────────────────────────────────────────
+
+test("BF-26: exceção e timeout NEGAM, em vez de escapar do guard", () => {
+  // Sem `try`, uma rejeição de promessa passa por cima da decisão: o chamador
+  // típico (`if (!r.allowed) return { error }`) nunca roda. A operação aborta,
+  // o que não autoriza — mas autoriza-ou-não deixa de ser uma decisão do guard
+  // e vira consequência de como cada chamador reage.
+  for (const arquivo of ["src/lib/billing/guard.ts", "src/lib/billing/authorization.ts"]) {
+    const src = tsExecutavel(arquivo);
+    assert.match(src, /\btry\s*\{/, `${arquivo} não protege contra exceção`);
+    assert.match(src, /\bcatch\b/, `${arquivo} não tem tratamento de exceção`);
+
+    // E todo `catch` tem de NEGAR. É o ponto inteiro deste PR.
+    const blocos = [...src.matchAll(/catch[^{]*\{([\s\S]{0,200}?)\}/g)].map((m) => m[1]);
+    assert.ok(blocos.length > 0, `${arquivo}: nenhum bloco catch encontrado`);
+    for (const bloco of blocos) {
+      assert.doesNotMatch(
+        bloco,
+        /allowed:\s*true|ok:\s*true/,
+        `${arquivo}: um catch produz autorização — é o fail-open de volta`
+      );
+      assert.match(
+        bloco,
+        /verification_failed/,
+        `${arquivo}: catch precisa negar com motivo nomeado`
+      );
+    }
+  }
+
+  // Resposta malformada também nega: veio linha, mas sem tenant utilizável.
+  for (const arquivo of ["src/lib/billing/guard.ts", "src/lib/billing/authorization.ts"]) {
+    assert.match(
+      tsExecutavel(arquivo),
+      /typeof membership\.tenant_id !== "string"/,
+      `${arquivo} aceita resposta malformada`
+    );
+  }
+});
+
+test("BF-27: identificador vindo do cliente não autoriza (IDOR)", () => {
+  const auth = tsExecutavel("src/lib/billing/authorization.ts");
+
+  assert.match(
+    auth,
+    /export async function requireBillingOwnerFor/,
+    "falta a autorização por organização solicitada"
+  );
+  // A comparação é o controle. Sem ela, o owner do tenant A administraria a
+  // assinatura do tenant B sem sair da própria sessão.
+  assert.match(
+    auth,
+    /requestedOrganizationId !== resultado\.principal\.organizationId/,
+    "o identificador do cliente não é comparado com o resolvido no servidor"
+  );
+  // E o servidor tem de resolver por conta própria ANTES de comparar.
+  const i = auth.indexOf("requireBillingOwnerFor");
+  const corpo = auth.slice(i, i + 1200);
+  assert.match(
+    corpo,
+    /await requireBillingOwner\(\)/,
+    "a variante por organização precisa reusar a resolução server-side"
+  );
+  // Entrada vazia não pode cair no caminho do servidor.
+  assert.match(corpo, /trim\(\) === ""/, "entrada vazia precisa ser recusada");
+});
+
+test("BF-28: a feature flag é inalcançável pelo browser", () => {
+  // Comentários fora: o cabeçalho de flag.ts EXPLICA por que não há
+  // `NEXT_PUBLIC_`, e a asserção casaria com a própria explicação.
+  const flag = tsExecutavel("src/lib/billing/flag.ts");
+
+  // `server-only` transforma import em componente cliente em erro de BUILD.
+  assert.match(flag, /import "server-only";/, "flag.ts não é marcada como server-only");
+  // Sem NEXT_PUBLIC_, o Next não injeta a variável no bundle.
+  assert.doesNotMatch(flag, /NEXT_PUBLIC_/, "a flag não pode ser pública");
+
+  // E nenhum componente cliente pode importar a fundação.
+  const clientes = [];
+  const varrer = (dir) => {
+    for (const entrada of fs.readdirSync(path.join(raiz, dir), { withFileTypes: true })) {
+      const rel = path.join(dir, entrada.name);
+      if (entrada.isDirectory()) varrer(rel);
+      else if (/\.(ts|tsx)$/.test(entrada.name)) {
+        const src = ler(rel);
+        if (!/^\s*["']use client["']/m.test(src)) continue;
+        if (/from\s+["']@\/lib\/billing\/(flag|guard|authorization)/.test(src)) {
+          clientes.push(rel);
+        }
+      }
+    }
+  };
+  varrer("src");
+  assert.deepEqual(clientes, [], `componente cliente importa a fundação:\n  ${clientes.join("\n  ")}`);
+});
+
+test("BF-29: o rollback restaura o valor REAL, não um valor presumido", () => {
+  const rollback = sqlExecutavel(ROLLBACK);
+
+  // `is_active` é boolean DEFAULT true e NÃO NOT NULL: true, false e NULL são
+  // todos possíveis. Reativar por lista de slugs erraria em dois casos reais.
+  assert.doesNotMatch(
+    rollback,
+    /SET\s+is_active\s*=\s*true/i,
+    "o rollback presume `true` — erraria para plano já inativo e para NULO"
+  );
+  assert.doesNotMatch(
+    rollback,
+    /slug IN \(/i,
+    "o rollback restaura por lista de slugs em vez de por estado capturado"
+  );
+  assert.match(
+    rollback,
+    /billing\.fn_restore_legacy_plans\(\)/,
+    "o rollback não usa a restauração baseada na captura"
+  );
+  // E restaura ANTES de destruir o schema que guarda a captura.
+  const iRestaura = rollback.indexOf("fn_restore_legacy_plans");
+  const iDrop = rollback.indexOf("DROP SCHEMA");
+  assert.ok(iRestaura > 0 && iDrop > 0, "faltam restauração ou remoção");
+  assert.ok(
+    iRestaura < iDrop,
+    "o rollback derruba o schema ANTES de restaurar — apagaria a própria captura"
+  );
+
+  // A migration precisa capturar antes de desativar.
+  const migration = sqlExecutavel(MIGRATION);
+  const iCaptura = migration.indexOf("INSERT INTO billing.legacy_plan_state");
+  const iUpdate = migration.indexOf("UPDATE public.subscription_plans");
+  assert.ok(iCaptura > 0, "a migration não captura o estado anterior");
+  assert.ok(
+    iCaptura < iUpdate,
+    "a captura acontece DEPOIS da desativação — gravaria o estado já alterado"
+  );
+  assert.match(
+    migration,
+    /ON CONFLICT \(plan_id\) DO NOTHING/,
+    "reaplicar sobrescreveria a captura original"
+  );
+
+  // E o comportamento é exercido contra PostgreSQL de verdade.
+  const assercao = ler(ASSERCAO);
+  assert.match(assercao, /fn_restore_legacy_plans/, "falta o teste comportamental do rollback");
+  assert.match(assercao, /REATIVOU um plano que já estava inativo/, "falta o cenário do plano já inativo");
+  assert.match(assercao, /is_active NULO/, "falta o cenário do valor nulo");
+});
+
+test("BF-30: toda rotina da fundação fixa search_path", () => {
+  const sql = sqlExecutavel(MIGRATION);
+  const funcoes = [...sql.matchAll(/CREATE OR REPLACE FUNCTION billing\.(\w+)/g)].map((m) => m[1]);
+  assert.ok(funcoes.length >= 2, `esperadas ao menos 2 funções, achadas ${funcoes.length}`);
+
+  for (const nome of funcoes) {
+    const i = sql.indexOf(`CREATE OR REPLACE FUNCTION billing.${nome}`);
+    const corpo = sql.slice(i, i + 400);
+    assert.match(
+      corpo,
+      /SET search_path TO 'pg_catalog', 'pg_temp'/,
+      `billing.${nome} não fixa search_path — nome não qualificado poderia ser sequestrado`
+    );
+  }
+
+  // E o banco confere isso por catálogo, nas três camadas.
+  assert.match(sql, /search\\_path=/, "faltam as pós-condições de search_path");
+  assert.match(ler(ASSERCAO), /search\\_path=/, "a asserção do CI não confere search_path");
+  assert.match(ler(VERIFICADOR), /search\\_path=/, "o verificador não confere search_path");
+});
+
+test("BF-31: CNPJ é obrigatório para iniciar o trial", () => {
+  const lifecycle = tsExecutavel("src/lib/billing/plans/lifecycle.ts");
+  assert.match(
+    lifecycle,
+    /if \(input\.cnpj\.trim\(\) === ""\)/,
+    "startTrial deixou de exigir CNPJ"
+  );
+  assert.match(lifecycle, /CNPJ é obrigatório/, "a recusa perdeu a mensagem");
+  // E a coluna do banco recusa vazio.
+  assert.match(
+    sqlExecutavel(MIGRATION),
+    /cnpj\s+text NOT NULL CHECK \(btrim\(cnpj\) <> ''\)/,
+    "a tabela aceita CNPJ vazio"
+  );
+});
+
+test("BF-32: os módulos puros não leem relógio nem ambiente", () => {
+  // Um `Date.now()` escondido num cálculo torna o resultado dependente do
+  // instante da execução — e um teste que passa hoje falha em outro fuso, ou
+  // na virada do mês. Todo instante entra por argumento.
+  for (const arquivo of MODULOS_PUROS) {
+    const src = tsExecutavel(arquivo);
+    assert.doesNotMatch(src, /Date\.now\(\)/, `${arquivo} lê o relógio`);
+    assert.doesNotMatch(src, /new Date\(\s*\)/, `${arquivo} lê o relógio`);
+    assert.doesNotMatch(src, /process\.env/, `${arquivo} lê o ambiente`);
+    assert.doesNotMatch(src, /Math\.random/, `${arquivo} não é determinístico`);
+    assert.doesNotMatch(src, /createClient|supabase/i, `${arquivo} faz I/O`);
+  }
+});
+
+test("BF-33: service role não alcança código de cliente", () => {
+  const vazamentos = [];
+  const varrer = (dir) => {
+    for (const entrada of fs.readdirSync(path.join(raiz, dir), { withFileTypes: true })) {
+      const rel = path.join(dir, entrada.name);
+      if (entrada.isDirectory()) varrer(rel);
+      else if (/\.(ts|tsx)$/.test(entrada.name)) {
+        const src = ler(rel);
+        if (!/^\s*["']use client["']/m.test(src)) continue;
+        if (/SUPABASE_SERVICE_ROLE_KEY|lib\/supabase\/service|createServiceClient/.test(src)) {
+          vazamentos.push(rel);
+        }
+      }
+    }
+  };
+  varrer("src");
+  assert.deepEqual(
+    vazamentos,
+    [],
+    `service role em componente cliente:\n  ${vazamentos.join("\n  ")}`
+  );
+
+  // E a chave nunca pode virar variável pública.
+  assert.doesNotMatch(
+    ler(".env.example"),
+    /NEXT_PUBLIC_[A-Z_]*SERVICE_ROLE/,
+    "a chave de service role foi exposta como variável pública"
+  );
+});
+
+test("BF-34: o CI ensaia a reconstrução descartável por inteiro", () => {
+  const ci = ler(".github/workflows/ci.yml");
+  const verify = ci.slice(ci.indexOf("  verify:"), ci.indexOf("  e2e:"));
+
+  // Os PASSOS têm de existir por nome. Conferir só os caminhos de arquivo
+  // deixa passar a desativação: basta renomear o passo e o comando fica órfão
+  // dentro de outro bloco, ainda visível no texto e nunca executado.
+  // Encontrado por MUT-39.
+  for (const passo of [
+    "- name: 36/36 hashes das históricas contra o manifesto",
+    "- name: Verificador independente da nova forward-only",
+    "- name: Rollback e reaplicação da nova forward-only",
+    "- name: Segurança e imutabilidade do schema billing",
+  ]) {
+    assert.ok(verify.includes(passo), `o Verify perdeu o passo: ${passo}`);
+  }
+
+  for (const [trecho, motivo] of [
+    ["verify-recovered-migrations.mjs supabase/migrations", "hashes das 36 históricas"],
+    ["verify-applied/20260801120000.sql", "verificador independente da nova migration"],
+    ["20260801120000_billing_foundation_rollback.sql", "rollback"],
+    ["supabase/migrations/20260801120000_billing_foundation.sql", "reaplicação"],
+  ]) {
+    assert.ok(verify.includes(trecho), `o Verify não executa: ${motivo}`);
+  }
+
+  // O rollback tem de ser conferido, não apenas executado.
+  assert.match(verify, /schema billing sobreviveu ao rollback/, "o rollback não é conferido");
+  assert.match(verify, /planos-antes\.txt/, "falta o diff antes/depois dos planos");
+  assert.match(verify, /reaplicar não reproduziu o mesmo estado/, "a idempotência não é conferida");
 });
 
 console.log("");

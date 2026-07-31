@@ -21,7 +21,20 @@
  * `tests/unit/billing/flag.spec.ts` fixa cada um desses casos, e
  * `tests/billing-mutation-guard.mjs` prova que inverter a comparação é
  * detectado.
+ *
+ * ── SOMENTE SERVIDOR, IMPOSTO PELO COMPILADOR ───────────────────────────────
+ *
+ * `BILLING_ENABLED` não tem prefixo `NEXT_PUBLIC_`, então o Next.js não a
+ * injeta no bundle do browser. Num componente cliente ela seria `undefined` —
+ * e a flag responderia `false` sempre, silenciosamente. O comportamento é
+ * seguro, mas a divergência entre servidor e cliente seria invisível.
+ *
+ * `server-only` transforma isso em erro de BUILD: importar este módulo de um
+ * componente cliente quebra a compilação em vez de produzir uma flag que mente.
+ * Nos testes o pacote é substituído por `tests/setup/server-only.stub.ts`.
  */
+
+import "server-only";
 
 /** Nome da variável. Exportado para que os testes não repitam o literal. */
 export const BILLING_FLAG_ENV = "BILLING_ENABLED";

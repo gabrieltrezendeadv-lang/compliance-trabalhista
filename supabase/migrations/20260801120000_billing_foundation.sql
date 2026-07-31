@@ -329,6 +329,31 @@ CREATE INDEX IF NOT EXISTS audit_events_organization_idx
   ON billing.audit_events (organization_id, occurred_at);
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 8b. ESTADO ANTERIOR DOS PLANOS ANTIGOS — para um rollback exato
+-- ─────────────────────────────────────────────────────────────────────────────
+--
+-- Declarada aqui, junto das demais, para que passe pelo mesmo fechamento de RLS
+-- e privilégios da seção 10. É preenchida na seção 11, imediatamente antes do
+-- UPDATE que ela existe para poder desfazer.
+
+CREATE TABLE IF NOT EXISTS billing.legacy_plan_state (
+  -- Sem FOREIGN KEY para `public.subscription_plans` de propósito: uma FK
+  -- criaria gatilho interno na tabela referenciada, e o compromisso desta
+  -- migration é não tocar em estrutura de `public`. A integridade que importa
+  -- aqui é histórica, não referencial — a linha registra o que havia, mesmo
+  -- que o plano deixe de existir depois.
+  plan_id     uuid PRIMARY KEY,
+  slug        text NOT NULL,
+  was_active  boolean NULL,
+  captured_at timestamptz NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE billing.legacy_plan_state IS
+  'Estado de is_active de public.subscription_plans imediatamente ANTES da '
+  'desativação feita por esta migration. Existe para que o rollback restaure o '
+  'valor real — inclusive NULL e false — em vez de presumir true.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- 9. IMUTABILIDADE — por trigger, não por convenção
 -- ─────────────────────────────────────────────────────────────────────────────
 --
@@ -375,6 +400,28 @@ CREATE TRIGGER tg_audit_events_append_only
 -- 10. FECHAMENTO — RLS e privilégios explícitos
 -- ─────────────────────────────────────────────────────────────────────────────
 --
+-- ── FORCE ROW LEVEL SECURITY: ausência DELIBERADA, e o motivo é concreto ────
+--
+-- `FORCE` faz a RLS valer também para o DONO da tabela. Aqui isso quebraria
+-- dois consumidores legítimos que se conectam como dono:
+--
+--   * `scripts/ci/verify-applied/20260801120000.sql`, a verificação
+--     independente da rota de aplicação, que LÊ `billing.price_catalog`,
+--     `billing.tiers` e `billing.grandfathering_cutoff` para conferir o efeito
+--     da migration. Com FORCE e zero policies, essas leituras voltariam vazias
+--     e o verificador reprovaria uma aplicação correta;
+--   * a própria rota de migrations, que conecta com o usuário `postgres`.
+--
+-- O que FORCE acrescentaria seria proteção contra acesso em contexto de DONO —
+-- e nenhum caminho da aplicação usa esse contexto: o cliente PostgREST não
+-- alcança o schema, e o servidor usará `service_role`.
+--
+-- A ausência de FORCE portanto NÃO afrouxa o modelo: as quatro negações abaixo
+-- continuam valendo para todo papel que não seja dono, e a pós-condição 12.8c
+-- exige que `service_role` tenha BYPASSRLS, que é o que torna a combinação
+-- "RLS ligada + zero policies" utilizável pelo servidor na Etapa 12B sem abrir
+-- nada para `anon` ou `authenticated`.
+--
 -- Quatro negações independentes, e nenhuma delas depende da interface:
 --
 --   1. o schema não é exposto ao PostgREST;
@@ -408,7 +455,7 @@ BEGIN
   FOREACH t IN ARRAY ARRAY[
     'tiers', 'price_catalog', 'subscriptions', 'price_snapshots',
     'grandfathering_cutoff', 'grandfathered_organizations',
-    'courtesies', 'audit_events'
+    'courtesies', 'audit_events', 'legacy_plan_state'
   ]
   LOOP
     EXECUTE format('REVOKE ALL ON TABLE billing.%I FROM PUBLIC', t);
@@ -440,10 +487,60 @@ $$;
 -- referência existente, é idempotente e é revertido pelo rollback.
 --
 -- DML, não DDL: não altera a estrutura de `public` e não afeta o dump.
+--
+-- ── POR QUE O ESTADO ANTERIOR É GRAVADO ANTES ───────────────────────────────
+--
+-- `public.subscription_plans.is_active` é `boolean DEFAULT true`, e NÃO é
+-- `NOT NULL`. Logo há três estados possíveis por linha: `true`, `false` e
+-- `NULL`.
+--
+-- Um rollback que fizesse `SET is_active = true` para os três slugs conhecidos
+-- estaria ERRADO em dois casos concretos: um plano que já estivesse desativado
+-- antes desta migration voltaria ativo, e um plano com `NULL` viraria `true`.
+-- Em ambos, o "rollback" deixaria o banco num estado que nunca existiu.
+--
+-- Por isso o estado anterior é capturado linha a linha ANTES do UPDATE, e o
+-- rollback restaura a partir da captura em vez de assumir qual era o valor.
+-- `ON CONFLICT DO NOTHING` preserva a PRIMEIRA captura: reaplicar a migration
+-- não sobrescreve o estado original com o estado já desativado.
+
+INSERT INTO billing.legacy_plan_state (plan_id, slug, was_active)
+SELECT id, slug, is_active FROM public.subscription_plans
+ON CONFLICT (plan_id) DO NOTHING;
 
 UPDATE public.subscription_plans
    SET is_active = false
  WHERE is_active IS DISTINCT FROM false;
+
+-- A restauração é FUNÇÃO, e não SQL solto no arquivo de rollback, por um motivo
+-- prático: assim ela pode ser exercida por teste de comportamento contra
+-- PostgreSQL de verdade (`scripts/ci/assert-billing-security.sql`), inclusive
+-- no cenário que o rollback ingênuo errava — plano previamente inativo.
+CREATE OR REPLACE FUNCTION billing.fn_restore_legacy_plans()
+RETURNS integer
+LANGUAGE plpgsql
+SET search_path TO 'pg_catalog', 'pg_temp'
+AS $$
+DECLARE
+  v_n integer;
+BEGIN
+  UPDATE public.subscription_plans p
+     SET is_active = s.was_active
+    FROM billing.legacy_plan_state s
+   WHERE s.plan_id = p.id
+     AND p.is_active IS DISTINCT FROM s.was_active;
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  RETURN v_n;
+END
+$$;
+
+COMMENT ON FUNCTION billing.fn_restore_legacy_plans() IS
+  'Restaura is_active a partir de billing.legacy_plan_state. Idempotente. '
+  'Usada pelo rollback da 20260801120000.';
+
+REVOKE ALL ON FUNCTION billing.fn_restore_legacy_plans() FROM PUBLIC;
+REVOKE ALL ON FUNCTION billing.fn_restore_legacy_plans() FROM anon;
+REVOKE ALL ON FUNCTION billing.fn_restore_legacy_plans() FROM authenticated;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 12. PÓS-CONDIÇÕES — abortam a transação inteira se o estado não conferir
@@ -454,12 +551,12 @@ DECLARE
   v_int integer;
   v_txt text;
 BEGIN
-  -- 12.1 As oito tabelas existem, todas com RLS ligada e ZERO policies.
+  -- 12.1 As nove tabelas existem, todas com RLS ligada e ZERO policies.
   SELECT count(*) INTO v_int
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 'billing' AND c.relkind = 'r';
-  IF v_int <> 8 THEN
-    RAISE EXCEPTION 'esperadas 8 tabelas em billing, encontradas %', v_int;
+  IF v_int <> 9 THEN
+    RAISE EXCEPTION 'esperadas 9 tabelas em billing, encontradas %', v_int;
   END IF;
 
   SELECT count(*) INTO v_int
@@ -586,11 +683,59 @@ BEGIN
       'grandfathering é fase posterior, e sem corte ninguém é elegível';
   END IF;
 
-  -- 12.8 Nenhum plano antigo continua ativo.
+  -- 12.8 Nenhum plano antigo continua ativo, e TODO plano tem estado anterior
+  --      capturado. A segunda metade é o que torna o rollback exato: sem uma
+  --      linha por plano, a restauração precisaria adivinhar um valor.
   SELECT count(*) INTO v_int
     FROM public.subscription_plans WHERE is_active IS DISTINCT FROM false;
   IF v_int <> 0 THEN
     RAISE EXCEPTION '% plano(s) antigo(s) continuam ativos em public.subscription_plans', v_int;
+  END IF;
+
+  SELECT count(*) INTO v_int
+    FROM public.subscription_plans p
+   WHERE NOT EXISTS (
+     SELECT 1 FROM billing.legacy_plan_state s WHERE s.plan_id = p.id
+   );
+  IF v_int <> 0 THEN
+    RAISE EXCEPTION
+      '% plano(s) sem estado anterior capturado — o rollback não conseguiria '
+      'restaurar o valor real de is_active', v_int;
+  END IF;
+
+  -- 12.8b Toda rotina de billing tem `search_path` fixado.
+  --
+  -- Sem `SET search_path`, uma rotina resolve nomes pelo caminho de quem a
+  -- chama. Basta um schema temporário à frente para que um objeto homônimo
+  -- sequestre a resolução. É por isso que TODA função deste repositório fixa o
+  -- caminho, e é isto que garante que a próxima também fixe.
+  SELECT string_agg(p.oid::regprocedure::text, ', ')
+    INTO v_txt
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'billing'
+     AND NOT EXISTS (
+       SELECT 1 FROM unnest(COALESCE(p.proconfig, ARRAY[]::text[])) cfg
+        WHERE cfg LIKE 'search\_path=%'
+     );
+  IF v_txt IS NOT NULL THEN
+    RAISE EXCEPTION 'rotina(s) de billing sem search_path fixado: %', v_txt;
+  END IF;
+
+  -- 12.8c `service_role` precisa contornar RLS.
+  --
+  -- A fundação usa RLS ligada com ZERO policies, que é negação total. Isso só
+  -- é sustentável porque `service_role` tem BYPASSRLS: é assim que o servidor
+  -- da Etapa 12B poderá ler e escrever sem que nenhuma policy abra brecha para
+  -- `anon` ou `authenticated`.
+  --
+  -- Se a premissa não valer neste banco, é melhor descobrir AGORA, com a
+  -- transação abortando, do que na 12B com a fundação inacessível.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname = 'service_role' AND rolbypassrls
+  ) THEN
+    RAISE EXCEPTION
+      'service_role não tem BYPASSRLS neste banco — a fundação ficaria '
+      'inacessível ao servidor, porque RLS está ligada sem nenhuma policy';
   END IF;
 
   -- 12.9 A migration não criou nada em public. Se criou, o baseline e as
@@ -601,7 +746,7 @@ BEGIN
      AND c.relname IN (
        'tiers', 'price_catalog', 'subscriptions', 'price_snapshots',
        'grandfathering_cutoff', 'grandfathered_organizations',
-       'courtesies', 'audit_events'
+       'courtesies', 'audit_events', 'legacy_plan_state'
      );
   IF v_int <> 0 THEN
     RAISE EXCEPTION
@@ -609,6 +754,6 @@ BEGIN
       'correto é billing', v_int;
   END IF;
 
-  RAISE NOTICE 'OK: fundação de billing instalada e fechada (8 tabelas, RLS ligada, 0 policies)';
+  RAISE NOTICE 'OK: fundação de billing instalada e fechada (9 tabelas, RLS ligada, 0 policies)';
 END
 $$;

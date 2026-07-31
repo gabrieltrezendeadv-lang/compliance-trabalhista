@@ -149,7 +149,64 @@ BEGIN
       'ASSERÇÃO REPROVADA: esperadas 2 triggers cobrindo UPDATE e DELETE, encontradas %', v_int;
   END IF;
 
-  RAISE NOTICE 'billing/estrutura OK: RLS em todas, 0 policies, sem acesso de cliente, triggers no lugar';
+  -- A.6 Toda rotina de billing fixa `search_path`.
+  --
+  -- Sem `SET search_path`, a rotina resolve nomes pelo caminho de quem a chama;
+  -- basta um schema à frente com objeto homônimo para sequestrar a resolução.
+  -- Vale inclusive para SECURITY INVOKER: o risco é de resolução, não de dono.
+  SELECT count(*), string_agg(p.oid::regprocedure::text, ', ')
+    INTO v_int, v_lista
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'billing'
+     AND NOT EXISTS (
+       SELECT 1 FROM unnest(COALESCE(p.proconfig, ARRAY[]::text[])) cfg
+        WHERE cfg LIKE 'search\_path=%'
+     );
+  IF v_int <> 0 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: % rotina(s) de billing sem search_path fixado: %', v_int, v_lista;
+  END IF;
+
+  -- A.7 A dupla que sustenta "RLS ligada + zero policies".
+  --
+  -- FORCE está AUSENTE por decisão: ele faria a RLS valer para o DONO, e o
+  -- verificador independente da rota de aplicação lê billing.price_catalog
+  -- conectado como dono — com FORCE, leria vazio e reprovaria uma aplicação
+  -- correta. Ver o comentário da seção 10 da migration.
+  --
+  -- O que torna a ausência de FORCE aceitável é `service_role` ter BYPASSRLS:
+  -- é assim que a Etapa 12B lerá e escreverá sem que nenhuma policy precise
+  -- existir — e portanto sem nenhuma brecha para anon/authenticated.
+  -- As duas condições são verificadas JUNTAS, porque só juntas fazem sentido.
+  SELECT count(*), string_agg(c.relname, ', ' ORDER BY c.relname)
+    INTO v_int, v_lista
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'billing' AND c.relkind = 'r' AND c.relforcerowsecurity;
+  IF v_int <> 0 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: % tabela(s) com FORCE RLS (%). A decisão da 12A é '
+      'NÃO usar FORCE — ele quebraria o verificador independente, que lê como '
+      'dono. Mudar isso exige revisar scripts/ci/verify-applied/.', v_int, v_lista;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname = 'service_role' AND rolbypassrls
+  ) THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: service_role sem BYPASSRLS — com RLS ligada e zero '
+      'policies, a fundação ficaria inacessível também ao servidor';
+  END IF;
+
+  -- A.8 Todas as tabelas pertencem ao mesmo dono.
+  SELECT count(DISTINCT c.relowner) INTO v_int
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'billing' AND c.relkind = 'r';
+  IF v_int <> 1 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: as tabelas de billing têm % donos distintos', v_int;
+  END IF;
+
+  RAISE NOTICE 'billing/estrutura OK: RLS em todas, 0 policies, sem acesso de cliente, search_path fixado, triggers no lugar';
 END
 $estrutura$;
 
@@ -320,6 +377,81 @@ BEGIN
 END
 $comportamento$;
 
+-- ── B.5 O ROLLBACK RESTAURA O VALOR REAL, e não um valor presumido ──────────
+--
+-- É o cenário que um `SET is_active = true` erraria em silêncio: um plano que
+-- JÁ ESTAVA inativo antes da migration, e um plano com `is_active` NULO.
+-- Ambos são possíveis — a coluna é `boolean DEFAULT true`, sem `NOT NULL`.
+--
+-- O teste exercita `billing.fn_restore_legacy_plans()`, que é exatamente a
+-- função chamada pelo arquivo de rollback. Não é uma reimplementação da regra:
+-- é a regra.
+
+DO $rollback$
+DECLARE
+  v_limites public.plan_limits := ROW(NULL, NULL, NULL, NULL, NULL, NULL, false, false, false)::public.plan_limits;
+  v_ja_inativo uuid;
+  v_era_nulo   uuid;
+  v_era_ativo  uuid;
+  v_depois     boolean;
+BEGIN
+  INSERT INTO public.subscription_plans (name, slug, price_monthly, limits, is_active)
+       VALUES ('Fixture já inativo', 'fixture-ja-inativo', 100, v_limites, false)
+    RETURNING id INTO v_ja_inativo;
+
+  INSERT INTO public.subscription_plans (name, slug, price_monthly, limits, is_active)
+       VALUES ('Fixture nulo', 'fixture-nulo', 100, v_limites, NULL)
+    RETURNING id INTO v_era_nulo;
+
+  INSERT INTO public.subscription_plans (name, slug, price_monthly, limits, is_active)
+       VALUES ('Fixture ativo', 'fixture-ativo', 100, v_limites, true)
+    RETURNING id INTO v_era_ativo;
+
+  -- Captura, como a migration faz.
+  INSERT INTO billing.legacy_plan_state (plan_id, slug, was_active)
+  SELECT id, slug, is_active FROM public.subscription_plans
+   WHERE id IN (v_ja_inativo, v_era_nulo, v_era_ativo)
+  ON CONFLICT (plan_id) DO NOTHING;
+
+  -- Desativação, como a migration faz.
+  UPDATE public.subscription_plans
+     SET is_active = false
+   WHERE id IN (v_ja_inativo, v_era_nulo, v_era_ativo)
+     AND is_active IS DISTINCT FROM false;
+
+  -- Restauração, como o rollback faz.
+  PERFORM billing.fn_restore_legacy_plans();
+
+  SELECT is_active INTO v_depois FROM public.subscription_plans WHERE id = v_ja_inativo;
+  IF v_depois IS DISTINCT FROM false THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: o rollback REATIVOU um plano que já estava inativo antes (virou %)',
+      coalesce(v_depois::text, 'NULO');
+  END IF;
+
+  SELECT is_active INTO v_depois FROM public.subscription_plans WHERE id = v_era_nulo;
+  IF v_depois IS NOT NULL THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: o rollback trocou is_active NULO por % — estado que nunca existiu',
+      v_depois;
+  END IF;
+
+  SELECT is_active INTO v_depois FROM public.subscription_plans WHERE id = v_era_ativo;
+  IF v_depois IS DISTINCT FROM true THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: o rollback NÃO reativou um plano que estava ativo (ficou %)',
+      coalesce(v_depois::text, 'NULO');
+  END IF;
+
+  -- Idempotente: repetir não muda mais nada.
+  IF billing.fn_restore_legacy_plans() <> 0 THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: a restauração não é idempotente';
+  END IF;
+
+  RAISE NOTICE 'billing/rollback OK: false permanece false, NULO permanece NULO, true volta a true';
+END
+$rollback$;
+
 ROLLBACK;
 
 -- ═════════════════════════════════════════════════════════════════════════════
@@ -337,6 +469,21 @@ BEGIN
       'ASSERÇÃO REPROVADA: fixture do teste comportamental sobreviveu ao ROLLBACK';
   END IF;
 
-  RAISE NOTICE 'billing OK: nenhuma fixture sobreviveu';
+  -- `billing.legacy_plan_state` NÃO entra na lista acima: ela tem linhas
+  -- legítimas, gravadas pela própria migration. O que não pode sobreviver são
+  -- as fixtures — conferidas pelo prefixo do slug, em `public`.
+  IF EXISTS (SELECT 1 FROM public.subscription_plans WHERE slug LIKE 'fixture-%')
+     OR EXISTS (SELECT 1 FROM billing.legacy_plan_state WHERE slug LIKE 'fixture-%') THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: plano sintético do teste de rollback sobreviveu ao ROLLBACK';
+  END IF;
+
+  -- E o estado real dos planos antigos continua o que a migration deixou.
+  IF EXISTS (SELECT 1 FROM public.subscription_plans WHERE is_active IS DISTINCT FROM false) THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: o teste de rollback deixou plano antigo ativo';
+  END IF;
+
+  RAISE NOTICE 'billing OK: nenhuma fixture sobreviveu; planos antigos seguem inativos';
 END
 $limpeza$;

@@ -147,7 +147,7 @@ test("MUT-00: sem mutação, as guardas PASSAM na cópia", () => {
 test("MUT-01: reintroduzir o fail-open no guard é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/guard.ts",
-    "  if (error) return { ok: false, reason: \"verification_failed\" };\n  if (!membership) return { ok: false, reason: \"no_organization\" };",
+    "    if (error) return { ok: false, reason: \"verification_failed\" };\n    if (!membership) return { ok: false, reason: \"no_organization\" };",
     "  if (error) { return { allowed: true, reason: \"ok\" }; }\n  if (!membership) return { ok: false, reason: \"no_organization\" };",
     FOUNDATION
   );
@@ -170,7 +170,7 @@ test("MUT-02: permitir por captura de exceção é DETECTADO", () => {
 test("MUT-03: chamar de novo a RPC revogada é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/guard.ts",
-    "  if (error) return { ok: false, reason: \"verification_failed\" };\n  if (!membership) return { ok: false, reason: \"no_organization\" };",
+    "    if (error) return { ok: false, reason: \"verification_failed\" };\n    if (!membership) return { ok: false, reason: \"no_organization\" };",
     "  await supabase.rpc(\"check_plan_limit\", {});\n  if (error) return { ok: false, reason: \"verification_failed\" };\n  if (!membership) return { ok: false, reason: \"no_organization\" };",
     FOUNDATION
   );
@@ -460,6 +460,196 @@ test("MUT-25: remover uma migration HISTÓRICA é DETECTADO", () => {
   }
   assert.equal(r.code, 1, `a remoção da histórica passou:\n${r.out}`);
   assert.match(r.out, /MF-0[89]|AUSENTE|conjunto histórico/i);
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// MUTAÇÕES ACRESCENTADAS NA REVISÃO FINAL
+// ═════════════════════════════════════════════════════════════════════════
+
+test("MUT-26: remover a comparação de organização (IDOR) é DETECTADO", () => {
+  // Sem a comparação, o servidor autoriza "é owner de alguma coisa" e opera
+  // sobre o identificador que o cliente mandou.
+  const r = mutar(
+    "src/lib/billing/authorization.ts",
+    "  if (requestedOrganizationId !== resultado.principal.organizationId) {",
+    "  if (false) {",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `o IDOR passou:\n${r.out}`);
+  assert.match(r.out, /BF-27/);
+});
+
+test("MUT-27: aceitar organização vazia usando a do servidor é DETECTADO", () => {
+  const r = mutar(
+    "src/lib/billing/authorization.ts",
+    '    requestedOrganizationId.trim() === ""',
+    "    false",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `a entrada vazia passou:\n${r.out}`);
+  assert.match(r.out, /BF-27/);
+});
+
+test("MUT-28: flag tolerante a caixa/espaço é DETECTADA", () => {
+  // `"TRUE"`, `" true"` e `"True"` passariam a ligar a cobrança.
+  const r = mutar(
+    "src/lib/billing/flag.ts",
+    "  return process.env[BILLING_FLAG_ENV] === BILLING_FLAG_ON;",
+    "  return (process.env[BILLING_FLAG_ENV] ?? '').trim().toLowerCase() === BILLING_FLAG_ON;",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `a normalização passou:\n${r.out}`);
+  assert.match(r.out, /BF-15/);
+});
+
+test("MUT-29: expor a flag ao browser é DETECTADO", () => {
+  const r = mutar(
+    "src/lib/billing/flag.ts",
+    'import "server-only";',
+    "",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `a flag alcançável pelo cliente passou:\n${r.out}`);
+  assert.match(r.out, /BF-28/);
+});
+
+test("MUT-30: dar preço automático ao Enterprise é DETECTADO", () => {
+  const r = mutar(
+    "src/lib/billing/plans/catalog.ts",
+    '{ plan: "completo", tier: "enterprise", monthlyCents: null, yearlyCents: null }',
+    '{ plan: "completo", tier: "enterprise", monthlyCents: 149_990, yearlyCents: 1_619_892 }',
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `Enterprise com preço de tabela passou:\n${r.out}`);
+  assert.match(r.out, /BF-12/);
+});
+
+test("MUT-31: rollback reativando plano previamente inativo é DETECTADO", () => {
+  // A regressão exata: presumir `true` em vez de restaurar o valor capturado.
+  const r = mutar(
+    "supabase/rollbacks/20260801120000_billing_foundation_rollback.sql",
+    "  SELECT billing.fn_restore_legacy_plans() INTO v_restaurados;",
+    "  UPDATE public.subscription_plans SET is_active = true; v_restaurados := 0;",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `o rollback presumido passou:\n${r.out}`);
+  assert.match(r.out, /BF-29/);
+});
+
+test("MUT-32: capturar o estado DEPOIS de desativar é DETECTADO", () => {
+  // A captura gravaria o estado já alterado, e o rollback restauraria `false`
+  // para todo mundo — inclusive para quem estava ativo.
+  const original = ler("supabase/migrations/20260801120000_billing_foundation.sql");
+  const captura =
+    "INSERT INTO billing.legacy_plan_state (plan_id, slug, was_active)\n" +
+    "SELECT id, slug, is_active FROM public.subscription_plans\n" +
+    "ON CONFLICT (plan_id) DO NOTHING;\n\n";
+  const update =
+    "UPDATE public.subscription_plans\n" +
+    "   SET is_active = false\n" +
+    " WHERE is_active IS DISTINCT FROM false;\n";
+
+  assert.ok(original.includes(captura + update), "o par captura+update mudou de forma");
+
+  const alvo = "supabase/migrations/20260801120000_billing_foundation.sql";
+  escrever(alvo, original.replace(captura + update, () => update + "\n" + captura));
+  let r;
+  try {
+    r = guarda(FOUNDATION);
+  } finally {
+    escrever(alvo, original);
+  }
+  assert.equal(r.code, 1, `a captura tardia passou:\n${r.out}`);
+  assert.match(r.out, /BF-29/);
+});
+
+test("MUT-33: dispensar CNPJ para iniciar o trial é DETECTADO", () => {
+  const r = mutar(
+    "src/lib/billing/plans/lifecycle.ts",
+    '  if (input.cnpj.trim() === "") {',
+    "  if (false) {",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `o trial sem CNPJ passou:\n${r.out}`);
+  assert.match(r.out, /BF-31/);
+});
+
+test("MUT-34: plano desconhecido devolvendo padrão em vez de recusar é DETECTADO", () => {
+  const r = mutar(
+    "src/lib/billing/plans/catalog.ts",
+    "  if (!plan) throw new Error(`plano desconhecido no catálogo: ${slug}`);\n  return plan;",
+    "  return plan ?? PLANS[1];",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `o plano padrão silencioso passou:\n${r.out}`);
+  assert.match(r.out, /BF-35/);
+});
+
+test("MUT-35: estado por lista de NEGAÇÃO em vez de permissão é DETECTADO", () => {
+  // Invertida, a lista faz todo estado NOVO nascer liberado.
+  const r = mutar(
+    "src/lib/billing/plans/entitlements.ts",
+    "  return ESTADOS_COM_ESCRITA.includes(state);",
+    '  return !(["read_only", "terminated"] as SubscriptionState[]).includes(state);',
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `a lista de negação passou:\n${r.out}`);
+  assert.match(r.out, /BF-35/);
+});
+
+test("MUT-36: relógio implícito em módulo puro é DETECTADO", () => {
+  const r = mutar(
+    "src/lib/billing/plans/lifecycle.ts",
+    "export function trialEndsAt(startedAt: string): string {\n  return addDays(startedAt, TRIAL_DAYS);",
+    "export function trialEndsAt(startedAt: string): string {\n  if (!startedAt) startedAt = new Date().toISOString();\n  return addDays(startedAt, TRIAL_DAYS);",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `o relógio implícito passou:\n${r.out}`);
+  assert.match(r.out, /BF-32/);
+});
+
+test("MUT-37: service role alcançada por componente cliente é DETECTADA", () => {
+  const r = mutar(
+    "src/components/billing/plan-card.tsx",
+    'import type { SubscriptionPlan } from "@/lib/billing/actions"',
+    'import type { SubscriptionPlan } from "@/lib/billing/actions"\nimport { createServiceClient } from "@/lib/supabase/service"',
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `o vazamento de service role passou:\n${r.out}`);
+  assert.match(r.out, /BF-33/);
+});
+
+test("MUT-38: função sem search_path fixado é DETECTADA", () => {
+  const r = mutar(
+    "supabase/migrations/20260801120000_billing_foundation.sql",
+    "RETURNS trigger\nLANGUAGE plpgsql\nSET search_path TO 'pg_catalog', 'pg_temp'",
+    "RETURNS trigger\nLANGUAGE plpgsql",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `a função sem search_path passou:\n${r.out}`);
+  assert.match(r.out, /BF-30/);
+});
+
+test("MUT-39: remover o ensaio de rollback do CI é DETECTADO", () => {
+  const r = mutar(
+    ".github/workflows/ci.yml",
+    "      - name: Rollback e reaplicação da nova forward-only",
+    "      - name: Passo neutro\n        run: 'true'\n      - name: Desativado",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `a remoção do ensaio passou:\n${r.out}`);
+  assert.match(r.out, /BF-34/);
+});
+
+test("MUT-40: tirar a verificação de hashes das históricas do CI é DETECTADO", () => {
+  const r = mutar(
+    ".github/workflows/ci.yml",
+    "        run: node tests/verify-recovered-migrations.mjs supabase/migrations",
+    "        run: 'true'",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `a remoção da conferência de hashes passou:\n${r.out}`);
+  assert.match(r.out, /BF-34/);
 });
 
 // ─── Limpeza ────────────────────────────────────────────────────────────────

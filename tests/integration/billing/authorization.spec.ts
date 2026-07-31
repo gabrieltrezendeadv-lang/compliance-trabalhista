@@ -31,7 +31,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
 
 import { createClient } from "@/lib/supabase/server";
-import { requireBillingOwner } from "@/lib/billing/authorization";
+import {
+  requireBillingOwner,
+  requireBillingOwnerFor,
+} from "@/lib/billing/authorization";
 
 import {
   adminA,
@@ -41,9 +44,11 @@ import {
   investigatorA,
   managerA,
   ownerA,
+  ownerB,
   userWithoutOrg,
   type Identity,
 } from "../../fixtures/identities";
+import { TENANT_A, TENANT_B } from "../../fixtures/tenants";
 import {
   createFakeSupabase,
   type FakeSupabaseOptions,
@@ -171,6 +176,33 @@ describe("fail-closed", () => {
     expect(r.reason).toBe("verification_failed");
   });
 
+  it("exceção do cliente NEGA em vez de escapar", async () => {
+    // Sem tratamento, a promessa rejeitaria e o chamador — que testa
+    // `if (!r.ok)` — nunca rodaria. A operação abortaria com erro não
+    // tratado: seguro por acidente, e não por decisão.
+    vi.mocked(createClient).mockRejectedValue(new Error("connect ETIMEDOUT"));
+    const r = await requireBillingOwner();
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("verification_failed");
+  });
+
+  it("resposta malformada não autoriza", async () => {
+    install(ownerA, {
+      from: {
+        organization_members: {
+          // Veio linha e o papel é owner, mas sem tenant utilizável.
+          data: { tenant_id: null, role: "owner" },
+          error: null,
+        },
+      },
+    });
+    const r = await requireBillingOwner();
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("verification_failed");
+  });
+
   it("erro de consulta NUNCA vira permissão", async () => {
     // É o defeito exato que esta etapa corrige em enforcePlanLimit. Ele não
     // pode reaparecer por outra porta.
@@ -187,5 +219,66 @@ describe("fail-closed", () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("verification_failed");
+  });
+});
+
+describe("IDOR — o identificador vindo do cliente nunca autoriza", () => {
+  // O formato clássico: o servidor confirma "é owner de alguma coisa" e depois
+  // OPERA sobre o `organization_id` que o cliente mandou. O proprietário do
+  // tenant A administraria a assinatura do tenant B sem sair da sessão dele.
+
+  it("owner do tenant A é aceito para a PRÓPRIA organização", async () => {
+    install(ownerA);
+    const r = await requireBillingOwnerFor(TENANT_A.id);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.principal.organizationId).toBe(TENANT_A.id);
+  });
+
+  it("owner do tenant A é RECUSADO ao pedir o tenant B", async () => {
+    install(ownerA);
+    const r = await requireBillingOwnerFor(TENANT_B.id);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("not_owner");
+  });
+
+  it("owner do tenant B é RECUSADO ao pedir o tenant A — a recusa vale nos dois sentidos", async () => {
+    install(ownerB);
+    const r = await requireBillingOwnerFor(TENANT_A.id);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("not_owner");
+  });
+
+  it("a recusa não confirma a existência da organização alheia", async () => {
+    // `not_owner` para os dois casos: organização inexistente e organização
+    // real de outro tenant. Uma mensagem distinta viraria oráculo de
+    // enumeração.
+    install(ownerA);
+    const alheia = await requireBillingOwnerFor(TENANT_B.id);
+    const inexistente = await requireBillingOwnerFor(
+      "00000000-0000-4000-8000-00000000dead"
+    );
+    expect(alheia.ok).toBe(false);
+    expect(inexistente.ok).toBe(false);
+    if (alheia.ok || inexistente.ok) return;
+    expect(inexistente.reason).toBe(alheia.reason);
+  });
+
+  it("entrada vazia é recusada, e não substituída pela do servidor", async () => {
+    install(ownerA);
+    for (const entrada of ["", "   ", null as unknown as string, undefined as unknown as string]) {
+      const r = await requireBillingOwnerFor(entrada);
+      expect(r.ok).toBe(false);
+    }
+  });
+
+  it("admin do tenant A é recusado mesmo pedindo a própria organização", async () => {
+    install(adminA);
+    const r = await requireBillingOwnerFor(TENANT_A.id);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("not_owner");
   });
 });
