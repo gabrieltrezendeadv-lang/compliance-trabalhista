@@ -128,6 +128,18 @@ $$;`,
       "`scripts/ci/assert-billing-security.sql`, que roda no job Verify " +
       "contra PostgreSQL real. Ver docs/decisions/PLANOS-E-PRECIFICACAO.md §8.1.",
   },
+  {
+    migration: "20260802093000_billing_orchestration.sql",
+    efeitoEstrutural: false,
+    nota:
+      "Etapa 12B. Puramente aditiva e inteiramente dentro do schema `billing`: " +
+      "quatro tabelas, três tipos e quatro colunas em `billing.audit_events`. " +
+      "Não toca em `public` — nem em DDL, nem em DML. Como `schema.sql` é " +
+      "gerado com `pg_dump --schema=public`, o efeito sobre o snapshot " +
+      "estrutural é nulo. A cobertura de segurança correspondente está em " +
+      "`scripts/ci/assert-billing-orchestration.sql`, executada no job Verify " +
+      "contra PostgreSQL real.",
+  },
 ];
 
 const modoCheck = process.argv.includes("--check");

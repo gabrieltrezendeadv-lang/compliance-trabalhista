@@ -137,12 +137,29 @@ test("BF-01: a migration existe e é forward-only", () => {
     "a migration não foi classificada como forward-only"
   );
 
-  // Estritamente posterior a TODA forward-only anterior.
-  for (const f of c.forwardOnly) {
-    if (f.version !== VERSAO) {
-      assert.ok(VERSAO > f.version, `${VERSAO} não é posterior a ${f.version}`);
-    }
+  // Estritamente posterior às forward-only que EXISTIAM antes dela.
+  //
+  // A versão anterior exigia posterioridade a TODA forward-only do
+  // repositório — verdadeiro enquanto esta era a última, e falso assim que a
+  // 12B entrou. A afirmação correta é sobre a ordem entre ela e as anteriores;
+  // migrations posteriores são legítimas e não a invalidam.
+  const ANTERIORES = ["20260730123613", "20260731094500"];
+  for (const anterior of ANTERIORES) {
+    assert.ok(
+      c.forwardOnly.some((f) => f.version === anterior),
+      `a forward-only anterior ${anterior} sumiu do repositório`
+    );
+    assert.ok(VERSAO > anterior, `${VERSAO} não é posterior a ${anterior}`);
   }
+
+  // E a ordem do conjunto inteiro continua estritamente crescente.
+  const versoesFO = c.forwardOnly.map((f) => f.version);
+  assert.deepEqual(
+    versoesFO,
+    [...versoesFO].sort(),
+    "as forward-only deixaram de estar em ordem crescente"
+  );
+  assert.equal(new Set(versoesFO).size, versoesFO.length, "há versão duplicada");
 });
 
 test("BF-02: a migration não cria, altera nem remove objeto em public", () => {

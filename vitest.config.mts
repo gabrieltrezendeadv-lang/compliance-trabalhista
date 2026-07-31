@@ -25,6 +25,10 @@ export default defineConfig({
         test: {
           name: "unit",
           environment: "node",
+          // Armadilha de rede: qualquer `fetch`/XHR/WebSocket num teste vira
+          // falha, com o alvo na mensagem. A Etapa 12B roda só com o provider
+          // mock, e essa afirmação precisava de imposição, não de revisão.
+          setupFiles: ["./tests/setup/no-network.ts"],
           include: [
             "tests/unit/**/*.spec.ts",
             "tests/integration/**/*.spec.ts",

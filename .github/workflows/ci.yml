@@ -143,6 +143,17 @@ jobs:
       #
       # Tudo contra a stack local. Nenhum acesso remoto, nenhuma credencial.
       # ────────────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────────────────────────
+      # ORQUESTRAÇÃO DA 12B (persistência)
+      #
+      # Quatro coisas que o repositório em memória NÃO tem como reproduzir, e
+      # que por isso só se provam aqui: UNIQUE resolvendo concorrência,
+      # transação desfazendo escrita parcial, RLS/grants efetivos, e trigger de
+      # imutabilidade sobre linha real.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Integração da orquestração de billing (12B)
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-billing-orchestration.sql'
+
       - name: 36/36 hashes das históricas contra o manifesto
         run: node tests/verify-recovered-migrations.mjs supabase/migrations
 
@@ -151,6 +162,8 @@ jobs:
           set -o pipefail
           "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
             -f scripts/ci/verify-applied/20260801120000.sql
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
+            -f scripts/ci/verify-applied/20260802093000.sql
 
       - name: Rollback e reaplicação da nova forward-only
         run: |
@@ -163,7 +176,8 @@ jobs:
           ANTES=$(P -At -c "SELECT count(*) FROM pg_namespace WHERE nspname='billing';")
           [ "$ANTES" = "1" ] || { echo "FALHA: schema billing ausente antes do rollback"; exit 1; }
 
-          echo "== rollback =="
+          echo "== rollback (12B primeiro, depois 12A — ordem inversa da aplicação) =="
+          P -f supabase/rollbacks/20260802093000_billing_orchestration_rollback.sql
           P -f supabase/rollbacks/20260801120000_billing_foundation_rollback.sql
 
           DEPOIS=$(P -At -c "SELECT count(*) FROM pg_namespace WHERE nspname='billing';")
@@ -181,11 +195,13 @@ jobs:
             exit 1
           fi
 
-          echo "== reaplicação =="
+          echo "== reaplicação (as DUAS, na ordem) =="
           P -f supabase/migrations/20260801120000_billing_foundation.sql
+          P -f supabase/migrations/20260802093000_billing_orchestration.sql
 
-          echo "== verificador independente, de novo =="
+          echo "== verificadores independentes, de novo =="
           P -f scripts/ci/verify-applied/20260801120000.sql
+          P -f scripts/ci/verify-applied/20260802093000.sql
 
           P -At -c "SELECT slug, coalesce(is_active::text,'NULO') FROM public.subscription_plans ORDER BY slug;" \
             > /tmp/planos-reaplicado.txt

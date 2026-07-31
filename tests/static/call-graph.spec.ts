@@ -116,6 +116,12 @@ describe("fronteira do service_role", () => {
       "lib/complaints/gateway.ts",
       "lib/supabase/service.ts",
       "app/api/cron/close-assessment-cycles/route.ts",
+      // Etapa 12B. O repositório de billing alcança o schema `billing`, que
+      // não é exposto ao PostgREST e portanto só é legível com service_role.
+      // A entrada é NOMINAL e o arquivo é `server-only`: importá-lo de um
+      // componente cliente é erro de build. `tests/billing-orchestration-guard.mjs`
+      // confere que ele continua sendo isso.
+      "lib/billing/repositories/supabase.ts",
     ]);
 
     const unexpected = ALL_TS_FILES.filter((filePath) => {

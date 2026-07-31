@@ -112,9 +112,18 @@ BEGIN
       v_int, v_lista;
   END IF;
 
-  -- A.4 DELETE não é concedido a ninguém, e UPDATE só em `subscriptions`.
-  --     Nenhum dado é apagado por downgrade ou inadimplência — a regra está
-  --     escrita no ACL, não apenas na documentação.
+  -- A.4 DELETE não é concedido a ninguém; UPDATE só em `subscriptions` e
+  --     `charges`.
+  --
+  --     `charges` entrou na lista na 12B, e a extensão é DELIBERADA: o status
+  --     de uma cobrança muda ao longo do ciclo (pendente → paga/falha), e
+  --     modelá-lo append-only obrigaria a agregar eventos em toda leitura sem
+  --     ganho de segurança — a imutabilidade que importa, do PREÇO CONTRATADO
+  --     e da TRILHA, continua imposta por trigger.
+  --
+  --     A lista é fechada e verificada por guarda estática: acrescentar uma
+  --     terceira tabela exige alterar o teste, e isso aparece no diff do PR.
+  --     Nenhum dado é apagado por downgrade ou inadimplência.
   SELECT string_agg(format('%s→%s em %s', pg_get_userbyid(a.grantee),
                            a.privilege_type, c.relname),
                     ', ' ORDER BY c.relname)
@@ -127,7 +136,7 @@ BEGIN
      AND (
        a.privilege_type = 'DELETE'
        OR a.privilege_type = 'TRUNCATE'
-       OR (a.privilege_type = 'UPDATE' AND c.relname <> 'subscriptions')
+       OR (a.privilege_type = 'UPDATE' AND c.relname NOT IN ('subscriptions', 'charges'))
      );
   IF v_lista IS NOT NULL THEN
     RAISE EXCEPTION 'ASSERÇÃO REPROVADA: privilégio de mutação indevido em billing: %', v_lista;

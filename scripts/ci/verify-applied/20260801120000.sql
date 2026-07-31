@@ -56,11 +56,23 @@ BEGIN
     RAISE EXCEPTION 'VERIF 20260801120000: tabela(s) ausente(s) em billing: %', v_faltando;
   END IF;
 
+  -- PRESENÇA das 9, e não contagem exata do schema.
+  --
+  -- A versão anterior exigia `= 9`. A afirmação estava errada em espírito: o
+  -- trabalho de um verificador é conferir o efeito da SUA migration, não
+  -- congelar o schema inteiro. Migrations posteriores acrescentam tabelas
+  -- legitimamente — a 12B acrescenta quatro —, e a contagem exata reprovaria
+  -- uma aplicação correta pelo motivo errado.
+  --
+  -- A lista nominal acima continua obrigatória: se qualquer uma das 9 sumir,
+  -- este verificador reprova. O que se abandonou foi apenas a exigência de que
+  -- nada mais exista.
   SELECT count(*) INTO v_tabelas
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 'billing' AND c.relkind = 'r';
-  IF v_tabelas <> 9 THEN
-    RAISE EXCEPTION 'VERIF 20260801120000: billing tem % tabela(s), esperadas 9', v_tabelas;
+  IF v_tabelas < 9 THEN
+    RAISE EXCEPTION
+      'VERIF 20260801120000: billing tem % tabela(s), esperadas ao menos 9', v_tabelas;
   END IF;
 
   SELECT count(*) INTO v_sem_rls
