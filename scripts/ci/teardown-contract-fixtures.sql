@@ -20,6 +20,18 @@
 
 BEGIN;
 
+-- ── POR QUE OS TRIGGERS SÃO DESLIGADOS AQUI ─────────────────────────────────
+--
+-- `tg_price_snapshot_immutable` e `tg_audit_events_append_only` recusam DELETE
+-- — e é exatamente para isso que existem. A limpeza de fixture é o único caso
+-- legítimo em que se precisa apagar, e ela roda como PROPRIETÁRIO, contra a
+-- stack descartável, dentro desta transação.
+--
+-- `SET LOCAL` limita o efeito a esta transação: o COMMIT o desfaz, e nenhuma
+-- outra sessão enxerga o afrouxamento. A imutabilidade continua valendo para
+-- todo o resto, e `assert-billing-orchestration.sql` a exercita.
+SET LOCAL session_replication_role = replica;
+
 DELETE FROM billing.provider_events
  WHERE organization_id::text LIKE :'PREFIXO';
 
