@@ -218,15 +218,30 @@ test("RES-09: com o ledger REAL da execução nº 5, a aplicada permanece e nada
     }
   }
 
+  // As pendentes são DERIVADAS do diretório real e do ledger real, e não
+  // fixadas em número. A versão anterior exigia exatamente uma e passou a
+  // reprovar quando a terceira forward-only entrou no repositório — falha do
+  // teste, não da regra. O que este cenário existe para provar continua
+  // intacto: nenhuma versão do ledger sai do diretório.
   const pendentes = fs
     .readdirSync(dir)
     .filter((f) => f.endsWith(".sql") && f.slice(0, 14) > LIMITE)
-    .filter((f) => !registros.some((r) => r.startsWith(f.slice(0, 14))));
-  assert.equal(pendentes.length, 1, `esperada 1 pendente, achadas ${pendentes.length}`);
+    .filter((f) => !registros.some((r) => r.startsWith(f.slice(0, 14))))
+    .sort();
+  assert.ok(pendentes.length >= 1, "o repositório deveria ter pendente neste ledger");
 
-  const r = reservar(pendentes[0], ledgerReal, dir);
+  // A rota só aceita a MAIS ANTIGA pendente (P8). Reservadas: as demais.
+  const selecionada = pendentes[0];
+  const esperadoReservado = pendentes.slice(1);
+
+  const r = reservar(selecionada, ledgerReal, dir);
   assert.equal(r.code, 0, r.out);
-  assert.deepEqual(arquivos(r.dirReserva ?? ""), [], "nada deveria ser reservado neste estado");
+  assert.deepEqual(
+    arquivos(r.dirReserva ?? ""),
+    esperadoReservado,
+    "só as pendentes não selecionadas podem ser reservadas"
+  );
+  assert.ok(fs.existsSync(path.join(dir, selecionada)), "a selecionada tem de permanecer");
 
   // Toda versão do ledger continua com arquivo presente.
   for (const linha of registros) {

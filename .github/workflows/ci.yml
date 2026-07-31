@@ -111,6 +111,25 @@ jobs:
         run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-no-public-execute.sql'
 
       # ────────────────────────────────────────────────────────────────────
+      # SEGURANÇA DO SCHEMA `billing` (Etapa 12A)
+      #
+      # A fundação de planos vive num schema próprio, fora de `public`, para
+      # não perturbar as âncoras do migration-rebuild-verify — e, pelo mesmo
+      # motivo, fora do alcance da asserção acima, que varre só `public`.
+      #
+      # Trocar uma cobertura por nenhuma seria regressão. Este passo é a
+      # cobertura equivalente, e vai além: além de conferir catálogo (RLS,
+      # policies, privilégios, triggers), EXECUTA o comportamento — insere,
+      # tenta alterar, tenta apagar, e exige que o banco recuse. Tudo em
+      # transação encerrada por ROLLBACK, contra a mesma stack descartável.
+      #
+      # "A trigger existe" e "a trigger funciona" são afirmações diferentes.
+      # Só a segunda vale como prova.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Segurança e imutabilidade do schema billing
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-billing-security.sql'
+
+      # ────────────────────────────────────────────────────────────────────
       # LEITURA DO LEDGER — contra psql de verdade
       #
       # A estreia da rota de aplicação falhou porque o passo de leitura do

@@ -50,6 +50,7 @@ on:
         options:
           - 20260730123613_revoke_public_webhook_execute.sql
           - 20260731094500_make_tenant_resolution_deterministic.sql
+          - 20260801120000_billing_foundation.sql
       confirmacao:
         description: 'Digite APLICAR para confirmar. Qualquer outro valor aborta.'
         required: true

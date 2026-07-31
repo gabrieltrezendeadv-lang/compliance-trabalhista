@@ -227,6 +227,24 @@ O que o verificador independente **prova**, em cada aplicação, por consulta de
 
 ### Nenhuma nova aplicação deve ser disparada
 
-**Não há o que aplicar.** Com o ledger em 38/38 e nenhuma pendente, um `workflow_dispatch` hoje seria recusado pela pré-condição **P6** (versão já consta do ledger) — a rota falha fechada, mas gastaria a espera de 15 minutos e uma aprovação à toa.
+**Não há o que aplicar** enquanto o ledger estiver em 38/38 e nenhuma migration nova tiver sido mergeada. Nesse estado, um `workflow_dispatch` seria recusado pela pré-condição **P6** (versão já consta do ledger) — a rota falha fechada, mas gastaria a espera de 15 minutos e uma aprovação à toa.
 
 A rota só deve ser acionada de novo quando existir uma **nova migration forward-only aprovada e mergeada na `main`**, com sua opção acrescentada ao `choice` do workflow (AP-03 reprova se a lista divergir) e seu arquivo em `scripts/ci/verify-applied/<versão>.sql` (AP-19 exige um para cada opção).
+
+## 12. Forward-only pendentes de aplicação
+
+| Versão | Migration | Origem | Estado |
+| --- | --- | --- | --- |
+| `20260801120000` | `billing_foundation` | Etapa 12A — fundação de planos e cobrança | **no repositório, NÃO aplicada** |
+
+Registrada aqui porque o repositório e o banco ficam divergentes nesse intervalo, e a divergência precisa ser visível em vez de descoberta na próxima execução da rota.
+
+O que já está pronto para ela, e é exigido por guarda:
+
+* opção no `choice` do workflow — **AP-03** reprova se a lista divergir do diretório;
+* `scripts/ci/verify-applied/20260801120000.sql` — **AP-19** exige um verificador por opção, somente leitura, sem fixture;
+* `supabase/rollbacks/20260801120000_billing_foundation_rollback.sql`;
+* delta declarado em `scripts/ci/build-expected-schema.mjs` como `efeitoEstrutural: false` — a migration cria tudo no schema `billing`, que `pg_dump --schema=public` e `extract-security.sql` não enxergam, então as duas âncoras do `migration-rebuild-verify` continuam valendo sem redeclaração;
+* `scripts/ci/assert-billing-security.sql` no job `Verify`, cobrindo o que a asserção de `EXECUTE`/`PUBLIC` não alcança fora de `public`.
+
+**A aplicação depende de autorização própria.** Ela não foi pedida nem concedida na Etapa 12A, e a ordem de aplicação continua valendo: `20260801120000` é a mais antiga pendente, então é a única que **P8** aceita quando chegar a hora.

@@ -113,6 +113,21 @@ $$;`,
   LIMIT 1;
 $$;`,
   },
+  {
+    migration: "20260801120000_billing_foundation.sql",
+    efeitoEstrutural: false,
+    nota:
+      "Cria TODOS os seus objetos no schema `billing`. `schema.sql` é gerado " +
+      "com `pg_dump --schema=public`, que não enxerga outro schema — e o " +
+      "extrator de segurança filtra `nspname = 'public'`, também não. O único " +
+      "comando que toca `public` é `UPDATE public.subscription_plans SET " +
+      "is_active = false`, que é DML e não aparece em dump estrutural. " +
+      "Portanto: efeito estrutural nulo sobre o snapshot. " +
+      "A contrapartida — a fundação ficar fora do alcance de " +
+      "`assert-no-public-execute.sql` — é coberta por " +
+      "`scripts/ci/assert-billing-security.sql`, que roda no job Verify " +
+      "contra PostgreSQL real. Ver docs/decisions/PLANOS-E-PRECIFICACAO.md §8.1.",
+  },
 ];
 
 const modoCheck = process.argv.includes("--check");

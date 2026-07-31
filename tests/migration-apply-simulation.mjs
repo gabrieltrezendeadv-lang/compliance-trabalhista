@@ -23,6 +23,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseManifest } from "./lib/manifest.mjs";
+import { classificarMigrations } from "./lib/migrations.mjs";
 
 const raiz = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WORKFLOW = path.join(raiz, ".github/workflows/migration-apply.yml");
@@ -185,7 +186,25 @@ test("SIM-06: ACEITA a mais antiga pendente, com o ledger íntegro", () => {
   const r = precondicoes(FO1, ledger([]));
   assert.equal(r.code, 0, `a rota deveria ter aceitado:\n${r.out}`);
   assert.match(r.out, /pré-condições aprovadas para 20260730123613/);
-  assert.match(r.out, /P8: é a mais antiga das 2 pendente\(s\)/);
+
+  // A contagem de pendentes é DERIVADA do repositório, não escrita à mão.
+  // A versão anterior fixava "2" e passou a reprovar quando a terceira
+  // forward-only entrou — falha do teste, não da rota. Derivar mantém a
+  // asserção específica (o número exato continua sendo conferido) sem
+  // reprovar a cada migration nova.
+  const forwardOnly = classificarMigrations(
+    path.join(raiz, "supabase/migrations"),
+    parseManifest(
+      fs.readFileSync(path.join(raiz, "supabase/baseline/applied-migrations.tsv"), "utf8")
+    ).map((m) => m.version)
+  ).forwardOnly.length;
+
+  assert.ok(forwardOnly >= 1, "o repositório deveria ter forward-only");
+  assert.match(
+    r.out,
+    new RegExp(`P8: é a mais antiga das ${forwardOnly} pendente\\(s\\)`),
+    `esperadas ${forwardOnly} pendentes (nenhuma no ledger sintético)`
+  );
 });
 
 test("SIM-07: ACEITA a segunda depois que a primeira consta do ledger", () => {
