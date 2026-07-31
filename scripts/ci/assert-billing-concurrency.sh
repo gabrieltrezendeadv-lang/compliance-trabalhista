@@ -82,8 +82,8 @@ INSERT INTO auth.users (id, instance_id, aud, role, email)
 VALUES ('$DONO', '00000000-0000-0000-0000-000000000000', 'authenticated',
         'authenticated', 'dono@corrida.test')
 ON CONFLICT (id) DO NOTHING;
--- `auth.users` tem trigger que já cria o perfil. O INSERT abaixo é para o caso
--- de a trigger não existir no descartável — por isso ON CONFLICT.
+-- auth.users tem trigger que ja cria o perfil. O INSERT abaixo cobre o caso
+-- de a trigger nao existir no descartavel. Sem crase: heredoc nao-quotado.
 INSERT INTO public.profiles (id, full_name, email)
 VALUES ('$DONO', 'dono corrida', 'dono@corrida.test')
 ON CONFLICT (id) DO NOTHING;
@@ -126,8 +126,12 @@ PB=$!
 
 wait "$ARBITRO" "$PA" "$PB"
 
-A=$(tail -1 /tmp/corrida-a.txt)
-B=$(tail -1 /tmp/corrida-b.txt)
+# O desfecho, e nao o tag de status: `-At` ainda imprime BEGIN/COMMIT, e
+# `tail -1` devolvia "COMMIT". O conjunto de desfechos e fechado, entao
+# extrai-se por ele.
+desfecho() { grep -oE '^(claimed|in_progress|completed|fingerprint_conflict)$' "$1" | head -1; }
+A=$(desfecho /tmp/corrida-a.txt)
+B=$(desfecho /tmp/corrida-b.txt)
 echo "  disputante A: $A"
 echo "  disputante B: $B"
 
@@ -178,7 +182,7 @@ SQL
 done
 wait
 
-C=$(tail -1 /tmp/corrida-C.txt); D=$(tail -1 /tmp/corrida-D.txt)
+C=$(desfecho /tmp/corrida-C.txt); D=$(desfecho /tmp/corrida-D.txt)
 echo "  disputante C: $C"
 echo "  disputante D: $D"
 
@@ -212,8 +216,8 @@ SQL
 done
 wait
 
-echo "  finalize E: $(tail -1 /tmp/corrida-E.txt)"
-echo "  finalize F: $(tail -1 /tmp/corrida-F.txt)"
+echo "  finalize E: $(desfecho /tmp/corrida-E.txt)"
+echo "  finalize F: $(desfecho /tmp/corrida-F.txt)"
 
 COBRANCAS=$(Q -c "SELECT count(*) FROM billing.charges WHERE organization_id='$ORG';")
 if [ "$COBRANCAS" != "1" ]; then
