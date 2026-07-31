@@ -261,14 +261,29 @@ jobs:
             http://127.0.0.1:*|http://localhost:*) ;;
             *) echo "FALHA: contrato só roda contra loopback (recebido: $BILLING_CONTRACT_URL)"; exit 1 ;;
           esac
-          npx --no-install vitest run --project contract 2>&1 | tee /tmp/contrato.log
+          # ── ISOLADO, UM ARQUIVO POR VEZ ──────────────────────────────────
+          #
+          # Rodar os dois arquivos juntos interleava a saída, e na primeira
+          # execução real ficou impossível dizer quais casos falharam em qual
+          # variante. `--no-file-parallelism` e um arquivo por invocação
+          # resolvem isso; `--reporter=verbose` dá o caso a caso.
+          echo "===== VARIANTE EM MEMÓRIA ====="
+          npx --no-install vitest run --project contract \
+            --no-file-parallelism --reporter=verbose \
+            tests/contract/in-memory.spec.ts 2>&1 | tee /tmp/contrato-memoria.log
+
+          echo "===== VARIANTE POSTGREST REAL ====="
+          npx --no-install vitest run --project contract \
+            --no-file-parallelism --reporter=verbose \
+            tests/contract/postgrest.spec.ts 2>&1 | tee /tmp/contrato-real.log
+
           # A variante real NÃO pode ter sido pulada: um skip silencioso aqui
           # devolveria exatamente o buraco que este passo existe para fechar.
-          if grep -q "PULADO" /tmp/contrato.log; then
+          if grep -q "PULADO" /tmp/contrato-real.log; then
             echo "FALHA: a variante PostgREST foi pulada — o caminho real não foi exercitado"
             exit 1
           fi
-          grep -q "PostgREST real" /tmp/contrato.log || {
+          grep -q "PostgREST real" /tmp/contrato-real.log || {
             echo "FALHA: a suíte do PostgREST real não apareceu no relatório"; exit 1; }
 
       # `if: always()` para que a limpeza aconteça mesmo quando um passo
