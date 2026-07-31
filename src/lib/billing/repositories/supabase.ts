@@ -127,6 +127,14 @@ function erroDeRpc<T>(erro: ErroPostgrest, contexto: string): Result<T> {
   if (code === "23505") {
     return fail("conflict", `${contexto}: conflito de unicidade`, { code });
   }
+  // `restrict_violation` é o que as triggers de `billing.charges` levantam:
+  // transição inválida (`paid → failed`) e alteração de coluna imutável. São
+  // recusas de DOMÍNIO, decididas pelo banco — mapeá-las como
+  // indisponibilidade diria "tente de novo" para algo que nunca vai passar, e
+  // esconderia um defeito de lógica atrás de um erro de infraestrutura.
+  if (code === "23001") {
+    return fail("invalid_state", `${contexto}: transição ou alteração recusada`, { code });
+  }
   // Inclusive PGRST202 ("função não encontrada") e PGRST106 ("schema não
   // exposto"): os dois significam que o caminho está quebrado, e caminho
   // quebrado NEGA.
