@@ -616,6 +616,82 @@ test("MUT-B41: transformar a corrida real em INSERT sequencial é DETECTADO", ()
   assert.match(r.out, /BO-17/);
 });
 
+// ─── A âncora B e o splitter ────────────────────────────────────────────────
+
+const REBUILD = ".github/workflows/migration-rebuild-verify.yml";
+
+test("MUT-B42: remover o splitter da âncora B é DETECTADO", () => {
+  const r = mutar(
+    REBUILD,
+    "          node scripts/ci/split-public-rpcs.mjs \\\n            artifacts/rebuilt-schema.sql \\\n            artifacts/rebuilt-sem-rpcs.sql \\\n            artifacts/rebuilt-rpcs.sql | tee artifacts/splitter.log",
+    "          cp artifacts/rebuilt-schema.sql artifacts/rebuilt-sem-rpcs.sql",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `a âncora B sem splitter passou:\n${r.out}`);
+  assert.match(r.out, /BO-25/);
+});
+
+test("MUT-B43: comparar o dump BRUTO na âncora B é DETECTADO", () => {
+  // O bruto contém as dezesseis RPCs; compará-lo faria a âncora divergir — ou,
+  // pior, alguém "consertaria" a baseline para caber.
+  const r = mutar(
+    REBUILD,
+    "normalize-schema-dump.mjs artifacts/rebuilt-sem-rpcs.sql artifacts/rebuilt-schema.norm.sql",
+    "normalize-schema-dump.mjs artifacts/rebuilt-schema.sql artifacts/rebuilt-schema.norm.sql",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `a comparação do dump bruto passou:\n${r.out}`);
+  assert.match(r.out, /BO-25/);
+});
+
+test("MUT-B44: afrouxar a contagem de 16 blocos é DETECTADO", () => {
+  const r = mutar(
+    REBUILD,
+    '[ "$BLOCOS" -eq 16 ]',
+    '[ "$BLOCOS" -ge 1 ]',
+    GUARDA
+  );
+  assert.equal(r.code, 1, `a contagem afrouxada passou:\n${r.out}`);
+  assert.match(r.out, /BO-25/);
+});
+
+test("MUT-B45: omitir o catálogo das RPCs na âncora B é DETECTADO", () => {
+  // A retirada textual não prova owner, SECURITY DEFINER, search_path, nomes de
+  // parâmetro nem ACL: o dump é tirado com --no-owner --no-privileges.
+  const r = mutar(
+    REBUILD,
+    "      - name: Âncora B — catálogo das RPCs no banco reconstruído\n        run: '\"$PGBIN/psql\" \"$DB_URL\" -v ON_ERROR_STOP=1 -f scripts/ci/assert-billing-rpcs.sql'",
+    "      - name: Âncora B — catálogo das RPCs no banco reconstruído\n        run: 'echo pulado'",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `a âncora B sem prova de catálogo passou:\n${r.out}`);
+  assert.match(r.out, /BO-25/);
+});
+
+test("MUT-B46: ignorar o exit code do splitter é DETECTADO", () => {
+  const r = mutar(
+    REBUILD,
+    "            artifacts/rebuilt-rpcs.sql | tee artifacts/splitter.log",
+    "            artifacts/rebuilt-rpcs.sql | tee artifacts/splitter.log || true",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `o exit code ignorado passou:\n${r.out}`);
+  assert.match(r.out, /BO-25/);
+});
+
+test("MUT-B47: rodar o splitter na âncora A é DETECTADO", () => {
+  // Lá as dezesseis ainda não existem: o splitter reprovaria por assinatura
+  // ausente, e sugeriria que o dump histórico precisa de tratamento.
+  const r = mutar(
+    REBUILD,
+    '            -f artifacts/historicas-schema.sql\n          wc -c artifacts/historicas-schema.sql',
+    '            -f artifacts/historicas-schema.sql\n          node scripts/ci/split-public-rpcs.mjs artifacts/historicas-schema.sql /tmp/a.sql /tmp/b.sql\n          wc -c artifacts/historicas-schema.sql',
+    GUARDA
+  );
+  assert.equal(r.code, 1, `o splitter na âncora A passou:\n${r.out}`);
+  assert.match(r.out, /BO-25/);
+});
+
 // ─── Limpeza ────────────────────────────────────────────────────────────────
 
 fs.rmSync(copia, { recursive: true, force: true });

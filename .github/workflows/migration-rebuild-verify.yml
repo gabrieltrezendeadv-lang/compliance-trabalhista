@@ -292,6 +292,50 @@ jobs:
             -f scripts/ci/extract-security.sql > artifacts/rebuilt-security.txt
           wc -l artifacts/rebuilt-security.txt
 
+      # ── SPLITTER: separa as 16 RPCs nominais do dump REAL ───────────────────
+      #
+      # A 12B cria dezesseis funções em `public`, e funções de `public` estão no
+      # dump. Sem esta separação a âncora B divergiria — e as duas saídas ruins
+      # seriam redigir à mão o texto que o pg_dump emite (adivinhar formatação)
+      # ou gerar o esperado a partir do dump (o que aprovaria qualquer coisa que
+      # a migration fizesse).
+      #
+      # O splitter atua SOMENTE no dump real. O arquivo esperado continua
+      # byte a byte idêntico e nunca passa por aqui.
+      #
+      # A retirada textual NÃO substitui a prova de catálogo: `assert-billing-
+      # rpcs.sql` roda no mesmo run, contra o mesmo banco, e confere owner,
+      # SECURITY DEFINER, search_path, nomes de parâmetro e ACL — coisas que o
+      # dump, tirado com --no-owner --no-privileges, nunca enxergou.
+      - name: Âncora B — separar as RPCs nominais do dump real
+        run: |
+          set -o pipefail
+          node scripts/ci/split-public-rpcs.mjs \
+            artifacts/rebuilt-schema.sql \
+            artifacts/rebuilt-sem-rpcs.sql \
+            artifacts/rebuilt-rpcs.sql | tee artifacts/splitter.log
+
+          # Exatamente 16 blocos, um por assinatura da allowlist. O splitter já
+          # reprova ausente, extra e duplicada; aqui a contagem é conferida de
+          # novo, de fora, para que um afrouxamento dentro dele apareça.
+          BLOCOS=$(grep -c '^-- Name: fn_billing_.*Type: FUNCTION' artifacts/rebuilt-rpcs.sql)
+          echo "blocos extraídos: $BLOCOS"
+          [ "$BLOCOS" -eq 16 ] || { echo "FALHA: esperados 16 blocos, extraídos $BLOCOS"; exit 1; }
+
+          # E nenhuma sobra no dump principal.
+          if grep -q 'fn_billing_' artifacts/rebuilt-sem-rpcs.sql; then
+            echo "FALHA: fn_billing_ remanescente no dump principal:"
+            grep -n 'fn_billing_' artifacts/rebuilt-sem-rpcs.sql | head -20
+            exit 1
+          fi
+
+          echo "== assinaturas extraídas =="
+          grep '^-- Name: fn_billing_' artifacts/rebuilt-rpcs.sql | sed 's/^-- Name: /  /'
+          sha256sum artifacts/rebuilt-sem-rpcs.sql artifacts/rebuilt-rpcs.sql
+
+      - name: Âncora B — catálogo das RPCs no banco reconstruído
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-billing-rpcs.sql'
+
       # Asserção geral, sem exceção nominal: NENHUMA rotina de `public` pode
       # conceder EXECUTE a PUBLIC. Considera proacl nulo via acldefault, porque
       # o default do PostgreSQL para funções INCLUI PUBLIC — filtrar
@@ -399,7 +443,9 @@ jobs:
           node scripts/ci/normalize-schema-dump.mjs supabase/baseline/schema.sql artifacts/snapshot.norm.sql
           node scripts/ci/normalize-schema-dump.mjs supabase/baseline/schema-after-forward-only.sql artifacts/esperado.norm.sql
           node scripts/ci/normalize-schema-dump.mjs artifacts/historicas-schema.sql artifacts/historicas-schema.norm.sql
-          node scripts/ci/normalize-schema-dump.mjs artifacts/rebuilt-schema.sql artifacts/rebuilt-schema.norm.sql
+          # A âncora B compara o dump SEM as RPCs nominais — o bruto, que as
+          # contém, é preservado como artifact mas NÃO é o que se compara.
+          node scripts/ci/normalize-schema-dump.mjs artifacts/rebuilt-sem-rpcs.sql artifacts/rebuilt-schema.norm.sql
           node scripts/ci/normalize-schema-dump.mjs artifacts/baseline-roundtrip.sql artifacts/baseline-roundtrip.norm.sql
 
       # ÂNCORA A: as 36 históricas, sozinhas, reproduzem o snapshot histórico.
@@ -434,7 +480,7 @@ jobs:
       - name: Diff — âncora B (reconstrução completa × estado esperado)
         id: estrutura
         run: |
-          diff -u supabase/baseline/schema-after-forward-only.sql artifacts/rebuilt-schema.sql \
+          diff -u supabase/baseline/schema-after-forward-only.sql artifacts/rebuilt-sem-rpcs.sql \
             > artifacts/diff-estrutural-bruto.diff || true
           diff -u artifacts/esperado.norm.sql artifacts/rebuilt-schema.norm.sql \
             > artifacts/diff-estrutural-normalizado.diff || true

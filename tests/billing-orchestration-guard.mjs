@@ -446,6 +446,94 @@ test("BO-13: a migration da 12B é forward-only e posterior à 12A", () => {
   );
 });
 
+test("BO-25: o splitter está ligado à âncora B, e só a ela", () => {
+  const wf = ler(".github/workflows/migration-rebuild-verify.yml");
+  // Só a parte EXECUTÁVEL: comentário que descreve o passo não é o passo.
+  const executavel = wf
+    .split("\n")
+    .filter((l) => !/^\s*#/.test(l))
+    .join("\n");
+
+  // ── ÂNCORA A INTOCADA ─────────────────────────────────────────────────────
+  //
+  // Na âncora A só as 36 históricas são aplicadas, e as 16 RPCs ainda NÃO
+  // existem. Rodar o splitter ali reprovaria por assinatura ausente — e, pior,
+  // sugeriria que o dump histórico precisa de tratamento. Ele não precisa.
+  const iA = executavel.indexOf("Âncora A — dump estrutural das 36");
+  const iDevolver = executavel.indexOf("Devolver as migrations forward-only");
+  assert.ok(iA > 0 && iDevolver > iA, "a fase da âncora A mudou de forma");
+  assert.doesNotMatch(
+    executavel.slice(iA, iDevolver),
+    /split-public-rpcs/,
+    "o splitter foi executado na âncora A, onde as RPCs ainda não existem"
+  );
+
+  // ── ÂNCORA B: splitter no dump REAL ───────────────────────────────────────
+  assert.match(
+    executavel,
+    /node scripts\/ci\/split-public-rpcs\.mjs\s*\\\s*\n\s*artifacts\/rebuilt-schema\.sql\s*\\\s*\n\s*artifacts\/rebuilt-sem-rpcs\.sql\s*\\\s*\n\s*artifacts\/rebuilt-rpcs\.sql/,
+    "o splitter deixou de atuar sobre o dump real da reconstrução"
+  );
+
+  // O arquivo ESPERADO nunca é entrada do splitter: se fosse, a baseline
+  // passaria a ser derivada do que a migration fez, e aprovaria qualquer coisa.
+  assert.doesNotMatch(
+    executavel,
+    /split-public-rpcs\.mjs[^\n]*schema-after-forward-only/,
+    "o arquivo esperado foi passado ao splitter — a baseline deixaria de ser previsão"
+  );
+
+  // Exit code respeitado. O comando é multilinha (continuações com `\`), então
+  // a checagem cobre o COMANDO INTEIRO: um `|| true` na última continuação
+  // engoliria a falha tão bem quanto na primeira linha.
+  const iSplit = executavel.indexOf("split-public-rpcs.mjs");
+  assert.ok(iSplit > 0, "a chamada do splitter sumiu");
+  const comandoSplit = executavel.slice(iSplit, executavel.indexOf("\n\n", iSplit));
+  assert.doesNotMatch(comandoSplit, /\|\|\s*true/, "o exit code do splitter é ignorado");
+  assert.doesNotMatch(comandoSplit, /\|\|\s*:/, "o exit code do splitter é ignorado");
+
+  // ── A COMPARAÇÃO É SOBRE O DUMP SEM AS RPCs ───────────────────────────────
+  assert.match(
+    executavel,
+    /normalize-schema-dump\.mjs artifacts\/rebuilt-sem-rpcs\.sql artifacts\/rebuilt-schema\.norm\.sql/,
+    "a âncora B voltou a normalizar o dump BRUTO, que contém as RPCs"
+  );
+  assert.match(
+    executavel,
+    /diff -u artifacts\/esperado\.norm\.sql artifacts\/rebuilt-schema\.norm\.sql/,
+    "a comparação do restante contra o esperado sumiu"
+  );
+
+  // ── CONTAGEM E CONJUNTO ───────────────────────────────────────────────────
+  assert.match(executavel, /\[ "\$BLOCOS" -eq 16 \]/, "a contagem de 16 blocos foi afrouxada");
+  assert.match(
+    executavel,
+    /grep -q 'fn_billing_' artifacts\/rebuilt-sem-rpcs\.sql/,
+    "deixou de reprovar fn_billing_ remanescente no dump principal"
+  );
+
+  // ── CATÁLOGO NO MESMO RUN ─────────────────────────────────────────────────
+  //
+  // A retirada textual não prova owner, SECURITY DEFINER, search_path, nomes de
+  // parâmetro nem ACL — o dump é tirado com --no-owner --no-privileges.
+  assert.match(
+    executavel,
+    /-f scripts\/ci\/assert-billing-rpcs\.sql/,
+    "o catálogo das RPCs não é conferido no mesmo run da âncora B"
+  );
+
+  // Nenhum destes passos pode virar informativo.
+  for (const trecho of ["split-public-rpcs.mjs", "assert-billing-rpcs.sql"]) {
+    const i = executavel.indexOf(trecho);
+    const janela = executavel.slice(Math.max(0, i - 400), i);
+    assert.doesNotMatch(
+      janela,
+      /continue-on-error:\s*true/,
+      `o passo de ${trecho} virou informativo`
+    );
+  }
+});
+
 test("BO-24: a state machine do checkout propaga falha e não chama o provider à toa", () => {
   const src = tsExecutavel("src/lib/billing/usecases/payments.ts");
 
