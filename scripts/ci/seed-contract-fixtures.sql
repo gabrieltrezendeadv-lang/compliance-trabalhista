@@ -37,7 +37,7 @@ DECLARE
   v_suf    text;
 BEGIN
   FOR i IN 0..39 LOOP
-    v_suf    := lpad(i::text, 4, '0');
+    v_suf    := lpad(i::text, 8, '0');
     v_org_a  := ('0c07a000-0000-4000-8000-a001' || v_suf)::uuid;
     v_org_b  := ('0c07a000-0000-4000-8000-b001' || v_suf)::uuid;
     v_dono_a := ('0c07a000-0000-4000-8000-c001' || v_suf)::uuid;

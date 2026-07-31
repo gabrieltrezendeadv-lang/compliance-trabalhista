@@ -72,7 +72,7 @@ const PARES = 40;
 let proximoPar = 0;
 
 function uuidDeFixture(tipo: "orgA" | "orgB" | "donoA" | "donoB" | "colabA", i: number): string {
-  const sufixo = String(i).padStart(4, "0");
+  const sufixo = String(i).padStart(8, "0");
   const grupo = { orgA: "a001", orgB: "b001", donoA: "c001", donoB: "d001", colabA: "e001" }[tipo];
   return `0c07a000-0000-4000-8000-${grupo}${sufixo}`;
 }
@@ -115,7 +115,7 @@ if (!ATIVO) {
         orgB: uuidDeFixture("orgB", i),
         colaboradorA: uuidDeFixture("colabA", i),
         // Existe no formato, não existe no banco.
-        orgFantasma: "0c07a000-0000-4000-8000-ffff9999",
+        orgFantasma: "0c07a000-0000-4000-8000-ffff99999999",
         agora: AGORA,
         catalogVersion: VERSAO,
       };
