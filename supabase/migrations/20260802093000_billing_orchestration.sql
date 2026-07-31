@@ -1694,7 +1694,16 @@ BEGIN
         AND p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' = t.esperada
    );
   IF v_txt IS NOT NULL THEN
-    RAISE EXCEPTION 'RPC(s) de billing ausente(s) ou com assinatura diferente: %', v_txt;
+    -- A mensagem carrega o que o CATÁLOGO realmente rendeu, e não apenas o que
+    -- se esperava. Sem isso, "assinatura diferente" não diz em quê ela difere —
+    -- e foi exatamente essa a informação que faltou na primeira execução real.
+    RAISE EXCEPTION E'RPC(s) ausente(s) ou com assinatura diferente:\n  esperado: %\n  no catalogo: %',
+      v_txt,
+      (SELECT string_agg(
+                p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
+                E'\n              ' ORDER BY p.proname)
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%');
   END IF;
 END
 $pc_assinaturas$;
