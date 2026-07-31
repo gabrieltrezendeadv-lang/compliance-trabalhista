@@ -50,9 +50,20 @@ esac
 # Um `COMMIT` no meio quebraria a garantia de ROLLBACK e deixaria efeito
 # aplicado. Um `BEGIN` aninhado mudaria a semântica. Nos dois casos o ensaio
 # deixa de ser seguro, e por isso ele se recusa a rodar.
+#
+# ── O QUE ESTA CHECAGEM NÃO PODE FAZER ──────────────────────────────────────
+#
+# `BEGIN` e `END` são também delimitadores de bloco PL/pgSQL, e aparecem às
+# dezenas dentro de `DO $$ … $$` e de corpos de função. A primeira versão desta
+# guarda casava `END;` indentado e reprovava a própria 12B — foi o ensaio que
+# denunciou o defeito, o que é exatamente o serviço que ele existe para prestar.
+#
+# Controle de transação no NÍVEL DA MIGRATION fica na coluna 1; código dentro de
+# bloco é sempre indentado. A âncora `^` é o que separa os dois casos, e `END`
+# sai da lista porque não há forma textual de distingui-lo do fim de bloco.
 for arquivo in "$@"; do
   [ -f "$arquivo" ] || { echo "FALHA: $arquivo não existe"; exit 1; }
-  if grep -nEi '^[[:space:]]*(BEGIN|COMMIT|ROLLBACK|START[[:space:]]+TRANSACTION|END)[[:space:]]*;' "$arquivo"; then
+  if grep -nEi '^(BEGIN|COMMIT|ROLLBACK|START[[:space:]]+TRANSACTION)[[:space:]]*;' "$arquivo"; then
     echo "FALHA: $arquivo tem controle próprio de transação — o ensaio não pode garantir o ROLLBACK"
     exit 1
   fi

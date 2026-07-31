@@ -271,9 +271,23 @@ jobs:
           grep -q "PostgREST real" /tmp/contrato.log || {
             echo "FALHA: a suíte do PostgREST real não apareceu no relatório"; exit 1; }
 
+      # `if: always()` para que a limpeza aconteça mesmo quando um passo
+      # anterior falha — fixture órfã contamina a execução seguinte. Mas se a
+      # 12B nem chegou a ser aplicada, não há o que limpar, e insistir
+      # produziria um erro derivado que esconde a causa real.
       - name: Remover fixtures do contrato e conferir que nada sobrou
         if: always()
-        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/teardown-contract-fixtures.sql'
+        run: |
+          set -o pipefail
+          if [ -z "${DB_URL:-}" ]; then
+            echo "stack não subiu — nada a limpar"; exit 0
+          fi
+          EXISTE=$("$PGBIN/psql" -X "$DB_URL" -At -c \
+            "SELECT count(*) FROM pg_namespace WHERE nspname='billing';" 2>/dev/null || echo 0)
+          if [ "$EXISTE" != "1" ]; then
+            echo "schema billing ausente — a 12B não chegou a ser aplicada, nada a limpar"; exit 0
+          fi
+          "$PGBIN/psql" -X "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/teardown-contract-fixtures.sql
 
       - name: 36/36 hashes das históricas contra o manifesto
         run: node tests/verify-recovered-migrations.mjs supabase/migrations
