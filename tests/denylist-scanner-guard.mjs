@@ -20,7 +20,6 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { conteudoExecutavel } from "../scripts/ci/lib/executavel.mjs";
 import { lerDenylist, paraRegExp, varrer } from "../scripts/ci/scan-denylist.mjs";
 
 const raiz = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -52,87 +51,75 @@ function reprova(arquivo) {
   return varrer(DENYLIST, [arquivo]).violacoes.length > 0;
 }
 
-// ── Comentários: citar não é executar ───────────────────────────────────────
+// ── POLÍTICA ESTRITA: citar já reprova ─────────────────────────────────────
+//
+// A guarda roda ANTES de `npm ci`, de propósito. Sem dependências não há
+// scanner léxico, e escrever um lexer à mão seria muito código e muita
+// superfície de erro para PERMITIR que um comando proibido apareça literalmente
+// num arquivo de automação. A escolha é a oposta: o comando não aparece.
 
-test("DS-01: comando proibido em comentário de LINHA é permitido", () => {
-  const f = fixture("linha.mjs", 'const x = 1;\n// roda supabase db push aqui? não.\n');
-  assert.equal(reprova(f), false);
-});
-
-test("DS-02: comando proibido em comentário de BLOCO é permitido", () => {
-  const f = fixture("bloco.mjs", "/**\n * A rota usa `supabase db push --dry-run` para nada.\n */\nexport const a = 1;\n");
-  assert.equal(reprova(f), false);
-});
-
-test("DS-03: as três ocorrências REAIS da main deixam de reprovar", () => {
-  for (const alvo of ["scripts/ci/reserve-forward-only.mjs", "scripts/ci/sanitize-log.mjs"]) {
-    const caminho = path.join(raiz, alvo);
-    assert.ok(fs.existsSync(caminho), `${alvo} sumiu`);
-    // O texto BRUTO contém o comando — é isso que reprovava antes.
-    const bruto = fs.readFileSync(caminho, "utf8");
-    assert.match(bruto, /supabase\s+(db\s+push|migration\s+(repair|fetch))/);
-    // E o executável, não.
-    assert.equal(reprova(caminho), false, `${alvo} ainda reprova`);
-  }
-});
-
-// ── Comandos de verdade: continuam reprovando ──────────────────────────────
-
-test("DS-04: comando em CÓDIGO EXECUTÁVEL é recusado", () => {
+test("DS-01: comando proibido em CÓDIGO EXECUTÁVEL é recusado", () => {
   const f = fixture("exec.mjs", 'execSync("supabase db push");\n');
   assert.equal(reprova(f), true);
 });
 
-test("DS-05: comando em STRING é recusado", () => {
+test("DS-02: comando proibido em STRING é recusado", () => {
   const f = fixture("str.mjs", 'const c = "supabase db push";\n');
   assert.equal(reprova(f), true);
 });
 
-test("DS-06: comando em TEMPLATE LITERAL é recusado", () => {
+test("DS-03: comando proibido em TEMPLATE LITERAL é recusado", () => {
   const f = fixture("tpl.mjs", "const c = `supabase db push ${alvo}`;\n");
   assert.equal(reprova(f), true);
 });
 
-// ── Armadilhas léxicas ─────────────────────────────────────────────────────
-
-test("DS-07: `//` de URL dentro de string não vira comentário", () => {
-  const origem = 'const u = "https://exemplo.test/a"; const v = 2;\n';
-  const exec = conteudoExecutavel(origem, ".mjs");
-  assert.match(exec, /https:\/\/exemplo\.test\/a/, "a URL foi apagada");
-  assert.match(exec, /const v = 2/, "o código depois da URL sumiu");
+test("DS-04: comando proibido em COMENTÁRIO também é recusado", () => {
+  // É a política nova, e é deliberada: citar é reprovar.
+  const f = fixture("com.mjs", "// nunca rode supabase db push aqui\nexport const a = 1;\n");
+  assert.equal(reprova(f), true, "comentário passou a ser exceção");
 });
 
-test("DS-08: `/*` dentro de string não abre bloco", () => {
-  const origem = 'const s = "abre /* e nao fecha"; const depois = 1;\n';
-  const exec = conteudoExecutavel(origem, ".mjs");
-  assert.match(exec, /abre \/\* e nao fecha/, "o conteúdo da string foi comido");
-  assert.match(exec, /const depois = 1/, "o código seguinte sumiu");
+test("DS-05: comentário EXPLICATIVO sem o comando literal é permitido", () => {
+  const f = fixture(
+    "ok.mjs",
+    "// o ensaio a seco do CLI de migrations precisa ver uma versao pendente\nexport const a = 1;\n"
+  );
+  assert.equal(reprova(f), false);
 });
 
-test("DS-09: regex literal não é confundida com comentário", () => {
-  const origem = "const r = /a\\/\\/b/; const depois = 1;\n";
-  const exec = conteudoExecutavel(origem, ".mjs");
-  assert.match(exec, /const depois = 1/, "o código depois da regex sumiu");
+test("DS-06: as três redações NOVAS são permitidas", () => {
+  for (const alvo of ["scripts/ci/reserve-forward-only.mjs", "scripts/ci/sanitize-log.mjs"]) {
+    const caminho = path.join(raiz, alvo);
+    assert.ok(fs.existsSync(caminho), `${alvo} sumiu`);
+    assert.equal(reprova(caminho), false, `${alvo} ainda reprova`);
+  }
 });
 
-test("DS-10: comentário ENTRE tokens não cria correspondência inexistente", () => {
-  // `supabase/*x*/db push` NÃO é `supabase db push`: há um comentário no meio.
-  // Se o varredor colasse os tokens, inventaria uma violação.
-  const f = fixture("entre.mjs", "const a = supabase/*x*/db;\n");
-  const exec = conteudoExecutavel(fs.readFileSync(f, "utf8"), ".mjs");
-  // O comentário vira ESPAÇOS — posição preservada. O que não pode acontecer é
-  // os tokens se encostarem: `supabasedb` seria um identificador que não existe
-  // no arquivo, e inventá-lo é como um varredor passa a alucinar.
-  assert.doesNotMatch(exec, /supabasedb/, "os tokens foram colados pelo varredor");
-  assert.equal(exec.length, fs.readFileSync(f, "utf8").length, "o comprimento mudou");
+test("DS-07: o sentido técnico foi preservado na reescrita", () => {
+  // Reescrever não pode virar apagar: as três explicações continuam dizendo o
+  // que diziam, sem transcrever o comando.
+  const reserva = fs.readFileSync(path.join(raiz, "scripts/ci/reserve-forward-only.mjs"), "utf8");
+  assert.match(reserva, /ensaio a seco do CLI de migrations/);
+  assert.match(reserva, /reparar manualmente o ledger remoto/);
+  assert.match(reserva, /puxar o schema do projeto remoto/);
+
+  const log = fs.readFileSync(path.join(raiz, "scripts/ci/sanitize-log.mjs"), "utf8");
+  assert.match(log, /logs crus da aplicação de migrations pelo CLI NÃO são publicados/);
 });
 
-test("DS-11: números de linha do arquivo ORIGINAL são preservados", () => {
-  const origem = "// linha 1\n/* 2\n 3 */\nexecSync('supabase db push');\n";
-  const exec = conteudoExecutavel(origem, ".mjs");
-  const linhas = exec.split("\n");
-  assert.equal(linhas.length, origem.split("\n").length, "a contagem de linhas mudou");
-  assert.match(linhas[3], /supabase db push/, "a linha 4 deixou de ser a linha 4");
+test("DS-08: nenhum arquivo de automação contém comando proibido, em lugar nenhum", () => {
+  const alvos = fs
+    .readdirSync(path.join(raiz, "scripts/ci"))
+    .filter((f) => /\.(sh|mjs|sql)$/.test(f))
+    .map((f) => path.join(raiz, "scripts/ci", f));
+  alvos.push(path.join(raiz, ".github/workflows/migration-rebuild-verify.yml"));
+
+  const { violacoes } = varrer(DENYLIST, alvos);
+  assert.deepEqual(
+    violacoes.map((v) => `${path.basename(v.alvo)}:${v.linha} ${v.rotulo}`),
+    [],
+    "há comando proibido na automação"
+  );
 });
 
 // ── Fail-closed ────────────────────────────────────────────────────────────
@@ -179,6 +166,74 @@ test("DS-19: as nove entradas da denylist estão intactas e compilam", () => {
   assert.ok(push, "a entrada do db push sumiu");
   assert.ok(push.regex.test("supabase   db\tpush"), "o padrão deixou de casar espaço/tab");
   assert.ok(!push.regex.test("supabasedbpush"), "o padrão passou a casar sem separador");
+});
+
+// ── Zero dependências ──────────────────────────────────────────────────────
+
+test("DS-24: o scanner funciona SEM node_modules ao alcance", () => {
+  // ── POR QUE ESTE TESTE EXISTE ─────────────────────────────────────────────
+  //
+  // A guarda roda ANTES de `npm ci`, e a primeira versão deste hotfix importava
+  // `typescript`. Passou na minha máquina e morreu no runner com
+  // ERR_MODULE_NOT_FOUND. Só uma prova de ausência pega isso.
+  //
+  // Nada é apagado: monta-se uma cópia MÍNIMA num diretório temporário, sem
+  // `node_modules` em nenhum ancestral, e roda-se o scanner lá.
+  const isolado = fs.mkdtempSync(path.join(os.tmpdir(), "sem-deps-"));
+  try {
+    fs.mkdirSync(path.join(isolado, "scripts", "ci"), { recursive: true });
+    fs.copyFileSync(
+      path.join(raiz, "scripts/ci/scan-denylist.mjs"),
+      path.join(isolado, "scripts/ci/scan-denylist.mjs")
+    );
+    fs.copyFileSync(DENYLIST, path.join(isolado, "scripts/ci/remote-access-denylist.txt"));
+
+    fs.writeFileSync(path.join(isolado, "limpo.mjs"), "export const a = 1;\n", "utf8");
+    fs.writeFileSync(path.join(isolado, "sujo.mjs"), 'const c = "supabase db push";\n', "utf8");
+
+    // Nenhum ancestral do temporário pode ter `node_modules` — se tivesse, a
+    // prova de ausência não valeria nada.
+    for (let d = isolado; d !== path.dirname(d); d = path.dirname(d)) {
+      assert.ok(
+        !fs.existsSync(path.join(d, "node_modules")),
+        `há node_modules em ${d} — a prova de ausência não vale`
+      );
+    }
+
+    function rodar(alvo) {
+      try {
+        execFileSync(
+          "node",
+          [
+            path.join(isolado, "scripts/ci/scan-denylist.mjs"),
+            path.join(isolado, "scripts/ci/remote-access-denylist.txt"),
+            path.join(isolado, alvo),
+          ],
+          { cwd: isolado, encoding: "utf8", stdio: "pipe" }
+        );
+        return { code: 0, out: "" };
+      } catch (e) {
+        return { code: e.status ?? 1, out: (e.stdout ?? "") + (e.stderr ?? "") };
+      }
+    }
+
+    const limpo = rodar("limpo.mjs");
+    assert.equal(limpo.code, 0, `o scanner não rodou sem node_modules:\n${limpo.out}`);
+
+    const sujo = rodar("sujo.mjs");
+    assert.equal(sujo.code, 1, "o alvo sujo passou");
+    assert.match(sujo.out, /GUARDA REPROVADA/);
+    assert.doesNotMatch(sujo.out, /ERR_MODULE_NOT_FOUND/, "o scanner voltou a depender de pacote");
+  } finally {
+    fs.rmSync(isolado, { recursive: true, force: true });
+  }
+});
+
+test("DS-25: o scanner não importa nada além de `node:`", () => {
+  const src = fs.readFileSync(path.join(raiz, "scripts/ci/scan-denylist.mjs"), "utf8");
+  const imports = [...src.matchAll(/^import[^"']*["']([^"']+)["']/gm)].map((m) => m[1]);
+  const externos = imports.filter((i) => !i.startsWith("node:"));
+  assert.deepEqual(externos, [], `o scanner passou a depender de: ${externos.join(", ")}`);
 });
 
 // ── Wrapper: exit code e invariância de locale ─────────────────────────────

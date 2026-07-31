@@ -12,8 +12,7 @@
  * sobre os alvos. Ela produzia resultados DIFERENTES conforme o ambiente:
  *
  *   FALSO POSITIVO no CI  — comandos proibidos CITADOS em comentário
- *                           (`/** … supabase db push … *\/`) reprovavam o job,
- *                           embora nenhum deles fosse executado.
+ *                           reprovavam o job, embora nenhum fosse executado.
  *
  *   FALSO NEGATIVO local  — no Git Bash do Windows, com `LANG` vazio, a mesma
  *                           guarda dizia "aprovado" para os mesmos arquivos.
@@ -33,17 +32,33 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { EXTENSOES_SUPORTADAS, lerExecutavel } from "./lib/executavel.mjs";
-
 /**
- * Extensões de automação sem analisador léxico próprio.
+ * Extensões de automação que esta guarda sabe varrer.
  *
- * Shell, SQL e YAML são varridos como TEXTO BRUTO, exatamente como antes. Não
- * há mudança de comportamento para elas, e não deveria haver sem necessidade
- * demonstrada: um comentário `#` de shell que cite um comando proibido continua
- * reprovando, e isso nunca gerou alarme falso neste repositório.
+ * A varredura é TEXTUAL e ESTRITA: o alvo inteiro é confrontado com a denylist,
+ * sem distinguir código de comentário.
+ *
+ * ── POR QUE ESTRITA, E NÃO LÉXICA ───────────────────────────────────────────
+ *
+ * Uma tentativa anterior removia comentários com o scanner do TypeScript, para
+ * que um comando CITADO não reprovasse. Ela funcionava — e era inutilizável
+ * aqui: esta guarda roda ANTES de `npm ci`, de propósito, porque instalar
+ * pacotes antes dela deixaria um `postinstall` executar primeiro. Sem
+ * `node_modules`, não há scanner.
+ *
+ * A alternativa seria um lexer escrito à mão, com todos os casos de string,
+ * template e regex literal. Mais código, mais superfície de erro, e tudo isso
+ * para PERMITIR que um comando proibido apareça literalmente num arquivo de
+ * automação.
+ *
+ * A escolha é a oposta e é mais barata: o comando não aparece. Quem precisa
+ * explicar por que não usa `link`, `push` ou `repair` descreve a operação em
+ * vez de transcrevê-la. O custo é uma frase; o ganho é uma guarda que não
+ * depende de nada e não tem como errar a favor.
  */
-const EXTENSOES_BRUTAS = Object.freeze([".sh", ".bash", ".sql", ".yml", ".yaml"]);
+const EXTENSOES_CONHECIDAS = Object.freeze([
+  ".sh", ".bash", ".mjs", ".cjs", ".js", ".ts", ".mts", ".cts", ".sql", ".yml", ".yaml",
+]);
 
 export class DenylistInvalidaError extends Error {
   constructor(mensagem) {
@@ -140,25 +155,20 @@ export function lerDenylist(arquivo) {
 }
 
 /**
- * Texto do alvo que deve ser confrontado com a denylist.
+ * Texto do alvo — o arquivo inteiro, sem interpretação.
  *
- * Para JS/TS, os comentários viram espaços — um comando CITADO para explicar
- * por que não é usado deixa de reprovar. Para os demais formatos, o texto é o
- * bruto, como sempre foi. Extensão desconhecida LANÇA.
+ * Comentário não é tratado de forma especial: um comando proibido reprova
+ * onde quer que apareça. Extensão desconhecida LANÇA, e a guarda reprova.
  */
 export function textoDoAlvo(arquivo) {
   const extensao = path.extname(arquivo).toLowerCase();
-
-  if (EXTENSOES_SUPORTADAS.includes(extensao)) {
-    return { texto: lerExecutavel(arquivo), modo: "léxico" };
+  if (!EXTENSOES_CONHECIDAS.includes(extensao)) {
+    throw new Error(
+      `extensão sem tratamento definido: ${extensao || "(nenhuma)"} em ${arquivo}. ` +
+        "A guarda reprova em vez de adivinhar."
+    );
   }
-  if (EXTENSOES_BRUTAS.includes(extensao)) {
-    return { texto: fs.readFileSync(arquivo, "utf8"), modo: "bruto" };
-  }
-  throw new Error(
-    `extensão sem tratamento definido: ${extensao || "(nenhuma)"} em ${arquivo}. ` +
-      "A guarda reprova em vez de adivinhar."
-  );
+  return { texto: fs.readFileSync(arquivo, "utf8"), modo: "estrito" };
 }
 
 /** Varre os alvos. Devolve a lista de violações — vazia quando limpo. */
