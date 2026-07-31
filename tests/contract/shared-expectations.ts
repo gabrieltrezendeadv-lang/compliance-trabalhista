@@ -361,15 +361,36 @@ export function definirContrato(opcoes: ContratoOptions): void {
 
     // ── Evento do provider ────────────────────────────────────────────────
 
-    async function comCobranca(amb: AmbienteDeContrato, externo = "chg-ev") {
+    /**
+     * Identificador externo derivado da ORGANIZAÇÃO.
+     *
+     * ── POR QUE NÃO PODE SER CONSTANTE ────────────────────────────────────
+     *
+     * `customers_externo_unico` e `charges_externo_unico` são unicidades
+     * GLOBAIS: `(provider, provider_account_id, external_*_id)`, sem
+     * `organization_id`. É essa globalidade que permite resolver o tenant a
+     * partir do identificador que o provider manda no webhook.
+     *
+     * Um identificador fixo entre casos significaria o MESMO cliente externo
+     * pertencendo a duas organizações — exatamente o que a constraint proíbe,
+     * e com razão. O dublê não pegava isso porque cada caso recebe uma
+     * instância nova, e a unicidade global não tinha com o que colidir; o
+     * banco compartilhado pegou. É a diferença que esta suíte existe para
+     * expor.
+     */
+    function externoDe(prefixo: string, org: string): string {
+      return `${prefixo}-${org.slice(-12)}`;
+    }
+
+    async function comCobranca(amb: AmbienteDeContrato, marca = "ev") {
       await comTrial(amb);
       await amb.repo.claimIdempotency(reserva(amb, "ck-ev", "fp-ev"));
       const fin = await amb.repo.finalizeCheckout({
         ...ctx(amb),
         provider: "mock",
         providerAccountId: "acct-1",
-        externalCustomerId: "cus-ev",
-        externalChargeId: externo,
+        externalCustomerId: externoDe("cus", amb.orgA),
+        externalChargeId: externoDe(`chg-${marca}`, amb.orgA),
         method: "pix",
         amountCents: 9_990,
         periodStart: amb.agora,
@@ -378,7 +399,12 @@ export function definirContrato(opcoes: ContratoOptions): void {
         fingerprint: "fp-ev",
         now: amb.agora,
       });
-      if (!fin.ok || fin.value.kind !== "completed") throw new Error("preparação falhou");
+      if (!fin.ok) {
+        throw new Error(`preparação falhou: ${fin.error.code} — ${fin.error.message}`);
+      }
+      if (fin.value.kind !== "completed") {
+        throw new Error(`preparação falhou: finalize devolveu ${fin.value.kind}`);
+      }
       return fin.value.charge;
     }
 
@@ -423,7 +449,7 @@ export function definirContrato(opcoes: ContratoOptions): void {
 
     it("evento anterior ao período da cobrança é recusado", async () => {
       await comAmbiente(async (amb) => {
-        const cobranca = await comCobranca(amb, "chg-ord");
+        const cobranca = await comCobranca(amb, "ord");
 
         const r = await amb.repo.applyProviderEvent({
           provider: "mock",
@@ -460,7 +486,7 @@ export function definirContrato(opcoes: ContratoOptions): void {
 
     it("transição inválida é recusada: cobrança paga não volta", async () => {
       await comAmbiente(async (amb) => {
-        const cobranca = await comCobranca(amb, "chg-tr");
+        const cobranca = await comCobranca(amb, "tr");
         await amb.repo.applyProviderEvent({
           provider: "mock",
           providerAccountId: "acct-1",
@@ -492,7 +518,7 @@ export function definirContrato(opcoes: ContratoOptions): void {
 
     it("a trilha de A não traz nada de B", async () => {
       await comAmbiente(async (amb) => {
-        await comCobranca(amb, "chg-a");
+        await comCobranca(amb, "a");
         await comTrial(amb, amb.orgB);
 
         const ledgerA = await amb.repo.readLedger(amb.donoA, amb.orgA);
@@ -515,7 +541,7 @@ export function definirContrato(opcoes: ContratoOptions): void {
 
     it("identificador externo é único GLOBALMENTE, não por tenant", async () => {
       await comAmbiente(async (amb) => {
-        await comCobranca(amb, "chg-dup");
+        await comCobranca(amb, "dup");
         await comTrial(amb, amb.orgB);
 
         await amb.repo.claimIdempotency({
@@ -534,8 +560,10 @@ export function definirContrato(opcoes: ContratoOptions): void {
           actorId: amb.donoB,
           provider: "mock",
           providerAccountId: "acct-1",
-          externalCustomerId: "cus-b",
-          externalChargeId: "chg-dup",
+          externalCustomerId: externoDe("cus", amb.orgB),
+          // MESMO identificador de cobrança da organização A: é esta colisão,
+          // e só ela, que o caso quer provar.
+          externalChargeId: externoDe("chg-dup", amb.orgA),
           method: "pix",
           amountCents: 9_990,
           periodStart: amb.agora,
