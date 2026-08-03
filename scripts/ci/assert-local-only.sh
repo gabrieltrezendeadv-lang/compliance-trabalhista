@@ -71,7 +71,7 @@ secao_pre() {
   done
 
   if node "$RAIZ/scripts/ci/scan-denylist.mjs" "$DENYLIST" "${alvos[@]}"; then
-    aprovar "denylist conferida pelo varredor léxico"
+    aprovar "denylist conferida pelo scanner Node estrito"
   else
     reprovar "varredura da denylist reprovou"
   fi

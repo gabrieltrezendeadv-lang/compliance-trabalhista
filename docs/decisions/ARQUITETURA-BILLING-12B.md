@@ -181,22 +181,61 @@ estrutura persistida.
 | --- | --- | --- |
 | Unitária | `tests/unit/billing/usecases/` | ciclo de vida, bordas temporais, faixas, preços, pró-rata, autorização, IDOR, idempotência, ordem, falhas, mock proibido em produção. `resilience.spec.ts` **mede** as chamadas ao provider por cenário |
 | Contrato | `tests/contract/shared-expectations.ts` | as MESMAS expectativas executadas contra o dublê **e** contra `SupabaseBillingRepository` pelo PostgREST local. É o arquivo que fecha o buraco de um repositório nunca exercitado |
-| Estática | `tests/billing-orchestration-guard.mjs` (22) | determinismo, ausência de rede, fronteira do `service_role`, alcance público, integridade da migration |
-| Mutação | `tests/billing-orchestration-mutation-guard.mjs` (35) | que as guardas acima reprovam quando a propriedade é removida |
+| Estática | `tests/billing-orchestration-guard.mjs` (25) | determinismo, ausência de rede, fronteira do `service_role`, alcance público, integridade da migration |
+| Mutação | `tests/billing-orchestration-mutation-guard.mjs` (49) | que as guardas acima reprovam quando a propriedade é removida |
 | PostgreSQL real | `scripts/ci/assert-billing-orchestration.sql` | **o que o dublê não reproduz**: UNIQUE resolvendo concorrência, transação desfazendo escrita parcial, RLS/grants efetivos, trigger de imutabilidade sobre linha real |
+| Assinaturas | `scripts/ci/assert-billing-rpcs.sql` | as 16 RPCs existem com a identidade exata — resolvidas por `to_regprocedure`, com nomes de parâmetro, modos, `SECURITY DEFINER`, `search_path` e EXECUTE conferidos no catálogo |
+| Concorrência real | `scripts/ci/assert-billing-concurrency.sh` | **duas conexões independentes** disputando a mesma chave, liberadas juntas por advisory lock. Não é simulação: são dois processos `psql` contra o mesmo Postgres |
+| Limpeza | `tests/contract-fixture-teardown-guard.mjs` (25) | as cinco cercas da limpeza de fixtures, e que retirar qualquer uma reprova |
 
 `tests/setup/no-network.ts` transforma qualquer `fetch`/XHR/WebSocket num teste
 em falha, com o alvo na mensagem.
 
+### 9.1 Como a âncora B enxerga as 16 RPCs
+
+A âncora B do `migration-rebuild-verify` **não compara o dump bruto**. As RPCs da
+12B vivem em `public` por decisão arquitetural, e o estado esperado congelado não
+as contém — compará-los crus produziria uma deriva permanente que não é deriva.
+
+O que acontece é: `scripts/ci/split-public-rpcs.mjs` retira do **dump real** os
+16 blocos `public.fn_billing_*` da allowlist, a comparação roda sobre o restante,
+e as RPCs extraídas são conferidas **à parte, no catálogo**, por
+`assert-billing-rpcs.sql`. O efeito estrutural declarado é `nominal`: o que sai da
+comparação textual entra numa verificação mais forte, não numa exceção.
+
+O dump é tomado com `--no-owner --no-privileges` — ele nunca viu owner nem ACL —,
+de modo que o splitter não pode esconder mudança de privilégio. Essa dimensão é
+coberta por `assert-billing-security.sql`, que lê o catálogo direto.
+
 ## 10. Limites desta etapa
 
-* Nenhum caso de uso é exposto como rota, action ou página. `BO-12` reprova
-  qualquer import da 12B a partir do runtime público.
-* O provider real (Asaas) **não foi alterado**, salvo por não ter sido tocado:
-  o contrato da 12B é novo e separado.
+Estes são os limites **verdadeiros** no momento em que este documento é escrito.
+Nenhum deles é hipotético, e nenhum foi contornado.
+
+* **O Asaas real nunca foi chamado.** Nem sandbox, nem produção. Todo o exercício
+  do provider passou pelo mock. `tests/setup/no-network.ts` faz de qualquer
+  chamada de rede num teste uma falha.
+* **A feature flag de billing está desligada.** Nada da 12B alcança usuário.
+* **Não há interface nem checkout.** Nenhum caso de uso é exposto como rota,
+  action ou página; `BO-12` reprova qualquer import da 12B a partir do runtime
+  público.
+* **As migrations 12A (`20260801120000`) e 12B (`20260802093000`) continuam
+  pendentes em produção.** Foram aplicadas, revertidas e reaplicadas contra a
+  stack descartável, muitas vezes. Contra o projeto remoto, nenhuma vez.
+* O provider real (Asaas) **não foi alterado**: o contrato da 12B é novo e
+  separado.
 * O repositório em memória **não** reproduz RLS, grants, transação real nem
   concorrência real — está declarado no próprio arquivo, e é a razão de existir
   a prova em PostgreSQL.
+
+O que **deixou** de ser limite, e por isso não aparece mais acima:
+
+* o repositório real já foi exercitado — `tests/contract/postgrest.spec.ts` roda
+  as mesmas 23 expectativas do dublê contra `SupabaseBillingRepository`, pelo
+  mesmo cliente supabase-js que a aplicação usa;
+* a concorrência já foi provada com **duas conexões independentes**, não por
+  simulação;
+* as 16 RPCs já são conferidas no catálogo, por identidade resolvida.
 
 ## 11. Gates para a 12C
 
