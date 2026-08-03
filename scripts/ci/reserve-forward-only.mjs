@@ -4,7 +4,7 @@
  * Uso:
  *   node scripts/ci/reserve-forward-only.mjs <selecionada.sql> <ledger.tsv> <dir-reserva>
  *
- * A rota precisa que o `supabase db push --dry-run` enxergue uma única
+ * A rota precisa que o ensaio a seco do CLI de migrations enxergue uma única
  * migration pendente: é assim que "exatamente uma por execução" deixa de ser
  * promessa e vira propriedade verificável. Para isso, as demais forward-only
  * PENDENTES saem temporariamente do diretório.
@@ -32,8 +32,12 @@
  *
  * O erro vem acompanhado de duas sugestões:
  *
- *   supabase migration repair --status reverted 20260730123613
- *   supabase db pull
+ *   — reparar manualmente o ledger remoto, marcando a versão como revertida;
+ *   — puxar o schema do projeto remoto por cima do local.
+ *
+ * As duas são recusadas por este repositório, e os comandos não são
+ * transcritos aqui de propósito: `scripts/ci/remote-access-denylist.txt`
+ * reprova a automação que os contenha, e a guarda é textual e estrita.
  *
  * A primeira marcaria como REVERTIDA uma migration que está aplicada de fato —
  * o ledger passaria a mentir sobre o banco, que é exatamente o estado que as

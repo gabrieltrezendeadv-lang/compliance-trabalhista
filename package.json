@@ -12,7 +12,7 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test:unit": "vitest run",
-    "test:reconciliation": "node tests/reconciliation-guards.mjs && node tests/p0-runtime-guards.mjs && node tests/migration-freeze-guard.mjs && node tests/manifest-parser-guard.mjs && node tests/migration-classification-guard.mjs && node tests/tg12-guard.mjs && node tests/migration-apply-guard.mjs && node tests/migration-apply-simulation.mjs && node tests/reserve-forward-only-guard.mjs && node tests/billing-foundation-guard.mjs && node tests/billing-mutation-guard.mjs",
+    "test:reconciliation": "node tests/reconciliation-guards.mjs && node tests/p0-runtime-guards.mjs && node tests/migration-freeze-guard.mjs && node tests/manifest-parser-guard.mjs && node tests/migration-classification-guard.mjs && node tests/tg12-guard.mjs && node tests/migration-apply-guard.mjs && node tests/migration-apply-simulation.mjs && node tests/reserve-forward-only-guard.mjs && node tests/billing-foundation-guard.mjs && node tests/billing-mutation-guard.mjs && node tests/denylist-scanner-guard.mjs",
     "test": "npm run test:unit && npm run test:reconciliation",
     "test:e2e": "playwright test",
     "verify": "npm run lint && npm run typecheck && npm run test && npm run build"

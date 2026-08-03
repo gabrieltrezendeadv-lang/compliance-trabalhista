@@ -55,26 +55,26 @@ secao_pre() {
   [ -f "$DENYLIST" ] || { echo "  ✗ denylist ausente: $DENYLIST"; exit 1; }
   [ -f "$WORKFLOW" ] || { echo "  ✗ workflow ausente: $WORKFLOW"; exit 1; }
 
+  # ── A VARREDURA É DO NODE, NÃO DO BASH ────────────────────────────────────
+  #
+  # Esta seção interpretava a denylist com `IFS=$'	' read` e aplicava os
+  # padrões com `grep`. O resultado DEPENDIA do ambiente: no Git Bash do
+  # Windows, com `LANG` vazio, aprovava arquivos que o CI do Linux reprovava —
+  # um falso negativo, que é o pior dos dois erros possíveis numa guarda.
+  #
+  # O Bash passa a ser wrapper: monta a lista de alvos e propaga o exit code.
+  # Quem lê a denylist, valida o formato, converte os padrões e decide é
+  # `scan-denylist.mjs`, cujo resultado não depende de locale.
   local alvos=("$WORKFLOW")
-  for f in "$RAIZ"/scripts/ci/*.sh "$RAIZ"/scripts/ci/*.mjs "$RAIZ"/scripts/ci/*.sql; do
+  for f in "$RAIZ"/scripts/ci/*.sh "$RAIZ"/scripts/ci/*.mjs "$RAIZ"/scripts/ci/*.sql            "$RAIZ"/scripts/ci/lib/*.mjs; do
     [ -e "$f" ] && alvos+=("$f")
   done
-  echo "  alvos varridos: ${#alvos[@]}"
 
-  local padroes=0
-  while IFS=$'\t' read -r rotulo padrao; do
-    case "$rotulo" in ''|'#'*) continue ;; esac
-    [ -z "${padrao:-}" ] && continue
-    padroes=$((padroes + 1))
-    for alvo in "${alvos[@]}"; do
-      if grep -nE -- "$padrao" "$alvo" >/dev/null 2>&1; then
-        reprovar "$rotulo em ${alvo#"$RAIZ"/}:"
-        grep -nE -- "$padrao" "$alvo" | sed 's/^/      /'
-      fi
-    done
-  done < "$DENYLIST"
-  [ "$padroes" -gt 0 ] || { echo "  ✗ denylist vazia"; exit 1; }
-  aprovar "$padroes padrão(ões) da denylist conferido(s)"
+  if node "$RAIZ/scripts/ci/scan-denylist.mjs" "$DENYLIST" "${alvos[@]}"; then
+    aprovar "denylist conferida pelo varredor léxico"
+  else
+    reprovar "varredura da denylist reprovou"
+  fi
 
   # Credenciais: ausentes do ambiente. Vazia conta como ausente.
   for var in SUPABASE_ACCESS_TOKEN SUPABASE_DB_PASSWORD SUPABASE_DB_URL \
