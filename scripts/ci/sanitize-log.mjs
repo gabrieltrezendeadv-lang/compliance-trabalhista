@@ -4,7 +4,7 @@
  * Uso:
  *   node scripts/ci/sanitize-log.mjs <entrada> <saida>
  *
- * Os logs crus do `supabase db push` NÃO são publicados. O CLI recebe a URL de
+ * Os logs crus da aplicação de migrations pelo CLI NÃO são publicados. O CLI recebe a URL de
  * conexão em `--db-url`, e nada garante que ele não a repita numa mensagem de
  * erro — aliás, é exatamente em erro que ferramentas costumam ecoar a conexão
  * que tentaram usar. Um artefato fica noventa dias disponível para qualquer
