@@ -292,6 +292,28 @@ jobs:
             -f scripts/ci/extract-security.sql > artifacts/rebuilt-security.txt
           wc -l artifacts/rebuilt-security.txt
 
+      # ── SEPARAÇÃO NOMINAL NA EXTRAÇÃO DE SEGURANÇA ──────────────────────────
+      #
+      # Mesmo princípio do splitter do dump, aplicado onde SECURITY DEFINER,
+      # search_path, proprietário e ACL efetivamente aparecem — o dump é tirado
+      # `--no-owner --no-privileges` e nunca os viu.
+      #
+      # A retirada é CONDICIONAL: as 48 linhas das 16 RPCs só saem se o perfil
+      # for exatamente o declarado. EXECUTE para PUBLIC/anon/authenticated, dono
+      # diferente, `SECURITY DEFINER` ausente, `search_path` divergente,
+      # sobrecarga não declarada, presença parcial — qualquer um REPROVA aqui,
+      # com o motivo escrito, e nada é retirado.
+      #
+      # O restante da extração segue para a comparação bloqueante e tem de dar
+      # zero. As 16 são verificadas no passo `assert-billing-rpcs.sql`, no MESMO
+      # banco, por identidade resolvida no catálogo.
+      - name: Separar as RPCs nominais da extração de segurança
+        run: |
+          node scripts/ci/split-security-nominal.mjs \
+            artifacts/rebuilt-security.txt \
+            artifacts/rebuilt-security-sem-rpcs.txt \
+            artifacts/rebuilt-security-rpcs.txt
+
       # ── SPLITTER: separa as 16 RPCs nominais do dump REAL ───────────────────
       #
       # A 12B cria dezesseis funções em `public`, e funções de `public` estão no
@@ -512,7 +534,11 @@ jobs:
       - name: Diff — segurança (extração × extração), por categoria
         id: seguranca
         run: |
-          diff -u artifacts/baseline-security.txt artifacts/rebuilt-security.txt \
+          # A comparação é contra a extração SEM as 16 nominais. A versão íntegra
+          # é preservada como artifact, e as retiradas estão em
+          # artifacts/rebuilt-security-rpcs.txt — nada é suprimido, só deslocado
+          # para a verificação de catálogo.
+          diff -u artifacts/baseline-security.txt artifacts/rebuilt-security-sem-rpcs.txt \
             > artifacts/diff-seguranca.diff || true
           TOTAL=$(wc -l < artifacts/diff-seguranca.diff)
           echo "diff de segurança, total: $TOTAL linha(s)"

@@ -204,8 +204,32 @@ e as RPCs extraídas são conferidas **à parte, no catálogo**, por
 comparação textual entra numa verificação mais forte, não numa exceção.
 
 O dump é tomado com `--no-owner --no-privileges` — ele nunca viu owner nem ACL —,
-de modo que o splitter não pode esconder mudança de privilégio. Essa dimensão é
-coberta por `assert-billing-security.sql`, que lê o catálogo direto.
+de modo que o splitter não pode esconder mudança de privilégio.
+
+### 9.2 A mesma separação na extração de segurança
+
+A âncora B compara também uma **extração de segurança**, e é lá que
+`SECURITY DEFINER`, `search_path`, proprietário e ACL aparecem. Como a baseline
+congelada não tem a 12B, as 16 RPCs surgiam ali como 48 linhas em categorias
+bloqueantes — 16 de propriedade de função, 32 de ACL. Diferir, para elas, é
+obrigatório: é o efeito declarado da migration, não regressão.
+
+`scripts/ci/split-security-nominal.mjs` aplica o mesmo tratamento nominal, com
+uma diferença que importa: aqui **a retirada é condicional**. Uma linha só sai da
+comparação se o perfil for exatamente o declarado — `plpgsql`, `secdef=t`,
+`search_path` vazio, dono `postgres`, e EXECUTE para **exatamente**
+`{postgres, service_role}`. Qualquer desvio faz o passo **reprovar com o motivo
+escrito, sem retirar nada**: EXECUTE para `PUBLIC`, `anon` ou `authenticated`,
+dono diferente, `SECURITY DEFINER` ausente, `search_path` divergente, sobrecarga
+não declarada, presença parcial.
+
+As categorias 3 (RLS/dono de tabela) e 7 (policies) não têm exceção alguma, e o
+restante da extração continua bloqueante — tem de dar **zero**. As 16 retiradas
+são verificadas por `assert-billing-rpcs.sql`, no **mesmo banco**, por identidade
+resolvida via `to_regprocedure`.
+
+`tests/security-nominal-split-guard.mjs` (18) prova as duas metades: que a
+retirada acontece quando deve, e que cada um dos desvios acima reprova.
 
 ## 10. Limites desta etapa
 
