@@ -426,6 +426,30 @@ BEGIN
       'ASSERÇÃO REPROVADA: reserva concluída foi retomada com a lease vencida (%)', v_json;
   END IF;
 
+  -- ── ESTE BLOCO DEVOLVE O ESTADO COMO ENCONTROU ────────────────────────────
+  --
+  -- O caso 8 precisa de uma reserva `completed`, e o único caminho para isso é
+  -- um `finalize_checkout` de verdade — que cria uma cobrança. O bloco B.6
+  -- adiante exige que A enxergue EXATAMENTE uma cobrança, e a primeira
+  -- execução desta asserção reprovou lá, com "A enxerga 2 cobrança(s)".
+  --
+  -- A alternativa seria afrouxar o B.6 para "pelo menos uma", e isso trocaria
+  -- uma asserção de isolamento por uma asserção mais fraca só para acomodar
+  -- este bloco. Limpar o que se criou é mais barato e não custa cobertura:
+  -- `charges` só tem trigger BEFORE UPDATE, então o DELETE passa, e a auditoria
+  -- append-only permanece — ninguém a conta depois daqui.
+  DELETE FROM billing.charges WHERE external_charge_id = 'chg-lease';
+  DELETE FROM billing.customers WHERE external_customer_id = 'cus-lease';
+  DELETE FROM billing.idempotency_records
+   WHERE organization_id = pg_temp.id('org_a') AND key IN ('ck-lease', 'ck-lease-c');
+
+  SELECT count(*) INTO v_int FROM billing.charges
+   WHERE organization_id = pg_temp.id('org_a');
+  IF v_int <> 1 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: o bloco da lease não devolveu o estado (% cobrança(s) em A)', v_int;
+  END IF;
+
   RAISE NOTICE
     'billing12B/lease OK: 5min fixos, borda >=, conflito antes e depois, takeover reinicia sem duplicar';
 END
