@@ -91,12 +91,64 @@ jobs:
         with:
           version: 2.110.0
 
-      - name: Subir stack descartável e aplicar as migrations do repositório
+      # ────────────────────────────────────────────────────────────────────
+      # ENSAIO DIAGNÓSTICO — psql, antes da aplicação autoritativa
+      #
+      # O wrapper `effect/sql` do CLI do Supabase NÃO expõe a mensagem do
+      # `RAISE EXCEPTION`: imprime só "At statement: N" e o texto do statement.
+      # Uma pós-condição que falha fica indiagnosticável — foi o que aconteceu
+      # com `pc_assinaturas`, e três execuções não revelaram a causa.
+      #
+      # As forward-only são RESERVADAS para a stack subir, o ensaio as aplica
+      # por psql numa transação encerrada em ROLLBACK — que imprime MESSAGE,
+      # DETAIL, HINT e CONTEXT — e depois elas voltam ao lugar para o CLI
+      # aplicá-las de verdade.
+      #
+      # Este passo NÃO substitui nada: é informativo e não deixa efeito.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Subir stack com as forward-only reservadas
         run: |
           set -o pipefail
           supabase init --force
+          mkdir -p /tmp/fo
+          node scripts/ci/list-forward-only.mjs > /tmp/forward-only.txt
+          echo "forward-only reservadas para o ensaio:"; cat /tmp/forward-only.txt
+          while read -r f; do
+            [ -n "$f" ] && mv "supabase/migrations/$f" /tmp/fo/
+          done < /tmp/forward-only.txt
           supabase start --exclude realtime,storage-api,imgproxy,studio,edge-runtime,logflare,vector,supavisor
           echo "DB_URL=$(supabase status -o env | grep '^DB_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+
+      - name: Ensaio diagnóstico das forward-only (psql, ROLLBACK obrigatório)
+        run: |
+          set -o pipefail
+          ORDEM=""
+          while read -r f; do
+            [ -n "$f" ] && ORDEM="$ORDEM /tmp/fo/$f"
+          done < /tmp/forward-only.txt
+          # A ordem do arquivo é lexicográfica = cronológica, então a 12A vem
+          # antes da 12B, que depende dela.
+          bash scripts/ci/diagnose-forward-only.sh "$DB_URL" $ORDEM
+
+      - name: Devolver as forward-only e aplicar pelo CLI (autoritativo)
+        run: |
+          set -o pipefail
+          while read -r f; do
+            [ -n "$f" ] && mv "/tmp/fo/$f" supabase/migrations/
+          done < /tmp/forward-only.txt
+          git diff --exit-code --stat -- supabase/migrations \
+            || { echo "FALHA: supabase/migrations foi modificado"; exit 1; }
+          # `db reset` reaplica TUDO pelo CLI, na ordem, como a rota de produção
+          # fará. É esta aplicação que vale como prova.
+          supabase db reset --no-seed
+          ST=$(supabase status -o env)
+          echo "DB_URL=$(printf '%s' "$ST" | grep '^DB_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+          # API_URL e SERVICE_ROLE_KEY alimentam o contrato contra o PostgREST.
+          # A chave é de uma stack descartável criada neste job e destruída ao
+          # final — não é segredo, e não vem de environment protegido.
+          echo "SUPABASE_API_URL=$(printf '%s' "$ST" | grep '^API_URL=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
+          echo "::add-mask::$(printf '%s' "$ST" | grep '^SERVICE_ROLE_KEY=' | cut -d= -f2- | tr -d '\"')"
+          echo "SUPABASE_SERVICE_KEY=$(printf '%s' "$ST" | grep '^SERVICE_ROLE_KEY=' | cut -d= -f2- | tr -d '\"')" >> "$GITHUB_ENV"
 
       - name: Guarda — a conexão é loopback
         run: |
@@ -143,6 +195,109 @@ jobs:
       #
       # Tudo contra a stack local. Nenhum acesso remoto, nenhuma credencial.
       # ────────────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────────────────────────
+      # ORQUESTRAÇÃO DA 12B (persistência)
+      #
+      # Quatro coisas que o repositório em memória NÃO tem como reproduzir, e
+      # que por isso só se provam aqui: UNIQUE resolvendo concorrência,
+      # transação desfazendo escrita parcial, RLS/grants efetivos, e trigger de
+      # imutabilidade sobre linha real.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Integração da orquestração de billing (12B)
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-billing-orchestration.sql'
+
+      # ────────────────────────────────────────────────────────────────────
+      # A EXCEÇÃO NOMINAL EM `public`, CONFERIDA NO CATÁLOGO
+      #
+      # A 12B abre uma exceção à regra "nenhum objeto de billing em public":
+      # dezesseis RPCs, porque `public` é o único schema exposto ao PostgREST e
+      # sem elas o repositório não alcança o banco.
+      #
+      # Os blocos dessas dezesseis saem da âncora textual do
+      # migration-rebuild-verify (split-public-rpcs.mjs). Esta asserção é a
+      # contrapartida — e é MAIS forte do que o diff que substitui, porque os
+      # dumps são tirados com --no-owner --no-privileges e nunca enxergaram
+      # proprietário nem ACL.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Exceção nominal de billing em public (catálogo)
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/assert-billing-rpcs.sql'
+
+      # ────────────────────────────────────────────────────────────────────
+      # CORRIDA REAL — duas conexões independentes
+      #
+      # Uma sessão psql não disputa nada consigo mesma. Este passo abre duas
+      # conexões, sincroniza-as com advisory lock e exige um único vencedor,
+      # uma única cobrança e recusa de fingerprint divergente.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Concorrência real na idempotência de billing
+        run: bash scripts/ci/assert-billing-concurrency.sh "$DB_URL"
+
+      # ────────────────────────────────────────────────────────────────────
+      # CONTRATO DO REPOSITÓRIO CONTRA O POSTGREST REAL
+      #
+      # O passo que faltava, e cuja ausência deixou passar um repositório que
+      # NUNCA havia executado: ele endereçava `billing` por `Accept-Profile`, o
+      # PostgREST recusava com PGRST106, e nenhum teste percebia porque nenhum
+      # teste o instanciava.
+      #
+      # Aqui as MESMAS expectativas que rodam contra o dublê rodam contra
+      # `SupabaseBillingRepository`, pelo mesmo cliente supabase-js que a
+      # aplicação usa. A rede é liberada apenas em loopback
+      # (`tests/setup/loopback-only.ts`); qualquer outro destino aborta antes
+      # da conexão.
+      # ────────────────────────────────────────────────────────────────────
+      - name: Semear fixtures do contrato
+        run: '"$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/ci/seed-contract-fixtures.sql'
+
+      - name: Contrato memória × PostgREST real
+        env:
+          BILLING_CONTRACT_URL: ${{ env.SUPABASE_API_URL }}
+          BILLING_CONTRACT_KEY: ${{ env.SUPABASE_SERVICE_KEY }}
+        run: |
+          set -o pipefail
+          # Guarda redundante e deliberada: o setup do Vitest também bloqueia,
+          # mas falhar aqui é mais barato e mais claro.
+          case "$BILLING_CONTRACT_URL" in
+            http://127.0.0.1:*|http://localhost:*) ;;
+            *) echo "FALHA: contrato só roda contra loopback (recebido: $BILLING_CONTRACT_URL)"; exit 1 ;;
+          esac
+          # ── ISOLADO, UM ARQUIVO POR VEZ ──────────────────────────────────
+          #
+          # Rodar os dois arquivos juntos interleava a saída, e na primeira
+          # execução real ficou impossível dizer quais casos falharam em qual
+          # variante. `--no-file-parallelism` e um arquivo por invocação
+          # resolvem isso; `--reporter=verbose` dá o caso a caso.
+          echo "===== VARIANTE EM MEMÓRIA ====="
+          npx --no-install vitest run --project contract \
+            --no-file-parallelism --reporter=verbose \
+            tests/contract/in-memory.spec.ts 2>&1 | tee /tmp/contrato-memoria.log
+
+          echo "===== VARIANTE POSTGREST REAL ====="
+          npx --no-install vitest run --project contract \
+            --no-file-parallelism --reporter=verbose \
+            tests/contract/postgrest.spec.ts 2>&1 | tee /tmp/contrato-real.log
+
+          # A variante real NÃO pode ter sido pulada: um skip silencioso aqui
+          # devolveria exatamente o buraco que este passo existe para fechar.
+          if grep -q "PULADO" /tmp/contrato-real.log; then
+            echo "FALHA: a variante PostgREST foi pulada — o caminho real não foi exercitado"
+            exit 1
+          fi
+          grep -q "PostgREST real" /tmp/contrato-real.log || {
+            echo "FALHA: a suíte do PostgREST real não apareceu no relatório"; exit 1; }
+
+      # `if: always()` para que a limpeza aconteça mesmo quando um passo
+      # anterior falha — fixture órfã contamina a execução seguinte.
+      #
+      # A decisão de destino e as saídas antecipadas (sem stack, sem 12B) moram
+      # no wrapper, não aqui: esta limpeza desliga triggers de imutabilidade por
+      # uma transação, e uma operação com esse poder não pode ter a cerca
+      # escrita em YAML, onde nenhum teste a alcança. Ver
+      # tests/contract-fixture-teardown-guard.mjs.
+      - name: Remover fixtures do contrato e conferir que nada sobrou
+        if: always()
+        run: bash scripts/ci/teardown-contract-fixtures.sh
+
       - name: 36/36 hashes das históricas contra o manifesto
         run: node tests/verify-recovered-migrations.mjs supabase/migrations
 
@@ -151,6 +306,8 @@ jobs:
           set -o pipefail
           "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
             -f scripts/ci/verify-applied/20260801120000.sql
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
+            -f scripts/ci/verify-applied/20260802093000.sql
 
       - name: Rollback e reaplicação da nova forward-only
         run: |
@@ -163,7 +320,8 @@ jobs:
           ANTES=$(P -At -c "SELECT count(*) FROM pg_namespace WHERE nspname='billing';")
           [ "$ANTES" = "1" ] || { echo "FALHA: schema billing ausente antes do rollback"; exit 1; }
 
-          echo "== rollback =="
+          echo "== rollback (12B primeiro, depois 12A — ordem inversa da aplicação) =="
+          P -f supabase/rollbacks/20260802093000_billing_orchestration_rollback.sql
           P -f supabase/rollbacks/20260801120000_billing_foundation_rollback.sql
 
           DEPOIS=$(P -At -c "SELECT count(*) FROM pg_namespace WHERE nspname='billing';")
@@ -181,11 +339,13 @@ jobs:
             exit 1
           fi
 
-          echo "== reaplicação =="
+          echo "== reaplicação (as DUAS, na ordem) =="
           P -f supabase/migrations/20260801120000_billing_foundation.sql
+          P -f supabase/migrations/20260802093000_billing_orchestration.sql
 
-          echo "== verificador independente, de novo =="
+          echo "== verificadores independentes, de novo =="
           P -f scripts/ci/verify-applied/20260801120000.sql
+          P -f scripts/ci/verify-applied/20260802093000.sql
 
           P -At -c "SELECT slug, coalesce(is_active::text,'NULO') FROM public.subscription_plans ORDER BY slug;" \
             > /tmp/planos-reaplicado.txt

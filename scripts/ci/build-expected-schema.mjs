@@ -70,6 +70,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { RPCS_DE_BILLING } from "./billing-rpc-allowlist.mjs";
+
 const raiz = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const ORIGEM = path.join(raiz, "supabase/baseline/schema.sql");
 const DESTINO = path.join(raiz, "supabase/baseline/schema-after-forward-only.sql");
@@ -128,6 +130,22 @@ $$;`,
       "`scripts/ci/assert-billing-security.sql`, que roda no job Verify " +
       "contra PostgreSQL real. Ver docs/decisions/PLANOS-E-PRECIFICACAO.md §8.1.",
   },
+  {
+    migration: "20260802093000_billing_orchestration.sql",
+    efeitoEstrutural: "nominal",
+    rpcs: RPCS_DE_BILLING,
+    nota:
+      "Etapa 12B. As TABELAS, TIPOS e TRIGGERS continuam inteiramente em " +
+      "`billing` e não aparecem em `pg_dump --schema=public`. As dezesseis " +
+      "RPCs, porém, VIVEM EM `public` — é o único schema exposto ao PostgREST, " +
+      "e sem elas o repositório não alcança o banco. Funções de `public` ESTÃO " +
+      "no dump, logo o efeito estrutural NÃO é nulo, e declará-lo nulo seria " +
+      "falso. A âncora B compara o dump SEM os blocos destas assinaturas " +
+      "(`scripts/ci/split-public-rpcs.mjs`), e os blocos retirados são " +
+      "verificados por catálogo em `scripts/ci/assert-billing-rpcs.sql` — que " +
+      "confere owner, SECURITY DEFINER, search_path e ACL, coisas que o dump " +
+      "é tirado com `--no-owner --no-privileges` e nunca teve como enxergar.",
+  },
 ];
 
 const modoCheck = process.argv.includes("--check");
@@ -137,8 +155,33 @@ let resultado = original;
 const aplicados = [];
 
 for (const delta of DELTAS) {
-  if (!delta.efeitoEstrutural) {
+  if (delta.efeitoEstrutural === false) {
     aplicados.push(`  ─ ${delta.migration}: sem efeito estrutural`);
+    continue;
+  }
+
+  // ── EFEITO ESTRUTURAL NOMINAL ─────────────────────────────────────────────
+  //
+  // A migration ACRESCENTA funções a `public`. O arquivo esperado NÃO é
+  // aumentado — nenhuma linha de saída de `pg_dump` é redigida à mão aqui, e
+  // isso é deliberado: texto de dump escrito por quem declara o delta não
+  // prova nada, só repete a expectativa do autor.
+  //
+  // Em vez disso, os blocos destas assinaturas são RETIRADOS do dump
+  // reconstruído antes da comparação, por `split-public-rpcs.mjs`, e passam a
+  // ser verificados no catálogo. O que sobra tem de bater com este arquivo,
+  // exatamente como antes.
+  if (delta.efeitoEstrutural === "nominal") {
+    if (!Array.isArray(delta.rpcs) || delta.rpcs.length === 0) {
+      console.error(
+        `FALHA: ${delta.migration} é "nominal" mas não declara assinatura alguma.`
+      );
+      process.exit(1);
+    }
+    aplicados.push(
+      `  ± ${delta.migration}: ${delta.rpcs.length} função(ões) nominais em public ` +
+        `(fora da âncora textual, verificadas por catálogo)`
+    );
     continue;
   }
   const ocorrencias = resultado.split(delta.de).length - 1;

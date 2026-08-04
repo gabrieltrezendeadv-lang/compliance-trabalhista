@@ -25,11 +25,34 @@ export default defineConfig({
         test: {
           name: "unit",
           environment: "node",
+          // Armadilha de rede: qualquer `fetch`/XHR/WebSocket num teste vira
+          // falha, com o alvo na mensagem. A Etapa 12B roda só com o provider
+          // mock, e essa afirmação precisava de imposição, não de revisão.
+          setupFiles: ["./tests/setup/no-network.ts"],
           include: [
             "tests/unit/**/*.spec.ts",
             "tests/integration/**/*.spec.ts",
             "tests/static/**/*.spec.ts",
           ],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          // ── CONTRATO: memória × PostgREST real ──────────────────────────
+          //
+          // Projeto SEPARADO porque é o único que pode abrir rede — e, ainda
+          // assim, só em loopback. A suíte unitária continua com proibição
+          // total; misturar as duas políticas num projeto só faria a mais
+          // frouxa valer para tudo.
+          //
+          // A variante PostgREST se auto-pula quando `BILLING_CONTRACT_URL`
+          // não está definida, e é o CI que a define, apontando para a stack
+          // descartável.
+          name: "contract",
+          environment: "node",
+          setupFiles: ["./tests/setup/loopback-only.ts"],
+          include: ["tests/contract/**/*.spec.ts"],
         },
       },
       {
