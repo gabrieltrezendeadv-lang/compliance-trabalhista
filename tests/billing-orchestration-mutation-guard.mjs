@@ -84,6 +84,7 @@ function mutar(rel, de, para, arquivoDaGuarda) {
 }
 
 const GUARDA = "tests/billing-orchestration-guard.mjs";
+const MIGRATION_12B = "supabase/migrations/20260802093000_billing_orchestration.sql";
 
 // ── Controle ────────────────────────────────────────────────────────────────
 
@@ -694,8 +695,122 @@ test("MUT-B47: rodar o splitter na âncora A é DETECTADO", () => {
 
 // ─── Limpeza ────────────────────────────────────────────────────────────────
 
-fs.rmSync(copia, { recursive: true, force: true });
+// ── LEASE DA RESERVA ────────────────────────────────────────────────────────
+//
+// A lease FALTOU no SQL enquanto existia no dublê, e nenhum teste percebeu:
+// o contrato compartilhado não a exercitava e as duas variantes passavam
+// 23/23. Estas oito mutações existem para que isso não volte a acontecer em
+// silêncio — cada peça da lease, removida ou trocada, tem de reprovar.
 
+test("MUT-B50: remover a comparação temporal da lease é DETECTADO", () => {
+  const r = mutar(
+    MIGRATION_12B,
+    "IF p_now < v_rec.started_at + c_lease THEN",
+    "IF true THEN",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `a lease sem expiração passou:\n${r.out}`);
+  assert.match(r.out, /BO-26/);
+});
+
+test("MUT-B51: trocar a borda `<` por `<=` é DETECTADO", () => {
+  // Com `<=` a lease valeria no limite exato, e o dublê discordaria — a
+  // divergência voltaria, agora de um caractere.
+  const r = mutar(
+    MIGRATION_12B,
+    "IF p_now < v_rec.started_at + c_lease THEN",
+    "IF p_now <= v_rec.started_at + c_lease THEN",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `a borda trocada passou:\n${r.out}`);
+  assert.match(r.out, /BO-26/);
+});
+
+test("MUT-B52: tornar a duração da lease um PARÂMETRO é DETECTADO", () => {
+  const r = mutar(
+    MIGRATION_12B,
+    "c_lease constant interval := interval '5 minutes';",
+    "c_lease interval := coalesce(p_lease_seconds * interval '1 second', interval '5 minutes');",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `duração vinda do cliente passou:\n${r.out}`);
+  assert.match(r.out, /BO-26/);
+});
+
+test("MUT-B53: remover o FOR UPDATE do registro de idempotência é DETECTADO", () => {
+  const r = mutar(
+    MIGRATION_12B,
+    "   FOR UPDATE;\n\n  IF NOT FOUND THEN\n    RAISE EXCEPTION 'billing: chave de idempotencia em disputa'",
+    "   ;\n\n  IF NOT FOUND THEN\n    RAISE EXCEPTION 'billing: chave de idempotencia em disputa'",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `claim sem FOR UPDATE passou:\n${r.out}`);
+  assert.match(r.out, /BO-27/);
+});
+
+test("MUT-B54: não renovar `started_at` no takeover é DETECTADO", () => {
+  // Sem renovar, a chave poderia ser retomada em cascata: toda tentativa
+  // seguinte veria a mesma lease vencida e venceria de novo.
+  const r = mutar(
+    MIGRATION_12B,
+    "       SET started_at     = p_now,\n           error_code     = NULL,",
+    "       SET error_code     = NULL,",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `takeover sem renovar started_at passou:\n${r.out}`);
+  assert.match(r.out, /BO-27/);
+});
+
+test("MUT-B55: conferir o fingerprint DEPOIS da lease é DETECTADO", () => {
+  // Ordem importa: expirar libera o MESMO pedido, nunca outro. Conferido
+  // depois, um pedido diferente tomaria a reserva de quem chegou primeiro.
+  const original = ler(MIGRATION_12B);
+  const conflito =
+    "  IF v_rec.request_fingerprint IS DISTINCT FROM p_fingerprint THEN\n" +
+    "    RETURN jsonb_build_object('outcome', 'fingerprint_conflict');\n" +
+    "  END IF;\n";
+  const i = original.indexOf(conflito, original.indexOf("fn_billing_claim_idempotency"));
+  assert.ok(i >= 0, "a mutação não encontrou o bloco de fingerprint — reescreva-a");
+
+  const semConflito = original.slice(0, i) + original.slice(i + conflito.length);
+  const j = semConflito.indexOf("  IF v_rec.status = 'in_progress' THEN");
+  const movido = semConflito.slice(0, j) + conflito + semConflito.slice(j);
+
+  escrever(MIGRATION_12B, movido);
+  try {
+    const r = guarda(GUARDA);
+    assert.equal(r.code, 1, `fingerprint conferido depois da lease passou:\n${r.out}`);
+    assert.match(r.out, /BO-27/);
+  } finally {
+    escrever(MIGRATION_12B, original);
+  }
+});
+
+test("MUT-B56: ler o relógio do BANCO em vez do instante explícito é DETECTADO", () => {
+  const r = mutar(
+    MIGRATION_12B,
+    "IF p_now < v_rec.started_at + c_lease THEN",
+    "IF now() < v_rec.started_at + c_lease THEN",
+    GUARDA
+  );
+  assert.equal(r.code, 1, `relógio do banco passou:\n${r.out}`);
+  assert.match(r.out, /BO-29/);
+});
+
+test("MUT-B57: remover o cenário de lease do contrato compartilhado é DETECTADO", () => {
+  // O contrato é o que faz memória e PostgREST responderem igual. Uma
+  // expectativa removida daqui some das DUAS variantes de uma vez.
+  const r = mutar(
+    "tests/contract/shared-expectations.ts",
+    'it("4: em T+5m EXATOS a lease já venceu — `claimed`", async () => {',
+    'it.skip("4: em T+5m EXATOS a lease já venceu — `claimed`", async () => {',
+    GUARDA
+  );
+  assert.equal(r.code, 1, `cenário de lease removido do contrato passou:\n${r.out}`);
+  assert.match(r.out, /BO-30/);
+});
+
+fs.rmSync(copia, { recursive: true, force: true });
 console.log("");
 console.log(`Billing orchestration mutation guard: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

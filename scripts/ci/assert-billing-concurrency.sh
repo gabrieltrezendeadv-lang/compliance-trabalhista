@@ -235,4 +235,86 @@ fi
 echo "  confere: 1 cobrança e 1 snapshot, apesar de dois finalize simultâneos"
 
 echo
+echo "== CORRIDA 4: dois takeover de uma lease VENCIDA =="
+#
+# A corrida 1 disputa uma chave INEXISTENTE, e quem resolve é o UNIQUE do
+# INSERT. Esta disputa é outra: a linha já existe, está `in_progress`, e a lease
+# venceu. Quem resolve agora é o `FOR UPDATE` — os dois disputantes serializam
+# ali, o primeiro grava `started_at = p_now` e sai com `claimed`, e o segundo,
+# ao adquirir o lock, relê a linha JÁ atualizada, encontra lease válida e sai
+# com `in_progress`.
+#
+# Sem a comparação temporal os dois sairiam `claimed`, e o efeito aconteceria
+# duas vezes. Sem o `FOR UPDATE` os dois leriam a versão antiga — mesmo
+# desfecho ruim, por outro caminho.
+Q -c "DELETE FROM billing.idempotency_records WHERE key='race-lease';" >/dev/null
+
+# Reserva plantada com `started_at` bem no passado: a lease de 5 minutos já
+# venceu com folga quando os disputantes chegarem com `now()`.
+Q -c "SELECT public.fn_billing_claim_idempotency(
+        '$DONO', '$ORG', 'command', 'mock', 'race-lease',
+        'fp-lease', 'corr-plantio', now() - interval '1 hour');" >/dev/null
+
+ESTADO=$(Q -c "SELECT status FROM billing.idempotency_records WHERE key='race-lease';")
+if [ "$ESTADO" != "in_progress" ]; then
+  echo "FALHA: a reserva plantada está '$ESTADO'; deveria estar in_progress"
+  exit 1
+fi
+
+"$PSQL" "$DB_URL" -v ON_ERROR_STOP=1 -At -c \
+  "BEGIN; SELECT pg_advisory_xact_lock(918276); SELECT pg_sleep(2); COMMIT;" >/dev/null &
+ARBITRO4=$!
+sleep 0.4
+
+for rot in G H; do
+  "$PSQL" "$DB_URL" -At > "/tmp/corrida-$rot.txt" 2>&1 <<SQL &
+BEGIN;
+SELECT pg_advisory_xact_lock_shared(918276);
+SELECT public.fn_billing_claim_idempotency(
+  '$DONO', '$ORG', 'command', 'mock', 'race-lease',
+  'fp-lease', 'corr-$rot', now())->>'outcome';
+COMMIT;
+SQL
+done
+wait
+
+G=$(desfecho /tmp/corrida-G.txt)
+H=$(desfecho /tmp/corrida-H.txt)
+echo "  takeover G: $G"
+echo "  takeover H: $H"
+
+TOMADAS=0
+[ "$G" = "claimed" ] && TOMADAS=$((TOMADAS + 1))
+[ "$H" = "claimed" ] && TOMADAS=$((TOMADAS + 1))
+
+if [ "$TOMADAS" -ne 1 ]; then
+  echo "FALHA: esperado exatamente 1 takeover, houve $TOMADAS"
+  echo "       (2 significa que a reserva foi retomada duas vezes — o efeito"
+  echo "        aconteceria em duplicidade, que é o que a lease impede)"
+  exit 1
+fi
+
+PERDEDOR4=$([ "$G" = "claimed" ] && echo "$H" || echo "$G")
+if [ "$PERDEDOR4" != "in_progress" ]; then
+  echo "FALHA: o perdedor do takeover devolveu '$PERDEDOR4'; deveria ler a lease"
+  echo "       recém-renovada e dizer in_progress"
+  exit 1
+fi
+
+LINHAS4=$(Q -c "SELECT count(*) FROM billing.idempotency_records WHERE key='race-lease';")
+if [ "$LINHAS4" != "1" ]; then
+  echo "FALHA: o takeover disputado deixou $LINHAS4 linha(s); deveria ser 1"
+  exit 1
+fi
+
+# O `started_at` tem de ter avançado: é a marca do takeover.
+RENOVADA=$(Q -c "SELECT (started_at > now() - interval '5 minutes')::text
+                   FROM billing.idempotency_records WHERE key='race-lease';")
+if [ "$RENOVADA" != "true" ]; then
+  echo "FALHA: started_at não foi renovado pelo takeover"
+  exit 1
+fi
+echo "  confere: 1 takeover, perdedor leu a lease renovada, 1 linha, started_at avançado"
+
+echo
 echo "corrida real conferida — barreira por advisory lock, duas conexões independentes"

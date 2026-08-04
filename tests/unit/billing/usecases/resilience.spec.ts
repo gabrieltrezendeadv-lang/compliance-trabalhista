@@ -46,6 +46,15 @@ function checkout(b: Bancada, chave = CHAVE) {
   });
 }
 
+/**
+ * DURAÇÃO DA LEASE — reafirmada aqui de propósito.
+ *
+ * Não é importada do repositório: um teste que importasse a constante passaria
+ * mesmo se a política mudasse. Cinco minutos é o que o SQL
+ * (`interval '5 minutes'`) e o dublê declaram, e é o que este arquivo cobra.
+ */
+const LEASE_MS = 5 * 60_000;
+
 describe("tabela de cenários — chamadas ao provider", () => {
   it("autorização negada: 0 chamadas, nenhum efeito", async () => {
     const b = await comAssinatura();
@@ -97,7 +106,7 @@ describe("tabela de cenários — chamadas ao provider", () => {
 
   it("lease válida: 0 chamadas — takeover recusado", async () => {
     // `finalizeCheckout` indisponível deixa a reserva `in_progress`.
-    const b = await comAssinatura({ leaseMs: 60_000 });
+    const b = await comAssinatura();
     b.repo.definirFalhas(["finalizeCheckout"]);
     const primeiro = await checkout(b);
     expect(primeiro.ok).toBe(false);
@@ -136,10 +145,7 @@ describe("tabela de cenários — chamadas ao provider", () => {
   });
 
   it("retry depois da recusa: mais 1 chamada, MESMA chave, 1 cobrança", async () => {
-    const b = await comAssinatura({
-      leaseMs: 60_000,
-      scenarios: ["unavailable_before_persist"],
-    });
+    const b = await comAssinatura({ scenarios: ["unavailable_before_persist"] });
     const primeiro = await checkout(b);
     expect(primeiro.ok).toBe(false);
     expect(b.chamadasDoProvider()).toBe(1);
@@ -152,7 +158,7 @@ describe("tabela de cenários — chamadas ao provider", () => {
     expect(cedo.ok).toBe(false);
     expect(b.chamadasDoProvider()).toBe(1);
 
-    b.relogio.avancarMs(61_000);
+    b.relogio.avancarMs(LEASE_MS);
     const segundo = await checkout(b);
     expect(segundo.ok).toBe(true);
     expect(b.chamadasDoProvider()).toBe(2);
@@ -171,7 +177,7 @@ describe("tabela de cenários — chamadas ao provider", () => {
   });
 
   it("retry após expirar a lease: mais 1 chamada, MESMO recurso externo, 1 cobrança", async () => {
-    const b = await comAssinatura({ leaseMs: 60_000, scenarios: ["unavailable_after_persist"] });
+    const b = await comAssinatura({ scenarios: ["unavailable_after_persist"] });
 
     // Primeira tentativa: o provider CRIOU e falhou ao responder.
     const primeiro = await checkout(b);
@@ -185,7 +191,7 @@ describe("tabela de cenários — chamadas ao provider", () => {
     expect(b.chamadasDoProvider()).toBe(1);
 
     // Vencida a lease, a retomada acontece — com a MESMA chave.
-    b.relogio.avancarMs(61_000);
+    b.relogio.avancarMs(LEASE_MS);
     const depois = await checkout(b);
 
     expect(depois.ok).toBe(true);
@@ -266,7 +272,7 @@ describe("estados da reserva", () => {
     // Valor inválido é rejeitado pelo provider sem criar nada, e sem ambiguidade
     // alguma. Aí sim a reserva vai a `failed`, e a retomada é IMEDIATA — sem
     // esperar lease. É o contraste com o caso ambíguo do teste anterior.
-    const b = await comAssinatura({ leaseMs: 3_600_000 });
+    const b = await comAssinatura();
 
     // `misconfigured` do mock em ambiente proibido não serve aqui; o caminho
     // determinístico disponível é a recusa por entrada inválida, provocada por
@@ -316,7 +322,7 @@ describe("estados da reserva", () => {
   });
 
   it("falha do finalize mantém `in_progress` — retomada só após a lease", async () => {
-    const b = await comAssinatura({ leaseMs: 60_000 });
+    const b = await comAssinatura();
     b.repo.definirFalhas(["finalizeCheckout"]);
     await checkout(b);
     b.repo.definirFalhas([]);
@@ -327,7 +333,7 @@ describe("estados da reserva", () => {
     if (!cedo.ok) expect(cedo.error.code).toBe("conflict");
 
     // Depois da lease: retomada.
-    b.relogio.avancarMs(61_000);
+    b.relogio.avancarMs(LEASE_MS);
     const tarde = await checkout(b);
     expect(tarde.ok).toBe(true);
   });

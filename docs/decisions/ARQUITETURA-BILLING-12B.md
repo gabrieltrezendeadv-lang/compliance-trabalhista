@@ -125,6 +125,44 @@ perde a corrida recebe a violação de unicidade e lê o resultado já gravado.
 `billing.charges` tem `UNIQUE (organization_id, idempotency_key)`, e é isso que
 faz o checkout repetido **devolver a cobrança original** em vez de erro.
 
+### 5.1 Lease — cinco minutos, política do servidor
+
+Uma reserva `in_progress` só é retomável depois que a **lease vence**. A borda é
+explícita: `p_now >= started_at + interval '5 minutes'` é lease **vencida** — no
+limite exato ela já venceu.
+
+| Estado da chave | Mesmo fingerprint | Outro fingerprint |
+| --- | --- | --- |
+| `in_progress`, antes de 5min | `in_progress` | `fingerprint_conflict` |
+| `in_progress`, em 5min ou depois | `claimed` (takeover) | `fingerprint_conflict` |
+| `completed` | replay do resultado | `fingerprint_conflict` |
+| `failed` | `claimed`, imediato | `fingerprint_conflict` |
+
+Expirar a lease libera o **mesmo** pedido, nunca outro: o fingerprint é
+conferido antes de qualquer ramo de estado. O takeover mantém chave, escopo,
+provider e fingerprint — é a mesma reserva sendo retomada, não uma nova — e
+reinicia `started_at`, de modo que a nova lease conta do zero.
+
+A duração **não é parâmetro**. Uma lease enviada pelo cliente permitiria pedir
+zero e tomar uma reserva viva, que é exatamente o efeito que ela existe para
+impedir. O que é explícito é o **relógio** (`p_now`), porque a operação precisa
+de um instante do começo ao fim — e é isso que permite ao contrato atravessar os
+cinco minutos sem espera real, inclusive contra o PostgREST.
+
+Duas retomadas simultâneas serializam no `FOR UPDATE`: a primeira grava
+`started_at` e sai com `claimed`; a segunda relê a linha já atualizada, encontra
+lease válida e sai com `in_progress`. Um vencedor, sempre — provado com duas
+conexões em `assert-billing-concurrency.sh` (corrida 4).
+
+> **Esta seção descreve uma correção, não o desenho original.** A lease existia
+> no dublê em memória e **não existia no SQL**: `fn_billing_claim_idempotency`
+> devolvia `in_progress` sem olhar `started_at`, e uma reserva abandonada
+> travava a chave para sempre contra o banco real. As duas variantes do contrato
+> passavam 23/23 porque **nenhuma expectativa exercitava a propriedade**. Foi o
+> contrato compartilhado que deixou de cobrar, não a implementação que se
+> perdeu — e por isso a correção começou pelas catorze expectativas de lease que
+> hoje rodam contra memória **e** PostgREST.
+
 **Ordem:** todo evento carrega o instante do provider. Evento anterior ao início
 da cobrança, ou cobrança de período já encerrado, é recusado com
 `out_of_order_event` — um pagamento atrasado **não reativa** ciclo posterior.
@@ -181,11 +219,11 @@ estrutura persistida.
 | --- | --- | --- |
 | Unitária | `tests/unit/billing/usecases/` | ciclo de vida, bordas temporais, faixas, preços, pró-rata, autorização, IDOR, idempotência, ordem, falhas, mock proibido em produção. `resilience.spec.ts` **mede** as chamadas ao provider por cenário |
 | Contrato | `tests/contract/shared-expectations.ts` | as MESMAS expectativas executadas contra o dublê **e** contra `SupabaseBillingRepository` pelo PostgREST local. É o arquivo que fecha o buraco de um repositório nunca exercitado |
-| Estática | `tests/billing-orchestration-guard.mjs` (25) | determinismo, ausência de rede, fronteira do `service_role`, alcance público, integridade da migration |
-| Mutação | `tests/billing-orchestration-mutation-guard.mjs` (49) | que as guardas acima reprovam quando a propriedade é removida |
+| Estática | `tests/billing-orchestration-guard.mjs` (31) | determinismo, ausência de rede, fronteira do `service_role`, alcance público, integridade da migration |
+| Mutação | `tests/billing-orchestration-mutation-guard.mjs` (57) | que as guardas acima reprovam quando a propriedade é removida |
 | PostgreSQL real | `scripts/ci/assert-billing-orchestration.sql` | **o que o dublê não reproduz**: UNIQUE resolvendo concorrência, transação desfazendo escrita parcial, RLS/grants efetivos, trigger de imutabilidade sobre linha real |
 | Assinaturas | `scripts/ci/assert-billing-rpcs.sql` | as 16 RPCs existem com a identidade exata — resolvidas por `to_regprocedure`, com nomes de parâmetro, modos, `SECURITY DEFINER`, `search_path` e EXECUTE conferidos no catálogo |
-| Concorrência real | `scripts/ci/assert-billing-concurrency.sh` | **duas conexões independentes** disputando a mesma chave, liberadas juntas por advisory lock. Não é simulação: são dois processos `psql` contra o mesmo Postgres |
+| Concorrência real | `scripts/ci/assert-billing-concurrency.sh` | **duas conexões independentes**, liberadas juntas por advisory lock, em quatro disputas — inclusive dois takeover de uma lease vencida. Não é simulação: são dois processos `psql` contra o mesmo Postgres |
 | Limpeza | `tests/contract-fixture-teardown-guard.mjs` (25) | as cinco cercas da limpeza de fixtures, e que retirar qualquer uma reprova |
 
 `tests/setup/no-network.ts` transforma qualquer `fetch`/XHR/WebSocket num teste
@@ -259,6 +297,8 @@ O que **deixou** de ser limite, e por isso não aparece mais acima:
   mesmo cliente supabase-js que a aplicação usa;
 * a concorrência já foi provada com **duas conexões independentes**, não por
   simulação;
+* a lease já é **a mesma** nas duas implementações, exercitada pelo contrato
+  compartilhado contra memória e PostgREST — ver 5.1;
 * as 16 RPCs já são conferidas no catálogo, por identidade resolvida.
 
 ## 11. Gates para a 12C

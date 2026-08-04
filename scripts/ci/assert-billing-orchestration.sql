@@ -306,6 +306,131 @@ BEGIN
 END
 $idem$;
 
+-- ── B.3.1 LEASE DA RESERVA ──────────────────────────────────────────────────
+--
+-- A lease é o que impede que uma reserva abandonada trave a chave para sempre,
+-- e é o que impede que uma reserva VIVA seja roubada. Ela existia só no dublê:
+-- o SQL devolvia `in_progress` sem olhar `started_at`, e as duas variantes do
+-- contrato passavam porque nenhuma expectativa a exercitava.
+--
+-- Aqui a prova é direta, contra o PostgreSQL, com o relógio explícito da RPC —
+-- os cinco minutos passam sem espera real.
+
+DO $lease$
+DECLARE
+  v_json     jsonb;
+  v_inicio   timestamptz := '2026-08-05T00:00:00Z';
+  v_started  timestamptz;
+  v_int      integer;
+BEGIN
+  -- claim inicial
+  v_json := public.fn_billing_claim_idempotency(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), 'command', 'mock', 'ck-lease',
+    'fp-lease', 'corr-l', v_inicio);
+  IF v_json->>'outcome' <> 'claimed' THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: claim inicial da lease devolveu %', v_json;
+  END IF;
+
+  -- 1. LEASE VÁLIDA — a 4m59s ainda está em curso
+  v_json := public.fn_billing_claim_idempotency(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), 'command', 'mock', 'ck-lease',
+    'fp-lease', 'corr-l', v_inicio + interval '4 minutes 59 seconds');
+  IF v_json->>'outcome' <> 'in_progress' THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: a 4m59s a lease deveria valer, devolveu %', v_json;
+  END IF;
+
+  -- 2. CONFLITO DE FINGERPRINT ANTES DE EXPIRAR
+  v_json := public.fn_billing_claim_idempotency(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), 'command', 'mock', 'ck-lease',
+    'fp-OUTRO', 'corr-l', v_inicio + interval '1 minute');
+  IF v_json->>'outcome' <> 'fingerprint_conflict' THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: fingerprint diferente dentro da lease devolveu %', v_json;
+  END IF;
+
+  -- 3. CONFLITO DE FINGERPRINT DEPOIS DE EXPIRAR
+  --
+  -- Expirar libera a retomada do MESMO pedido. Nunca de outro: devolver a
+  -- reserva a um pedido diferente faria o primeiro sumir sem aviso.
+  v_json := public.fn_billing_claim_idempotency(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), 'command', 'mock', 'ck-lease',
+    'fp-OUTRO', 'corr-l', v_inicio + interval '30 minutes');
+  IF v_json->>'outcome' <> 'fingerprint_conflict' THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: fingerprint diferente APÓS expirar devolveu %', v_json;
+  END IF;
+
+  -- 4. LIMITE EXATO — `p_now >= started_at + 5min` é lease VENCIDA
+  --
+  -- É a borda que separa `>=` de `>`. Uma implementação com `>` devolveria
+  -- `in_progress` aqui, e este bloco reprovaria.
+  v_json := public.fn_billing_claim_idempotency(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), 'command', 'mock', 'ck-lease',
+    'fp-lease', 'corr-takeover', v_inicio + interval '5 minutes');
+  IF v_json->>'outcome' <> 'claimed' THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: no limite exato de 5min a lease deveria ter vencido, devolveu %',
+      v_json;
+  END IF;
+
+  -- 5. O TAKEOVER REINICIA `started_at`, mantendo chave e fingerprint
+  SELECT started_at INTO v_started FROM billing.idempotency_records
+   WHERE organization_id = pg_temp.id('org_a') AND key = 'ck-lease';
+  IF v_started <> v_inicio + interval '5 minutes' THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: takeover não reiniciou started_at (ficou em %)', v_started;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM billing.idempotency_records
+     WHERE organization_id = pg_temp.id('org_a') AND key = 'ck-lease'
+       AND request_fingerprint = 'fp-lease'
+       AND status = 'in_progress'
+       AND error_code IS NULL
+  ) THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: takeover alterou fingerprint, status ou não limpou error_code';
+  END IF;
+
+  -- 6. A NOVA LEASE CONTA DO ZERO — 4m59s depois do takeover ainda vale
+  v_json := public.fn_billing_claim_idempotency(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), 'command', 'mock', 'ck-lease',
+    'fp-lease', 'corr-l', v_inicio + interval '9 minutes 59 seconds');
+  IF v_json->>'outcome' <> 'in_progress' THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: a nova lease não conta do takeover, devolveu %', v_json;
+  END IF;
+
+  -- 7. NENHUM REGISTRO DUPLICADO — takeover retoma a MESMA linha
+  SELECT count(*) INTO v_int FROM billing.idempotency_records
+   WHERE organization_id = pg_temp.id('org_a') AND key = 'ck-lease';
+  IF v_int <> 1 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: o takeover criou registro novo (% linhas para a mesma chave)', v_int;
+  END IF;
+
+  -- 8. `completed` NUNCA é retomado, por mais que a lease tenha vencido
+  PERFORM public.fn_billing_claim_idempotency(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), 'command', 'mock', 'ck-lease-c',
+    'fp-c', 'corr-l', v_inicio);
+  PERFORM public.fn_billing_finalize_checkout(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), 'mock', 'acct-1', 'cus-lease',
+    'chg-lease', 'pix', 9990, '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
+    'ck-lease-c', 'fp-c', 'corr-l', v_inicio);
+  v_json := public.fn_billing_claim_idempotency(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), 'command', 'mock', 'ck-lease-c',
+    'fp-c', 'corr-l', v_inicio + interval '1 hour');
+  IF v_json->>'outcome' <> 'completed' THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: reserva concluída foi retomada com a lease vencida (%)', v_json;
+  END IF;
+
+  RAISE NOTICE
+    'billing12B/lease OK: 5min fixos, borda >=, conflito antes e depois, takeover reinicia sem duplicar';
+END
+$lease$;
+
 -- ── B.4 COBRANÇA: imutabilidade e transições ────────────────────────────────
 
 DO $cobranca$

@@ -905,10 +905,17 @@ test("BO-17: o CI executa a integração e o ensaio das DUAS migrations", () => 
   // Uma barreira POR corrida. Contar importa: uma disputa sem portão de
   // largada não é disputa — a primeira conexão termina antes de a segunda
   // abrir, e o teste vira prova de constraint, que é o que a revisão reprovou.
+  //
+  // O número não é fixo: conta-se uma barreira POR disputa declarada. Um
+  // limiar constante envelhece — quando a quarta corrida entrou, remover uma
+  // barreira deixou de ser detectado por um `>= 3`.
+  const corridas = (sh.match(/^echo "== CORRIDA \d+/gm) ?? []).length;
   const barreiras = (sh.match(/pg_advisory_xact_lock_shared/g) ?? []).length;
-  assert.ok(
-    barreiras >= 3,
-    `a corrida tem ${barreiras} barreira(s); são três disputas e cada uma precisa da sua`
+  assert.ok(corridas >= 3, `só ${corridas} corrida(s) declarada(s)`);
+  assert.equal(
+    barreiras,
+    corridas,
+    `${corridas} corrida(s) e ${barreiras} barreira(s): cada disputa precisa do seu portão de largada`
   );
   assert.match(sh, /esperado exatamente 1 vencedor/, "a corrida não confere o vencedor único");
   assert.ok(verify.includes(corrida), "o CI não executa a corrida real");
@@ -1053,6 +1060,159 @@ test("BO-21: grandfathering e cortesia são sempre resolvidos por ORGANIZAÇÃO"
     memoria,
     /organizationId: ctx\.organizationId,\s*cutoffAt,/,
     "o direito adquirido deixou de ser gravado por organização"
+  );
+});
+
+// ── LEASE DA RESERVA ────────────────────────────────────────────────────────
+//
+// ── POR QUE ESTAS GUARDAS EXISTEM ───────────────────────────────────────────
+//
+// A lease existia no dublê em memória e NÃO existia no SQL:
+// `fn_billing_claim_idempotency` devolvia `in_progress` sem olhar `started_at`.
+// Uma reserva abandonada travava a chave para sempre contra o banco real, e as
+// duas variantes do contrato passavam 23/23 porque nenhuma expectativa a
+// exercitava.
+//
+// Comportamento é provado em `assert-billing-orchestration.sql`, na corrida com
+// duas conexões e no contrato compartilhado. O que estas guardas impedem é a
+// REMOÇÃO silenciosa de cada peça no meio de outra edição.
+
+test("BO-26: o SQL expira a lease, com a borda `>=` e sem parâmetro de duração", () => {
+  const sql = sqlExecutavel(MIGRATION);
+  const i = sql.indexOf("CREATE OR REPLACE FUNCTION public.fn_billing_claim_idempotency");
+  assert.ok(i >= 0, "fn_billing_claim_idempotency sumiu da migration");
+  const corpo = sql.slice(i, sql.indexOf("$fn$;", i));
+
+  assert.match(corpo, /interval '5 minutes'/, "a duração da lease sumiu");
+  assert.match(
+    corpo,
+    /p_now < v_rec\.started_at \+ c_lease/,
+    "a comparação temporal sumiu — sem ela não há expiração e a chave trava para sempre"
+  );
+  // Borda: só `p_now < started_at + lease` mantém `in_progress`. Uma condição
+  // com `<=` faria a lease valer no limite exato, divergindo do dublê.
+  assert.doesNotMatch(
+    corpo,
+    /p_now <= v_rec\.started_at/,
+    "a borda virou `<=`: no limite exato a lease passaria a valer, e o dublê discordaria"
+  );
+  assert.doesNotMatch(
+    corpo,
+    /p_lease|lease_ms|p_lease_seconds/i,
+    "a duração da lease virou parâmetro — política do servidor não se negocia com o cliente"
+  );
+});
+
+test("BO-27: o takeover renova `started_at` e trava a linha com FOR UPDATE", () => {
+  const sql = sqlExecutavel(MIGRATION);
+  const i = sql.indexOf("CREATE OR REPLACE FUNCTION public.fn_billing_claim_idempotency");
+  const corpo = sql.slice(i, sql.indexOf("$fn$;", i));
+
+  assert.match(corpo, /FOR UPDATE/, "sem FOR UPDATE duas retomadas simultâneas venceriam juntas");
+  // A âncora é o TRECHO DO TAKEOVER, não qualquer UPDATE do arquivo: o caminho
+  // `failed` também escreve `started_at = p_now`, e uma asserção larga passaria
+  // com o takeover mutilado.
+  const iLease = corpo.indexOf("p_now < v_rec.started_at");
+  const iFimIn = corpo.indexOf("RETURN jsonb_build_object('outcome', 'claimed');", iLease);
+  assert.ok(iLease >= 0 && iFimIn > iLease, "o ramo de takeover sumiu");
+  const takeover = corpo.slice(iLease, iFimIn);
+  assert.match(
+    takeover,
+    /UPDATE billing\.idempotency_records[\s\S]{0,200}started_at\s*=\s*p_now/,
+    "o takeover não renova started_at — a chave poderia ser retomada em cascata"
+  );
+  // O fingerprint é conferido ANTES de qualquer retomada. Expirar libera o
+  // MESMO pedido, nunca outro.
+  const iFp = corpo.indexOf("request_fingerprint IS DISTINCT FROM p_fingerprint");
+  const iEstado = corpo.indexOf("IF v_rec.status =");
+  assert.ok(iFp >= 0, "a comparação de fingerprint sumiu");
+  assert.ok(
+    iEstado >= 0 && iFp < iEstado,
+    "o fingerprint passou a ser conferido DEPOIS do primeiro ramo de estado: um pedido diferente poderia tomar a reserva"
+  );
+});
+
+test("BO-28: o dublê usa a MESMA política fixa de 5 minutos", () => {
+  const memoria = tsExecutavel("src/lib/billing/repositories/in-memory.ts");
+  assert.match(memoria, /const LEASE_MS = 5 \* 60 \* 1000;/, "a constante da lease mudou de forma");
+  assert.doesNotMatch(
+    memoria,
+    /leaseMs/,
+    "a duração da lease voltou a ser configurável — teste não escolhe política"
+  );
+  assert.match(
+    memoria,
+    /Date\.parse\(input\.now\) < expiraEm/,
+    "o dublê deixou de comparar o instante explícito com a expiração"
+  );
+});
+
+test("BO-29: o relógio da lease é explícito, nunca do banco", () => {
+  const sql = sqlExecutavel(MIGRATION);
+  const i = sql.indexOf("CREATE OR REPLACE FUNCTION public.fn_billing_claim_idempotency");
+  const corpo = sql.slice(i, sql.indexOf("$fn$;", i));
+  // `now()`/`clock_timestamp()` dentro da RPC romperia o Clock determinístico
+  // dos casos de uso e tornaria a borda intestável.
+  assert.doesNotMatch(
+    corpo,
+    /\b(now\(\)|clock_timestamp\(\)|current_timestamp)\b/i,
+    "a RPC passou a ler o relógio do banco — o instante tem de vir de p_now"
+  );
+  assert.match(corpo, /p_now IS NULL/, "a RPC deixou de exigir o instante explícito");
+});
+
+test("BO-30: o contrato compartilhado exercita a lease nas DUAS variantes", () => {
+  const contrato = tsExecutavel("tests/contract/shared-expectations.ts");
+  assert.match(contrato, /const LEASE_MS = 5 \* 60_000;/, "a política sumiu do contrato");
+  for (const marca of [
+    "a lease ainda vale",
+    "a lease já venceu",
+    "fingerprint diferente conflita ANTES e DEPOIS",
+    "nunca é retomado",
+    "reinicia `started_at`",
+    "duas retomadas concorrentes",
+    "takeover chama o provider de novo",
+  ]) {
+    assert.ok(
+      contrato.includes(marca),
+      `o contrato perdeu a expectativa de lease: "${marca}"`
+    );
+  }
+  // Desligar um caso preserva o texto e some com a prova — é a forma mais
+  // barata de a lease voltar a divergir sem ninguém notar.
+  assert.doesNotMatch(
+    contrato,
+    /\b(it|describe)\.(skip|todo|only)\(/,
+    "há expectativa desligada no contrato compartilhado"
+  );
+
+  // E as duas variantes chamam a MESMA função.
+  for (const spec of ["tests/contract/in-memory.spec.ts", "tests/contract/postgrest.spec.ts"]) {
+    assert.match(
+      tsExecutavel(spec),
+      /definirContrato\(/,
+      `${spec} deixou de usar as expectativas compartilhadas`
+    );
+  }
+});
+
+test("BO-31: a lease é provada contra o PostgreSQL e na corrida real", () => {
+  const integracao = sqlExecutavel(INTEGRACAO);
+  assert.match(integracao, /billing12B\/lease OK/, "o bloco de lease sumiu da asserção SQL");
+  assert.match(integracao, /interval '5 minutes'/, "a asserção SQL não exercita a borda exata");
+  assert.match(
+    integracao,
+    /4 minutes 59 seconds/,
+    "a asserção SQL não exercita a lease ainda válida"
+  );
+
+  const corrida = ler("scripts/ci/assert-billing-concurrency.sh");
+  assert.match(corrida, /CORRIDA 4/, "a corrida de takeover sumiu");
+  assert.match(corrida, /race-lease/, "a corrida 4 não disputa uma lease vencida");
+  assert.match(
+    corrida,
+    /esperado exatamente 1 takeover/,
+    "a corrida 4 não exige um único vencedor"
   );
 });
 

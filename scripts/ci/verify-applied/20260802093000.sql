@@ -151,6 +151,61 @@ END
 $idempotencia$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- 2.1 LEASE DA RESERVA
+--
+-- Verificador INDEPENDENTE: lê a definição instalada no banco, não o arquivo da
+-- migration. Se alguém aplicar uma versão sem a lease — ou com a borda trocada
+-- por `>` —, a reserva abandonada volta a travar a chave para sempre e a
+-- reserva viva volta a poder ser roubada.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+DO $lease$
+DECLARE
+  v_src text;
+BEGIN
+  SELECT pg_get_functiondef(
+           to_regprocedure('public.fn_billing_claim_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)')
+         ) INTO v_src;
+
+  IF v_src IS NULL THEN
+    RAISE EXCEPTION
+      'VERIF 20260802093000: fn_billing_claim_idempotency ausente com a assinatura esperada';
+  END IF;
+
+  IF position('''5 minutes''' IN v_src) = 0 THEN
+    RAISE EXCEPTION
+      'VERIF 20260802093000: a lease de 5 minutos nao esta na funcao instalada';
+  END IF;
+
+  IF position('p_now < v_rec.started_at' IN v_src) = 0 THEN
+    RAISE EXCEPTION
+      'VERIF 20260802093000: a funcao instalada nao compara p_now com started_at — nao ha expiracao';
+  END IF;
+
+  IF position('FOR UPDATE' IN v_src) = 0 THEN
+    RAISE EXCEPTION
+      'VERIF 20260802093000: a funcao instalada perdeu o FOR UPDATE do registro de idempotencia';
+  END IF;
+
+  -- A duração NÃO pode ter virado parâmetro: lease enviada pelo cliente
+  -- permitiria pedir zero e tomar uma reserva viva.
+  IF EXISTS (
+    SELECT 1
+      FROM unnest(COALESCE(
+             (SELECT p.proargnames FROM pg_proc p
+               WHERE p.oid = to_regprocedure('public.fn_billing_claim_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)')),
+             ARRAY[]::text[])) AS arg
+     WHERE arg ILIKE '%lease%'
+  ) THEN
+    RAISE EXCEPTION
+      'VERIF 20260802093000: a duracao da lease virou parametro — politica do servidor nao se negocia com o cliente';
+  END IF;
+
+  RAISE NOTICE 'VERIF 20260802093000 OK: lease de 5min na funcao instalada, com FOR UPDATE e sem parametro de duracao';
+END
+$lease$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- 3. Unicidades GLOBAIS e triggers de cobrança
 -- ─────────────────────────────────────────────────────────────────────────────
 

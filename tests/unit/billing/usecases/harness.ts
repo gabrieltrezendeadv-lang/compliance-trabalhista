@@ -100,7 +100,6 @@ export interface BancadaOptions {
   readonly organizationId?: string;
   readonly scenarios?: readonly MockScenario[];
   readonly failAt?: ConstructorParameters<typeof InMemoryBillingRepository>[0]["failAt"];
-  readonly leaseMs?: number;
   readonly grandfatheringCutoff?: string | null;
   readonly members?: readonly MembroFixture[];
 }
@@ -145,7 +144,6 @@ export function montarBancada(opcoes: BancadaOptions = {}): Bancada {
     catalog: CATALOGO,
     members: opcoes.members ?? MEMBROS,
     failAt: opcoes.failAt,
-    leaseMs: opcoes.leaseMs,
     grandfatheringCutoff: opcoes.grandfatheringCutoff ?? null,
     env,
   });

@@ -22,10 +22,14 @@
 
 import { describe, expect, it } from "vitest";
 
+import { fixedClock, sequentialIds } from "@/lib/billing/core/ports";
 import type {
   BillingRepository,
   ComandoContexto,
 } from "@/lib/billing/core/repository";
+import { BillingProviderMock } from "@/lib/billing/providers/mock/deterministic";
+import { createCheckout } from "@/lib/billing/usecases/payments";
+import type { UseCaseEnv } from "@/lib/billing/usecases/shared";
 
 export interface AmbienteDeContrato {
   readonly repo: BillingRepository;
@@ -356,6 +360,260 @@ export function definirContrato(opcoes: ContratoOptions): void {
         const dois = await amb.repo.failIdempotency(r, "x");
         expect(um.ok && um.value.kind).toBe("failed");
         expect(dois.ok && dois.value.kind).toBe("failed");
+      });
+    });
+
+    // ── LEASE ─────────────────────────────────────────────────────────────
+    //
+    // ── POR QUE ESTE BLOCO EXISTE ─────────────────────────────────────────
+    //
+    // A lease existia no dublê e NÃO existia no SQL: `fn_billing_claim_
+    // idempotency` devolvia `in_progress` sem olhar `started_at`, de modo que
+    // uma reserva abandonada travava a chave para sempre contra o banco real.
+    // As duas variantes passavam 23/23 porque nenhuma expectativa daqui
+    // exercitava a propriedade. Uma divergência que o contrato não cobra é uma
+    // divergência que o contrato não impede.
+    //
+    // O relógio é EXPLÍCITO: `now` é entrada de `claimIdempotency` nas duas
+    // implementações, e por isso os cinco minutos passam sem espera real —
+    // inclusive contra o PostgREST.
+    //
+    // Os cinco minutos são reafirmados aqui, não importados. Um teste que
+    // importasse a constante passaria mesmo se a política mudasse.
+    const LEASE_MS = 5 * 60_000;
+
+    function emT(amb: AmbienteDeContrato, ms: number): string {
+      return new Date(Date.parse(amb.agora) + ms).toISOString();
+    }
+
+    it("1-2: claim inicial reserva; nova tentativa antes de 5min é recusada", async () => {
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+        const inicial = await amb.repo.claimIdempotency(reserva(amb, "lease-1", "fp"));
+        expect(inicial.ok && inicial.value.kind).toBe("claimed");
+
+        const cedo = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-1", "fp", emT(amb, 60_000))
+        );
+        expect(cedo.ok && cedo.value.kind).toBe("in_progress");
+      });
+    });
+
+    it("3: em T+4m59s a lease ainda vale — `in_progress`", async () => {
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+        await amb.repo.claimIdempotency(reserva(amb, "lease-2", "fp"));
+
+        const quase = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-2", "fp", emT(amb, LEASE_MS - 1_000))
+        );
+        expect(quase.ok && quase.value.kind).toBe("in_progress");
+      });
+    });
+
+    it("4: em T+5m EXATOS a lease já venceu — `claimed`", async () => {
+      // A borda é `now >= startedAt + 5min`. No limite exato a lease venceu.
+      // Se alguma das duas implementações usasse `>`, este caso separaria.
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+        await amb.repo.claimIdempotency(reserva(amb, "lease-3", "fp"));
+
+        const limite = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-3", "fp", emT(amb, LEASE_MS))
+        );
+        expect(limite.ok && limite.value.kind).toBe("claimed");
+      });
+    });
+
+    it("5: depois de 5min a lease venceu — `claimed`", async () => {
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+        await amb.repo.claimIdempotency(reserva(amb, "lease-4", "fp"));
+
+        const depois = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-4", "fp", emT(amb, LEASE_MS + 60_000))
+        );
+        expect(depois.ok && depois.value.kind).toBe("claimed");
+      });
+    });
+
+    it("6-7: fingerprint diferente conflita ANTES e DEPOIS de expirar", async () => {
+      // Expirar a lease libera a retomada do MESMO pedido. Nunca de outro:
+      // devolver a reserva a um pedido diferente faria o primeiro sumir.
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+        await amb.repo.claimIdempotency(reserva(amb, "lease-5", "fp-original"));
+
+        const antes = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-5", "fp-OUTRO", emT(amb, 60_000))
+        );
+        expect(antes.ok && antes.value.kind).toBe("fingerprint_conflict");
+
+        const depois = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-5", "fp-OUTRO", emT(amb, LEASE_MS + 60_000))
+        );
+        expect(depois.ok && depois.value.kind).toBe("fingerprint_conflict");
+      });
+    });
+
+    it("8: `completed` nunca é retomado, por mais que a lease tenha vencido", async () => {
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+        await amb.repo.claimIdempotency(reserva(amb, "lease-6", "fp"));
+
+        const fin = await amb.repo.finalizeCheckout({
+          ...ctx(amb),
+          provider: "mock",
+          providerAccountId: "acct-1",
+          externalCustomerId: externoDe("cus-lease", amb.orgA),
+          externalChargeId: externoDe("chg-lease", amb.orgA),
+          method: "pix",
+          amountCents: 9_990,
+          periodStart: amb.agora,
+          periodEnd: maisDias(amb.agora, 30),
+          idempotencyKey: "lease-6",
+          fingerprint: "fp",
+          now: amb.agora,
+        });
+        expect(fin.ok).toBe(true);
+
+        const muitoDepois = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-6", "fp", emT(amb, LEASE_MS * 10))
+        );
+        expect(muitoDepois.ok && muitoDepois.value.kind).toBe("completed");
+      });
+    });
+
+    it("9: `failed` é retomável NO MESMO INSTANTE, sem esperar a lease", async () => {
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+        const r = reserva(amb, "lease-7", "fp");
+        await amb.repo.claimIdempotency(r);
+        await amb.repo.failIdempotency(r, "provider_declined");
+
+        const imediata = await amb.repo.claimIdempotency(r);
+        expect(imediata.ok && imediata.value.kind).toBe("claimed");
+      });
+    });
+
+    it("10: o takeover reinicia `started_at` — a nova lease conta do zero", async () => {
+      // `started_at` não é observável pela interface, então a prova é
+      // comportamental: depois do takeover em T+5m, uma tentativa em
+      // T+9m59s tem de ser recusada. Ela está 4m59s DEPOIS do takeover, mas
+      // 9m59s depois do claim original — se `started_at` não tivesse sido
+      // atualizado, esta chamada devolveria `claimed`.
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+        await amb.repo.claimIdempotency(reserva(amb, "lease-8", "fp"));
+
+        const takeover = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-8", "fp", emT(amb, LEASE_MS))
+        );
+        expect(takeover.ok && takeover.value.kind).toBe("claimed");
+
+        const dentroDaNova = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-8", "fp", emT(amb, LEASE_MS * 2 - 1_000))
+        );
+        expect(dentroDaNova.ok && dentroDaNova.value.kind).toBe("in_progress");
+
+        const foraDaNova = await amb.repo.claimIdempotency(
+          reserva(amb, "lease-8", "fp", emT(amb, LEASE_MS * 2))
+        );
+        expect(foraDaNova.ok && foraDaNova.value.kind).toBe("claimed");
+      });
+    });
+
+    it("11: duas retomadas concorrentes após expirar — UM vencedor", async () => {
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+        await amb.repo.claimIdempotency(reserva(amb, "lease-9", "fp"));
+
+        const quando = emT(amb, LEASE_MS);
+        const [a, b] = await Promise.all([
+          amb.repo.claimIdempotency(reserva(amb, "lease-9", "fp", quando)),
+          amb.repo.claimIdempotency(reserva(amb, "lease-9", "fp", quando)),
+        ]);
+
+        expect(a.ok && b.ok).toBe(true);
+        const desfechos = [
+          a.ok ? a.value.kind : "erro",
+          b.ok ? b.value.kind : "erro",
+        ].sort();
+        expect(desfechos).toEqual(["claimed", "in_progress"]);
+      });
+    });
+
+    it("12-14: takeover chama o provider de novo, MESMO recurso, UMA cobrança", async () => {
+      // Aqui o caso de uso inteiro roda contra o repositório da variante. É a
+      // única parte do contrato que envolve o provider, e ela existe porque as
+      // três garantias que importam depois de um takeover — o provider é
+      // chamado de novo, com a mesma chave e fingerprint; o mock devolve o
+      // MESMO recurso externo; e nada disso vira uma segunda cobrança lógica —
+      // não são observáveis só pelo repositório.
+      await comAmbiente(async (amb) => {
+        await comTrial(amb);
+
+        // `unavailable_after_persist`: o provider CRIA o recurso externo e
+        // falha ao responder. É o erro ambíguo — de cá, uma conexão que cai
+        // depois do commit do provider é idêntica a uma que cai antes —, e por
+        // isso a reserva fica `in_progress` em vez de `failed`. É exatamente o
+        // estado que a lease governa, e o cenário é do MOCK: independe de qual
+        // repositório está por baixo.
+        const provider = new BillingProviderMock({
+          ids: sequentialIds(),
+          scenarios: ["unavailable_after_persist"],
+          env: { NODE_ENV: "test", VERCEL_ENV: "development" },
+        });
+
+        function ambiente(instante: string): UseCaseEnv {
+          return {
+            clock: fixedClock(instante),
+            ids: sequentialIds(),
+            repo: amb.repo,
+            provider,
+            auth: { userId: amb.donoA, organizationId: amb.orgA, role: "owner" },
+            providerAccountId: externoDe("acct-lease", amb.orgA),
+            correlationId: "corr-lease",
+          };
+        }
+
+        const pedido = {
+          method: "pix" as const,
+          idempotencyKey: "lease-uc",
+          customerName: "Contrato Lease",
+          customerEmail: "lease@contrato.test",
+        };
+
+        // 1ª tentativa: o provider criou e não respondeu. Reserva fica presa.
+        const presa = await createCheckout(ambiente(amb.agora), pedido);
+        expect(presa.ok).toBe(false);
+        expect(provider.chamadasDeCobranca).toHaveLength(1);
+
+        // Dentro da lease, o checkout é recusado e o provider NÃO é tocado de
+        // novo. Sem isso, a repetição criaria a segunda cobrança.
+        const cedo = await createCheckout(ambiente(emT(amb, 60_000)), pedido);
+        expect(cedo.ok).toBe(false);
+        expect(provider.chamadasDeCobranca).toHaveLength(1);
+
+        // 12. Vencida a lease, a retomada acontece e o provider é chamado de
+        //     novo — com a MESMA chave e o MESMO fingerprint.
+        const retomado = await createCheckout(ambiente(emT(amb, LEASE_MS)), pedido);
+        expect(retomado.ok).toBe(true);
+        expect(provider.chamadasDeCobranca).toHaveLength(2);
+
+        const chamadas = provider.chamadasDeCobranca;
+        expect(chamadas.every((c) => c.idempotencyKey === chamadas[0].idempotencyKey)).toBe(true);
+        expect(chamadas.every((c) => c.fingerprint === chamadas[0].fingerprint)).toBe(true);
+
+        const ledger = await amb.repo.readLedger(amb.donoA, amb.orgA);
+        expect(ledger.ok).toBe(true);
+        if (!ledger.ok) throw new Error("readLedger falhou depois do takeover");
+
+        // O mock devolve o MESMO recurso externo para chave+fingerprint iguais,
+        // e nada disso virou uma segunda cobrança lógica.
+        const externos = new Set(ledger.value.charges.map((c) => c.externalChargeId));
+        expect(externos.size).toBe(1);
+        expect(ledger.value.charges).toHaveLength(1);
       });
     });
 

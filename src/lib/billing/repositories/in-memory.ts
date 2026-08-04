@@ -110,14 +110,6 @@ export interface InMemoryOptions {
   readonly members?: readonly MembroFixture[];
   /** Operações que devem falhar como `repository_unavailable`. */
   readonly failAt?: readonly InMemoryFailurePoint[];
-  /**
-   * Duração da lease de uma reserva `in_progress`, em milissegundos.
-   *
-   * Passado esse prazo sem conclusão, a reserva é considerada ABANDONADA e
-   * pode ser retomada pelo mesmo pedido. Sem lease, um processo que morreu
-   * entre o `claim` e o `finalize` travaria a chave para sempre.
-   */
-  readonly leaseMs?: number;
   readonly env?: { NODE_ENV?: string; VERCEL_ENV?: string };
 }
 
@@ -146,11 +138,21 @@ interface EventoExterno {
   chargeId: string;
 }
 
-const LEASE_PADRAO_MS = 5 * 60 * 1000;
+/**
+ * DURAÇÃO DA LEASE — POLÍTICA FIXA, IGUAL À DO SQL.
+ *
+ * Cinco minutos, e deliberadamente NÃO configurável. Uma duração vinda de fora
+ * permitiria pedir lease zero e tomar uma reserva viva — que é exatamente o
+ * efeito que a lease existe para impedir. Quem precisa exercitar a expiração
+ * move o RELÓGIO, não a política; é o que o contrato compartilhado faz, contra
+ * as duas variantes.
+ *
+ * O par em `fn_billing_claim_idempotency` é `interval '5 minutes'`.
+ */
+const LEASE_MS = 5 * 60 * 1000;
 
 export class InMemoryBillingRepository implements BillingRepository {
   readonly #clock: Clock;
-  readonly #leaseMs: number;
   readonly #catalogo: readonly CatalogPrice[];
   readonly #corteGlobal: string | null;
   readonly #membros: readonly MembroFixture[];
@@ -189,7 +191,6 @@ export class InMemoryBillingRepository implements BillingRepository {
     }
 
     this.#clock = opcoes.clock;
-    this.#leaseMs = opcoes.leaseMs ?? LEASE_PADRAO_MS;
     this.#catalogo = opcoes.catalog ?? [];
     this.#corteGlobal = opcoes.grandfatheringCutoff ?? null;
     this.#membros = opcoes.members ?? [];
@@ -656,7 +657,9 @@ export class InMemoryBillingRepository implements BillingRepository {
       // repete. Vencida, a operação é ABANDONADA — quem a iniciou pode ter
       // morrido — e o MESMO pedido pode retomá-la. Sem isso, um processo morto
       // entre o claim e o finalize travaria a chave para sempre.
-      const expiraEm = Date.parse(existente.startedAt) + this.#leaseMs;
+      // Borda: `now >= startedAt + LEASE_MS` é lease VENCIDA. No limite exato
+      // ela já venceu — a mesma borda do `>=` no SQL.
+      const expiraEm = Date.parse(existente.startedAt) + LEASE_MS;
       if (Date.parse(input.now) < expiraEm) {
         return ok({ kind: "in_progress" });
       }

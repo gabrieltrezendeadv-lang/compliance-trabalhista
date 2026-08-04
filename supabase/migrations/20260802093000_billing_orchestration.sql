@@ -991,11 +991,23 @@ SET search_path = ''
 AS $fn$
 DECLARE
   v_rec billing.idempotency_records%ROWTYPE;
+  -- ── DURAÇÃO DA LEASE — POLÍTICA FIXA DO SERVIDOR ──────────────────────────
+  --
+  -- Cinco minutos, e NÃO é parâmetro. Uma duração vinda do cliente permitiria
+  -- pedir lease zero e tomar uma reserva viva — que é exatamente o efeito que a
+  -- lease existe para impedir. O relógio é explícito (`p_now`) porque a
+  -- operação precisa de UM instante do começo ao fim; a política, não.
+  c_lease constant interval := interval '5 minutes';
 BEGIN
   PERFORM billing.fn_require_member(p_actor_id, p_organization_id, true);
 
   IF p_fingerprint IS NULL OR btrim(p_fingerprint) = '' THEN
     RAISE EXCEPTION 'billing: fingerprint do pedido e obrigatorio'
+      USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+
+  IF p_now IS NULL THEN
+    RAISE EXCEPTION 'billing: instante do pedido e obrigatorio'
       USING ERRCODE = 'invalid_parameter_value';
   END IF;
 
@@ -1041,8 +1053,36 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'completed', 'result', v_rec.result);
   END IF;
 
+  -- ── LEASE ───────────────────────────────────────────────────────────────
+  --
+  -- Enquanto vale, outra execução está em curso: o efeito NÃO se repete.
+  -- Vencida, a operação é considerada ABANDONADA — quem a iniciou pode ter
+  -- morrido entre o claim e o finalize — e o MESMO pedido pode retomá-la. Sem
+  -- isso, um processo morto trava a chave para sempre.
+  --
+  -- A borda é `p_now >= started_at + c_lease`: no limite exato a lease JÁ
+  -- venceu. O fingerprint já foi conferido acima, então retomada nunca acontece
+  -- para pedido diferente — nem depois de vencida.
+  --
+  -- A linha está travada por `FOR UPDATE`. Duas retomadas simultâneas serializam
+  -- aqui: a primeira grava `started_at = p_now` e devolve `claimed`; a segunda,
+  -- ao adquirir o lock, relê a linha já atualizada, encontra lease válida e
+  -- devolve `in_progress`. Um vencedor, sempre.
   IF v_rec.status = 'in_progress' THEN
-    RETURN jsonb_build_object('outcome', 'in_progress');
+    IF p_now < v_rec.started_at + c_lease THEN
+      RETURN jsonb_build_object('outcome', 'in_progress');
+    END IF;
+
+    -- Takeover. Chave, escopo, provider e fingerprint permanecem: é a MESMA
+    -- reserva sendo retomada, não uma nova. Só o que é incompatível com uma
+    -- nova tentativa é limpo.
+    UPDATE billing.idempotency_records
+       SET started_at     = p_now,
+           error_code     = NULL,
+           correlation_id = p_correlation_id
+     WHERE id = v_rec.id;
+
+    RETURN jsonb_build_object('outcome', 'claimed');
   END IF;
 
   -- `failed` significa que o efeito NÃO aconteceu. Repetir é legítimo, desde
@@ -1797,6 +1837,53 @@ BEGIN
   END IF;
 END
 $pc_definer$;
+
+-- 11.6.1 A LEASE ESTÁ NO CORPO DA RPC, E COM A BORDA CERTA.
+--
+-- Esta pós-condição existe porque a lease JÁ FALTOU aqui: o dublê em memória a
+-- implementava, o SQL não, e as duas variantes do contrato passavam porque
+-- nenhuma expectativa a exercitava. Uma reserva abandonada travava a chave para
+-- sempre contra o banco real.
+--
+-- A verificação é textual sobre `pg_get_functiondef` de propósito: comportamento
+-- é provado em `assert-billing-orchestration.sql` e no contrato compartilhado;
+-- aqui o que se impede é a REMOÇÃO silenciosa no meio de outra edição.
+DO $pc_lease$
+DECLARE
+  v_src text;
+BEGIN
+  SELECT pg_get_functiondef(
+           to_regprocedure('public.fn_billing_claim_idempotency(uuid, uuid, text, text, text, text, text, timestamp with time zone)')
+         ) INTO v_src;
+
+  IF v_src IS NULL THEN
+    RAISE EXCEPTION 'fn_billing_claim_idempotency nao encontrada para conferir a lease';
+  END IF;
+
+  IF position('''5 minutes''' IN v_src) = 0 THEN
+    RAISE EXCEPTION
+      'a duracao da lease (5 minutes) sumiu de fn_billing_claim_idempotency';
+  END IF;
+
+  -- A comparação e a renovação. Sem a primeira não há expiração; sem a segunda,
+  -- o takeover não reinicia a lease e a chave pode ser retomada em cascata.
+  IF position('p_now < v_rec.started_at' IN v_src) = 0 THEN
+    RAISE EXCEPTION
+      'a comparacao temporal da lease sumiu de fn_billing_claim_idempotency';
+  END IF;
+
+  IF position('started_at     = p_now' IN v_src) = 0
+     AND position('started_at = p_now' IN v_src) = 0 THEN
+    RAISE EXCEPTION
+      'o takeover nao renova started_at em fn_billing_claim_idempotency';
+  END IF;
+
+  IF position('FOR UPDATE' IN v_src) = 0 THEN
+    RAISE EXCEPTION
+      'o FOR UPDATE sumiu de fn_billing_claim_idempotency: duas retomadas simultaneas venceriam juntas';
+  END IF;
+END
+$pc_lease$;
 
 DO $pc_execute$
 DECLARE
