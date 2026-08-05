@@ -42,32 +42,26 @@ test("P0-03: provider webhooks bypass session redirect", () => {
   assert.match(source, /\/api\/webhooks/)
 })
 
-test("P0-04: billing registry never falls back to mock in production", () => {
+test("P0-04: billing provider is chosen by explicit selector, never by key presence", () => {
+  // A versão anterior desta asserção cobrava `ALLOW_MOCK_BILLING_PROVIDER` e a
+  // ausência de um fallback específico. O registry foi reescrito na 12C.0: a
+  // seleção passou a ser por `BILLING_PROVIDER`, e a chave do Asaas voltou a
+  // ser configuração, não intenção. A propriedade cobrada é a mesma — nunca
+  // cair em provider por efeito colateral —, agora na forma nova.
   const source = read("src/lib/billing/registry.ts")
-  assert.match(source, /BillingNotConfiguredError/)
-  assert.match(source, /ALLOW_MOCK_BILLING_PROVIDER/)
-  assert.match(source, /not-configured/)
-  assert.doesNotMatch(
-    source,
-    /if\s*\(\s*!?apiKey\s*\)\s*return\s+getMockBillingProvider/
-  )
+  assert.match(source, /BillingProviderNotConfiguredError/)
+  assert.match(source, /BILLING_PROVIDER/)
+  // Nenhuma decisão de seleção pode nascer da presença da chave.
+  assert.doesNotMatch(source, /if\s*\(\s*!?\s*(env\.)?ASAAS_API_KEY\s*\)\s*return/)
+  assert.doesNotMatch(source, /ALLOW_MOCK_BILLING_PROVIDER/)
 })
 
-test("P0-05: billing checkout handles missing provider before PII leaves app", () => {
-  const source = read("src/lib/billing/actions.ts")
-  const guard = source.indexOf("provider = resolveBillingProvider()")
-  const customer = source.indexOf("provider.createCustomer")
-  assert.ok(guard >= 0 && customer > guard)
-  assert.match(source, /Cobrança não configurada/)
-})
-
-test("P0-06: billing webhook requires provider and token", () => {
-  const source = read("src/app/api/webhooks/billing/route.ts")
-  assert.match(source, /BillingNotConfiguredError/)
-  assert.match(source, /ALLOW_INSECURE_BILLING_WEBHOOKS/)
-  assert.match(source, /if\s*\(!secret\s*&&\s*!insecureDevWebhookAllowed\)/)
-  assert.match(source, /status:\s*503/)
-})
+// P0-05 e P0-06 cobriam `src/lib/billing/actions.ts` e
+// `src/app/api/webhooks/billing/route.ts`, aposentados na 12C.0. Elas NÃO
+// foram descartadas: viraram asserções de AUSÊNCIA em
+// `tests/billing-legacy-retirement-guard.mjs`, que reprova se qualquer um dos
+// dois caminhos reaparecer — o que é mais forte do que cobrar a forma correta
+// de um arquivo que não deveria existir.
 
 test("P0-07: mock billing logs no customer PII", () => {
   const source = read("src/lib/billing/providers/mock-billing.ts")

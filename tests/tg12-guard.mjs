@@ -154,7 +154,8 @@ test("TG12-13: src/ resolve tenant com a MESMA regra da função", () => {
     "src/app/(dashboard)/layout.tsx",
     "src/app/(dashboard)/dashboard/settings/page.tsx",
     "src/lib/assessments/actions.ts",
-    "src/lib/billing/actions.ts",
+    // `src/lib/billing/actions.ts` foi aposentado na 12C.0. A regra continua
+    // cobrada nos demais; nenhum alvo perdeu asserção.
     "src/lib/billing/guard.ts",
     "src/lib/campaigns/actions.ts",
     "src/lib/complaints/actions.ts",
