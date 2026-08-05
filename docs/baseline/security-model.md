@@ -243,11 +243,17 @@ Variáveis por natureza (**nomes apenas**):
 |---|---|
 | Público (browser) | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_APP_URL` |
 | Server-only | `SUPABASE_SERVICE_ROLE_KEY`, `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET`, `RESEND_FROM_ADDRESS`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `ASAAS_API_KEY`, `ASAAS_WEBHOOK_TOKEN`, `ASAAS_SANDBOX`, `CRON_SECRET` |
-| Opt-in dev/teste | `ALLOW_MOCK_PROVIDERS`, `ALLOW_MOCK_BILLING_PROVIDER`, `ALLOW_INSECURE_BILLING_WEBHOOKS` |
+| Seleção de provider | `BILLING_PROVIDER` (`mock` \| `asaas`) — ausente ou desconhecido REPROVA |
+| Opt-in dev/teste | `ALLOW_MOCK_PROVIDERS` |
 
 **Pendências:** não há validação das variáveis por schema no backend; não existe
-`.env.test`; `ALLOW_INSECURE_BILLING_WEBHOOKS` é um interruptor perigoso cuja
-neutralização em produção **não** é coberta por nenhum teste versionado.
+`.env.test`.
+
+O interruptor que dispensava a verificação de assinatura do webhook legado de
+cobrança **foi removido na Etapa 12C.0**, junto da rota que o lia. Não há mais
+o que neutralizar: `tests/billing-legacy-retirement-guard.mjs` (LR-06) reprova
+se o nome reaparecer em `src/` ou no `.env.example`, e a mutação `MUT-LR-07`
+prova que a guarda o detecta de volta.
 
 ---
 
@@ -300,7 +306,7 @@ administrativo) não é contida por policy alguma. Registrado como **S9**.
 | S4 | Média | Guards de segurança mais extensos não rodam no CI por falta de `tsx` (§8) |
 | S5 | Média | Garantias de idempotência do webhook dependem de `fn_process_webhook_event`, não versionada |
 | S6 | Média | 12 vulnerabilidades de severidade alta reportadas por `npm ci`; sem auditoria de dependências no CI |
-| S7 | Média | Variáveis de ambiente sem validação por schema; `ALLOW_INSECURE_BILLING_WEBHOOKS` sem teste de neutralização em produção |
+| S7 | Baixa | Variáveis de ambiente sem validação por schema. A parte grave — o interruptor que dispensava a assinatura do webhook de cobrança — foi **removida na 12C.0**, com guarda e mutação |
 | S8 | Baixa | Ausência de `requireRole()` centralizado; listas de papéis repetidas por action |
 
 ---

@@ -111,8 +111,9 @@ no painel seguro da Vercel.** Consulte [`.env.example`](.env.example).
 | `CRON_SECRET` | server-only | sim (rotina de ciclos) |
 | `RESEND_API_KEY`, `RESEND_FROM_ADDRESS`, `RESEND_WEBHOOK_SECRET` | server-only | não — canal desativa sem elas |
 | `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN` | server-only | não |
-| `ASAAS_API_KEY`, `ASAAS_SANDBOX`, `ASAAS_WEBHOOK_TOKEN` | server-only | não |
-| `ALLOW_MOCK_PROVIDERS`, `ALLOW_MOCK_BILLING_PROVIDER`, `ALLOW_INSECURE_BILLING_WEBHOOKS` | dev/teste | **nunca em produção** |
+| `BILLING_PROVIDER` | server-only | **sim** — seletor explícito, `mock` ou `asaas`; ausente ou desconhecido reprova |
+| `ASAAS_API_KEY`, `ASAAS_ENVIRONMENT`, `ASAAS_WEBHOOK_TOKEN` | server-only | só quando `BILLING_PROVIDER=asaas`, e as três juntas |
+| `ALLOW_MOCK_PROVIDERS` | dev/teste | **nunca em produção** |
 
 Sem credencial configurada, o canal correspondente **falha fechado**: nenhum
 envio é marcado como realizado e nenhum mock é usado em produção. Detalhes em
