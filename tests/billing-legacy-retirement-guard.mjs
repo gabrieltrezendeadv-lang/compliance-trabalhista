@@ -270,9 +270,174 @@ test("LR-10: o erro de configuração não reproduz valor de secret", () => {
   );
 });
 
+// ── 4.1 A ALLOWLIST DA ROTA DINÂMICA ───────────────────────────────────────
+//
+// `/api/webhooks/[provider]` CASA com `/api/webhooks/billing`. O 404 que o E2E
+// observa não vem de "não há rota" — vem de `PROVIDER_CHANNEL_MAP` não conter
+// `billing`. A proteção é de allowlist, e allowlist só protege enquanto fechada.
+
+const ROTA_DINAMICA = "src/app/api/webhooks/[provider]/route.ts";
+
+test("LR-14: a allowlist de providers de webhook é fechada e não contém `billing`", () => {
+  const src = executavel(ROTA_DINAMICA);
+  const i = src.indexOf("PROVIDER_CHANNEL_MAP");
+  assert.ok(i > 0, "PROVIDER_CHANNEL_MAP sumiu da rota dinâmica");
+  const mapa = src.slice(i, src.indexOf("}", i) + 1);
+
+  const chaves = [...mapa.matchAll(/^\s*([a-z_]+)\s*:/gm)].map((m) => m[1]);
+  assert.deepEqual(
+    chaves.sort(),
+    ["resend", "whatsapp"],
+    `a allowlist de webhooks mudou: [${chaves.join(", ")}]. ` +
+      "Acrescentar um provider aqui abre um caminho de webhook — decisão que não é desta etapa."
+  );
+  assert.ok(!chaves.includes("billing"), "`billing` voltou à allowlist de webhooks");
+
+  // E a recusa continua sendo 404, não outro status.
+  assert.match(
+    src.slice(i),
+    /Unknown provider[\s\S]{0,120}status:\s*404/,
+    "a recusa de provider desconhecido deixou de ser 404"
+  );
+});
+
+test("LR-15: o E2E exige 404 EXATO, nunca um intervalo permissivo", () => {
+  const e2e = executavel("tests/e2e/billing-retired.spec.ts");
+
+  assert.doesNotMatch(
+    e2e,
+    /expect\(\s*\[[^\]]*40[0-9][^\]]*\]\s*\)\.toContain\(\s*resposta\.status\(\)/,
+    "o E2E voltou a aceitar um CONJUNTO de status; 405 significaria handler no caminho"
+  );
+  // A contagem não fixa o nome da variável: dois casos comparam duas respostas
+  // ao mesmo tempo, e prender a regex a `resposta` mediria menos do que existe.
+  const exatos = (e2e.match(/\.status\(\)\)\.toBe\(404\)/g) ?? []).length;
+  assert.ok(
+    exatos >= 5,
+    `o E2E tem ${exatos} asserção(ões) de 404 exato; são esperadas ao menos cinco ` +
+      "(GET, POST, as duas da procedência e a de ausência de efeito)"
+  );
+  assert.match(
+    e2e,
+    /Unknown provider: billing/,
+    "o E2E deixou de fixar a PROCEDÊNCIA do 404 (a allowlist), medindo só o status"
+  );
+});
+
+// ── 4.2 PROVIDER RESOLVIDO ANTES DE QUALQUER PII ───────────────────────────
+//
+// ── O QUE ESTA REGRA SUBSTITUI ──────────────────────────────────────────────
+//
+// `P0-05` cobrava, em `src/lib/billing/actions.ts`, que
+// `resolveBillingProvider()` acontecesse antes de `provider.createCustomer` —
+// isto é, que nenhum dado pessoal saísse da aplicação antes de haver provider
+// legítimo. O arquivo foi aposentado, e com ele a asserção. A PROPRIEDADE, não:
+// ela volta a importar assim que a 12C.2 escrever o primeiro entrypoint
+// comercial.
+//
+// ── POR QUE A REGRA MEDE ENTRYPOINT, E NÃO CASO DE USO ─────────────────────
+//
+// Exigir `resolveBillingProvider()` de todo mundo que toca o provider estaria
+// errado: os casos de uso da 12B recebem `BillingProviderPort` por INJEÇÃO, já
+// validado por quem os montou, e resolver de novo lá dentro seria o oposto do
+// desenho — quebraria o determinismo e daria a cada caso de uso uma decisão de
+// ambiente que não é dele.
+//
+// Entrypoint é onde o ambiente entra: server action ou route handler. É lá que
+// a ordem precisa ser cobrada.
+//
+// ── ESTADO ATUAL: CONJUNTO VAZIO, E ISSO ESTÁ DECLARADO ────────────────────
+//
+// Hoje nenhum entrypoint toca o provider — billing está desligado e a 12C.0 não
+// criou nada. A regra passa por vacuidade, e a mutação `MUT-LR-20` prova que
+// ela NÃO é decorativa: cria um entrypoint com a ordem invertida e exige
+// reprovação. Quando o primeiro entrypoint real surgir na 12C.2, esta guarda
+// passa a ter conteúdo sem precisar de uma linha a mais.
+
+/** Operações que levam dado pessoal para fora da aplicação. */
+const OPERACOES_COM_PII = Object.freeze([
+  "createCustomer",
+  "createCharge",
+  "createCheckout",
+]);
+
+/** Um arquivo é entrypoint quando o ambiente entra por ele. */
+function ehEntrypoint(rel, src) {
+  return /^\s*["']use server["']/m.test(src) || /^src\/app\/.*\/route\.tsx?$/.test(rel);
+}
+
+test("LR-16: entrypoint resolve o provider ANTES de enviar PII", () => {
+  const problemas = [];
+  let entrypointsComProvider = 0;
+
+  for (const arquivo of fontesDeSrc()) {
+    const src = executavel(arquivo);
+    if (!ehEntrypoint(arquivo, src)) continue;
+
+    const iPii = OPERACOES_COM_PII.map((op) => src.indexOf(`.${op}(`))
+      .filter((i) => i >= 0)
+      .sort((a, b) => a - b)[0];
+    if (iPii === undefined) continue;
+
+    entrypointsComProvider += 1;
+    const iResolve = src.indexOf("resolveBillingProvider");
+
+    if (iResolve < 0) {
+      problemas.push(`${arquivo}: envia PII ao provider sem resolvê-lo pelo registry`);
+    } else if (iResolve > iPii) {
+      problemas.push(
+        `${arquivo}: resolveBillingProvider() vem DEPOIS da primeira operação com PII`
+      );
+    }
+  }
+
+  assert.deepEqual(problemas, [], `ordem provider × PII violada:\n  ${problemas.join("\n  ")}`);
+  console.log(
+    `       (entrypoints que tocam o provider: ${entrypointsComProvider} — ` +
+      "a regra ganha conteúdo quando a 12C.2 criar o primeiro)"
+  );
+});
+
+test("LR-17: ninguém fora do registry constrói um provider", () => {
+  // Construir direto pula o seletor, a validação de configuração e a recusa em
+  // produção — os três de uma vez.
+  const culpados = [];
+  for (const arquivo of fontesDeSrc()) {
+    if (arquivo === "src/lib/billing/registry.ts") continue;
+    const src = executavel(arquivo);
+    if (/new\s+(BillingProviderMock|AsaasProvider|MockBillingProvider)\s*\(/.test(src)) {
+      culpados.push(arquivo);
+    }
+  }
+  assert.deepEqual(
+    culpados,
+    [],
+    `provider construído fora do registry:\n  ${culpados.join("\n  ")}`
+  );
+});
+
+test("LR-18: o `.env.example` não escolhe provider por padrão", () => {
+  const linhas = ler(".env.example").split("\n");
+  const decl = linhas.filter((l) => /^\s*BILLING_PROVIDER\s*=/.test(l));
+
+  assert.ok(decl.length <= 1, `BILLING_PROVIDER declarada ${decl.length} vezes no exemplo`);
+  if (decl.length === 1) {
+    const valor = decl[0].split("=").slice(1).join("=").trim();
+    assert.equal(
+      valor,
+      "",
+      `o exemplo já escolhe "${valor}": copiar o arquivo passaria a selecionar provider. ` +
+        "Vazio é tratado como ausente, e ausente RECUSA."
+    );
+  }
+
+  // E a flag de produto continua fora — ausente é o estado desligado.
+  assert.doesNotMatch(ler(".env.example"), /BILLING_ENABLED/, "a flag voltou ao exemplo");
+});
+
 // ── 5. O QUE NÃO PODE TER MUDADO ───────────────────────────────────────────
 
-test("LR-11: a jornada comercial continua desligada", () => {
+test("LR-21: a jornada comercial continua desligada", () => {
   assert.match(
     ler("src/app/(dashboard)/dashboard/billing/page.tsx"),
     /redirect\("\/dashboard"\)/,
@@ -285,7 +450,7 @@ test("LR-11: a jornada comercial continua desligada", () => {
   assert.doesNotMatch(ler("src/app/page.tsx"), /R\$|\bpre[çc]o/i, "a landing passou a citar preço");
 });
 
-test("LR-12: as cinco tabelas legadas continuam declaradas na migration histórica", () => {
+test("LR-19: as cinco tabelas legadas continuam declaradas na migration histórica", () => {
   // A aposentadoria é do CÓDIGO, não do dado. Se alguém tentar antecipar a
   // remoção física por aqui, esta asserção reprova: tirar tabela é migration
   // própria, com rollback e rodada de aplicação.
@@ -298,7 +463,7 @@ test("LR-12: as cinco tabelas legadas continuam declaradas na migration históri
   );
 });
 
-test("LR-13: a guarda roda na suíte de reconciliação", () => {
+test("LR-20: a guarda roda na suíte de reconciliação", () => {
   const pkg = JSON.parse(ler("package.json"));
   assert.match(
     pkg.scripts["test:reconciliation"],

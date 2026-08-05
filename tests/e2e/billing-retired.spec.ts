@@ -26,17 +26,72 @@ test.describe("webhook legado de billing", () => {
       failOnStatusCode: false,
     });
 
-    // 404 (rota inexistente) e 405 (método não permitido) são os desfechos
-    // aceitáveis. O que NÃO pode acontecer é 2xx: significaria que alguma coisa
-    // aceitou o evento.
-    expect([404, 405]).toContain(resposta.status());
+    // 404 EXATO, não "algo que não seja 2xx".
+    //
+    // A frouxidão importa aqui: 405 significaria que existe um handler no
+    // caminho recusando o método — ou seja, que alguma coisa voltou a ocupar
+    // `/api/webhooks/billing`. 401 significaria autenticação; 500, um handler
+    // quebrado. Só o 404 diz "não há nada aqui para cobrança".
+    expect(resposta.status()).toBe(404);
     expect(resposta.ok()).toBe(false);
   });
 
-  test("GET no mesmo caminho também não é atendido", async ({ request }) => {
+  test("GET no mesmo caminho também responde 404 exato", async ({ request }) => {
     const resposta = await request.get("/api/webhooks/billing", { failOnStatusCode: false });
+    expect(resposta.status()).toBe(404);
     expect(resposta.ok()).toBe(false);
-    expect([404, 405]).toContain(resposta.status());
+  });
+
+  test("o 404 vem da allowlist FECHADA de `[provider]`, não de rota inexistente", async ({
+    request,
+  }) => {
+    // ── POR QUE ESTA DISTINÇÃO IMPORTA ────────────────────────────────────
+    //
+    // `/api/webhooks/[provider]` é rota dinâmica: ela CASA com
+    // `/api/webhooks/billing`. O 404 não vem de "não há rota" — vem de
+    // `PROVIDER_CHANNEL_MAP` não conter `billing`. A proteção é de allowlist,
+    // e uma allowlist só protege enquanto for fechada.
+    //
+    // Se alguém acrescentar `billing: "..."` ao mapa, este caso muda de corpo
+    // e reprova, mesmo que o status siga 404 por outro motivo.
+    const doBilling = await request.post("/api/webhooks/billing", {
+      data: {},
+      failOnStatusCode: false,
+    });
+    const deUmNomeQualquer = await request.post("/api/webhooks/provider-inexistente-xyz", {
+      data: {},
+      failOnStatusCode: false,
+    });
+
+    expect(doBilling.status()).toBe(404);
+    expect(deUmNomeQualquer.status()).toBe(404);
+
+    // Mesma recusa, pelo mesmo motivo: `billing` é tão desconhecido quanto um
+    // nome inventado. É exatamente isso que se quer preservar.
+    expect(await doBilling.json()).toEqual({ error: "Unknown provider: billing" });
+    expect(await deUmNomeQualquer.json()).toEqual({
+      error: "Unknown provider: provider-inexistente-xyz",
+    });
+  });
+
+  test("nenhuma operação é executada pela requisição recusada", async ({ request }) => {
+    // Um payload que, no handler antigo, teria marcado uma cobrança como paga.
+    const resposta = await request.post("/api/webhooks/billing", {
+      data: {
+        event: "PAYMENT_RECEIVED",
+        payment: { id: "pay_x", subscription: "sub_x", value: 9990, status: "RECEIVED" },
+      },
+      headers: { "content-type": "application/json", "asaas-access-token": "qualquer" },
+      failOnStatusCode: false,
+    });
+
+    expect(resposta.status()).toBe(404);
+
+    // A recusa acontece ANTES de ler o corpo: o handler dinâmico consulta o
+    // mapa e sai. Nada de idempotência, assinatura ou persistência aparece na
+    // resposta, porque nada disso chegou a ser considerado.
+    const corpo = await resposta.text();
+    expect(corpo).toBe(JSON.stringify({ error: "Unknown provider: billing" }));
   });
 
   test("a resposta não vaza estrutura do processamento antigo", async ({ request }) => {

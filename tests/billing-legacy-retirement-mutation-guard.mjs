@@ -186,7 +186,7 @@ test("MUT-LR-07: reintroduzir o interruptor inseguro é DETECTADO", () => {
 
 test("MUT-LR-08: o interruptor de volta ao .env.example é DETECTADO", () => {
   const nome = ["ALLOW", "INSECURE", "BILLING", "WEBHOOKS"].join("_");
-  mutar("\u002Eenv.example", "BILLING_PROVIDER=mock", `BILLING_PROVIDER=mock\n${nome}=false`, /LR-06/);
+  mutar("\u002Eenv.example", "\nBILLING_PROVIDER=\n", `\nBILLING_PROVIDER=\n${nome}=false\n`, /LR-06/);
 });
 
 // ── 4. Seleção de provider ─────────────────────────────────────────────────
@@ -272,7 +272,7 @@ test("MUT-LR-17: religar /dashboard/billing é DETECTADO", () => {
     "src/app/(dashboard)/dashboard/billing/page.tsx",
     'redirect("/dashboard");',
     "return null;",
-    /LR-11/
+    /LR-21/
   );
 });
 
@@ -281,7 +281,7 @@ test("MUT-LR-18: apagar tabela legada da migration histórica é DETECTADO", () 
     "supabase/migrations/20260724161707_create_billing_tables_only.sql",
     "CREATE TABLE public.usage_records",
     "CREATE TABLE public.usage_records_renomeada",
-    /LR-12/
+    /LR-19/
   );
 });
 
@@ -290,8 +290,114 @@ test("MUT-LR-19: remover a guarda da suíte de reconciliação é DETECTADO", ()
     "package.json",
     "node tests/billing-legacy-retirement-guard.mjs && ",
     "",
-    /LR-13/
+    /LR-20/
   );
+});
+
+// ── 6. Allowlist do webhook, 404 exato e ordem provider × PII ──────────────
+
+test("MUT-LR-20: acrescentar `billing` à allowlist de webhooks é DETECTADO", () => {
+  // É a porta pela qual o caminho antigo voltaria sem recriar arquivo nenhum:
+  // a rota dinâmica já casa com /api/webhooks/billing; falta só o mapa aceitar.
+  mutar(
+    "src/app/api/webhooks/[provider]/route.ts",
+    '  resend: "email",\n  whatsapp: "whatsapp",',
+    '  resend: "email",\n  whatsapp: "whatsapp",\n  billing: "email",',
+    /LR-14/
+  );
+});
+
+test("MUT-LR-21: trocar a recusa de provider desconhecido de 404 para outro status é DETECTADO", () => {
+  mutar(
+    "src/app/api/webhooks/[provider]/route.ts",
+    '      { error: `Unknown provider: ${providerName}` },\n      { status: 404 }',
+    '      { error: `Unknown provider: ${providerName}` },\n      { status: 405 }',
+    /LR-14/
+  );
+});
+
+test("MUT-LR-22: afrouxar o E2E para aceitar 405 é DETECTADO", () => {
+  mutar(
+    "tests/e2e/billing-retired.spec.ts",
+    "    expect(resposta.status()).toBe(404);\n    expect(resposta.ok()).toBe(false);\n  });\n\n  test(\"GET no mesmo caminho também responde 404 exato\"",
+    "    expect([404, 405]).toContain(resposta.status());\n    expect(resposta.ok()).toBe(false);\n  });\n\n  test(\"GET no mesmo caminho também responde 404 exato\"",
+    /LR-15/
+  );
+});
+
+test("MUT-LR-23: remover do E2E a prova de PROCEDÊNCIA do 404 é DETECTADO", () => {
+  // Medir só o status deixaria passar um 404 vindo de outro lugar — por
+  // exemplo, de um handler novo que recusa por conta própria.
+  mutar(
+    "tests/e2e/billing-retired.spec.ts",
+    'expect(await doBilling.json()).toEqual({ error: "Unknown provider: billing" });',
+    "expect(doBilling.ok()).toBe(false);",
+    /LR-15/
+  );
+});
+
+test("MUT-LR-24: entrypoint que envia PII ANTES de resolver o provider é DETECTADO", () => {
+  // Hoje nenhum entrypoint toca o provider, então LR-16 passa por vacuidade.
+  // Esta mutação cria o primeiro — com a ordem invertida — e prova que a regra
+  // não é decorativa. É o teste que impede a guarda de nascer morta.
+  ressuscitar(
+    "src/app/api/checkout-mutante/route.ts",
+    'import { resolveBillingProvider } from "@/lib/billing/registry";\n\n' +
+      "export async function POST(request: Request) {\n" +
+      "  const dados = await request.json();\n" +
+      "  const provider = { createCustomer: async (x: unknown) => x };\n" +
+      "  await provider.createCustomer({ nome: dados.nome, cpfCnpj: dados.cpfCnpj });\n" +
+      "  const real = resolveBillingProvider();\n" +
+      "  return Response.json({ ok: Boolean(real) });\n" +
+      "}\n",
+    /LR-16/
+  );
+});
+
+test("MUT-LR-25: entrypoint que envia PII SEM resolver o provider é DETECTADO", () => {
+  ressuscitar(
+    "src/app/api/checkout-mutante/route.ts",
+    "export async function POST(request: Request) {\n" +
+      "  const dados = await request.json();\n" +
+      "  const provider = { createCustomer: async (x: unknown) => x };\n" +
+      "  await provider.createCustomer({ nome: dados.nome, cpfCnpj: dados.cpfCnpj });\n" +
+      "  return Response.json({ ok: true });\n" +
+      "}\n",
+    /LR-16/
+  );
+});
+
+test("MUT-LR-26: server action que envia PII sem resolver o provider é DETECTADA", () => {
+  // A regra vale para as duas formas de entrypoint, não só para route handler.
+  ressuscitar(
+    "src/lib/billing/checkout-mutante.ts",
+    '"use server"\n\n' +
+      "export async function contratar(nome: string, cpfCnpj: string) {\n" +
+      "  const provider = { createCharge: async (x: unknown) => x };\n" +
+      "  return provider.createCharge({ nome, cpfCnpj });\n" +
+      "}\n",
+    /LR-16/
+  );
+});
+
+test("MUT-LR-27: construir provider fora do registry é DETECTADO", () => {
+  mutar(
+    "src/lib/billing/flag.ts",
+    "export function isBillingEnabled(): boolean {",
+    'import { BillingProviderMock } from "./providers/mock/deterministic";\n' +
+      "export function atalho() {\n" +
+      "  return new BillingProviderMock({ ids: { next: () => \"x\" } });\n}\n\n" +
+      "export function isBillingEnabled(): boolean {",
+    /LR-17/
+  );
+});
+
+test("MUT-LR-28: `.env.example` voltando a escolher `mock` é DETECTADO", () => {
+  mutar(".env.example", "\nBILLING_PROVIDER=\n", "\nBILLING_PROVIDER=mock\n", /LR-18/);
+});
+
+test("MUT-LR-29: `.env.example` escolhendo `asaas` é DETECTADO", () => {
+  mutar(".env.example", "\nBILLING_PROVIDER=\n", "\nBILLING_PROVIDER=asaas\n", /LR-18/);
 });
 
 // ─── Fim ────────────────────────────────────────────────────────────────────
