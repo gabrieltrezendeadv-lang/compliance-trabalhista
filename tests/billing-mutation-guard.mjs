@@ -609,10 +609,14 @@ test("MUT-36: relógio implícito em módulo puro é DETECTADO", () => {
 });
 
 test("MUT-37: service role alcançada por componente cliente é DETECTADA", () => {
+  // A âncora era `src/components/billing/plan-card.tsx`, aposentado na 12C.0.
+  // BF-33 varre TODO componente cliente, então qualquer um serve de âncora —
+  // a propriedade cobrada não é sobre billing, é sobre a fronteira
+  // cliente × service role.
   const r = mutar(
-    "src/components/billing/plan-card.tsx",
-    'import type { SubscriptionPlan } from "@/lib/billing/actions"',
-    'import type { SubscriptionPlan } from "@/lib/billing/actions"\nimport { createServiceClient } from "@/lib/supabase/service"',
+    "src/components/auth/password-input.tsx",
+    '"use client"',
+    '"use client"\nimport { createServiceClient } from "@/lib/supabase/service"',
     FOUNDATION
   );
   assert.equal(r.code, 1, `o vazamento de service role passou:\n${r.out}`);

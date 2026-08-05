@@ -5,10 +5,14 @@
 
 > **O que esta etapa NÃO entrega, e é preciso dizer sem rodeio:**
 > não há interface, não há checkout real, não há Asaas real, não há notificação.
-> As duas migrations de billing (`20260801120000` e `20260802093000`) **permanecem
-> pendentes** — nenhuma foi aplicada em produção. A feature flag **continua
-> desligada**, e nenhuma variável precisa ser criada na Vercel.
-> Billing **não está disponível**.
+> A feature flag **continua desligada**, e nenhuma variável precisa ser criada
+> na Vercel. Billing **não está disponível**.
+>
+> **Estado de aplicação (atualizado):** a 12A (`20260801120000`) **foi aplicada
+> em produção** pela execução `30870009332`, e o ledger remoto passou a
+> **39**, com `20260801120000|billing_foundation` presente. A 12B
+> (`20260802093000_billing_orchestration.sql`) **continua pendente**. O estado
+> correto é **39/40**.
 
 ---
 
@@ -281,9 +285,10 @@ Nenhum deles é hipotético, e nenhum foi contornado.
 * **Não há interface nem checkout.** Nenhum caso de uso é exposto como rota,
   action ou página; `BO-12` reprova qualquer import da 12B a partir do runtime
   público.
-* **As migrations 12A (`20260801120000`) e 12B (`20260802093000`) continuam
-  pendentes em produção.** Foram aplicadas, revertidas e reaplicadas contra a
-  stack descartável, muitas vezes. Contra o projeto remoto, nenhuma vez.
+* **A 12B (`20260802093000`) continua pendente em produção.** A 12A
+  (`20260801120000`) foi aplicada pela execução `30870009332`; o ledger remoto
+  está em **39/40**. Contra a stack descartável, as duas foram aplicadas,
+  revertidas e reaplicadas muitas vezes; contra o projeto remoto, só a 12A.
 * O provider real (Asaas) **não foi alterado**: o contrato da 12B é novo e
   separado.
 * O repositório em memória **não** reproduz RLS, grants, transação real nem

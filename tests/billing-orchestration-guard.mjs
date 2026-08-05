@@ -328,19 +328,37 @@ test("BO-09: ausência de configuração NÃO cai no mock", () => {
   // A asserção é sobre `resolveBillingProvider`, e não sobre o arquivo: havia
   // um segundo `throw` em `getMockBillingProvider` que fazia a versão anterior
   // aprovar um registry com fallback (encontrado por MUT-B03).
+  //
+  // A 12C.0 reescreveu o registry para seletor explícito. A propriedade cobrada
+  // é a MESMA — nenhuma queda para o mock — mas o mock passou a só ser
+  // instanciado dentro do ramo `escolhido === "mock"`, nunca como último
+  // recurso.
   const registry = tsExecutavel("src/lib/billing/registry.ts");
   const iResolve = registry.indexOf("export function resolveBillingProvider");
   assert.ok(iResolve > 0, "resolveBillingProvider sumiu");
-  const corpoResolve = registry.slice(iResolve, registry.indexOf("\n}", iResolve));
+  const corpoResolve = registry.slice(iResolve, registry.indexOf("\n}\n", iResolve));
+
   assert.match(
     corpoResolve,
-    /throw new BillingNotConfiguredError\(\)/,
-    "resolveBillingProvider deixou de abortar sem configuração"
+    /seletorDeProvider\(env\)/,
+    "resolveBillingProvider deixou de exigir o seletor explícito"
   );
-  assert.doesNotMatch(
+  assert.match(
     corpoResolve,
-    /return getMockBillingProvider\(\);\s*$/,
-    "resolveBillingProvider passou a cair no mock como último recurso"
+    /escolhido === "mock"/,
+    "o mock deixou de estar restrito ao ramo do seletor"
+  );
+
+  // Nenhuma instanciação do mock pode existir DEPOIS do ramo do seletor —
+  // é ali que um fallback de último recurso apareceria.
+  const iRamo = corpoResolve.indexOf('escolhido === "mock"');
+  const depois = corpoResolve.slice(iRamo);
+  const iFimDoRamo = depois.indexOf("\n  }");
+  assert.ok(iFimDoRamo > 0, "o ramo do mock mudou de forma");
+  assert.doesNotMatch(
+    depois.slice(iFimDoRamo),
+    /new BillingProviderMock/,
+    "resolveBillingProvider passou a cair no mock fora do ramo do seletor"
   );
 });
 

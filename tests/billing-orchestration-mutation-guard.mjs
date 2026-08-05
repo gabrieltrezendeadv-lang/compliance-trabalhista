@@ -119,10 +119,13 @@ test("MUT-B02: deixar de barrar VERCEL_ENV=production é DETECTADO", () => {
 });
 
 test("MUT-B03: registry caindo no mock em vez de abortar é DETECTADO", () => {
+  // A 12C.0 trocou a forma do registry: a queda para o mock não é mais um
+  // `throw` substituído, é um `return` acrescentado DEPOIS do ramo do seletor.
+  // A mutação acompanha a forma nova; a propriedade cobrada é a mesma.
   const r = mutar(
     "src/lib/billing/registry.ts",
-    "  throw new BillingNotConfiguredError()",
-    "  return getMockBillingProvider()",
+    "  exigirConfiguracaoDoAsaas(env);\n  throw new BillingProviderNotImplementedError(\"asaas\");",
+    "  return new BillingProviderMock({\n    ids: sequentialIds(),\n    env: { NODE_ENV: env.NODE_ENV, VERCEL_ENV: env.VERCEL_ENV },\n  });",
     GUARDA
   );
   assert.equal(r.code, 1, `o fallback do registry passou:\n${r.out}`);
