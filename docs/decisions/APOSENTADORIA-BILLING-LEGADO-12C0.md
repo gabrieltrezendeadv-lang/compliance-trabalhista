@@ -115,20 +115,21 @@ Nenhuma foi descartada para obter verde.
 | | |
 | --- | --- |
 | 12A `20260801120000_billing_foundation.sql` | **aplicada** — execução `30870009332` |
-| Ledger remoto depois dela | **39**, com `20260801120000|billing_foundation` presente |
-| 12B `20260802093000_billing_orchestration.sql` | **pendente** |
-| Estado correto | **39/40** |
+| 12B `20260802093000_billing_orchestration.sql` | **aplicada** — execução `31041386635` |
+| Ledger remoto | **40**, sem pendência |
+| Estado de produção | **40/40** |
 
-**A 12C.0 não depende da aplicação da 12B.** Ela só remove runtime legado: não
-cria migration, não toca `supabase/` e não chama nenhuma das 16 RPCs. Com o
-ledger em 39 ela funciona exatamente igual.
+**A 12C.0 não dependeu da aplicação da 12B.** Ela só removeu runtime legado: não
+criou migration, não tocou `supabase/` e não chamou nenhuma RPC. Com o ledger
+em 39, como estava quando foi incorporada, funcionou exatamente igual.
 
-**A 12C.1, ao contrário, depende.** Ela criará uma forward-only posterior, e a
-pré-condição **P8** (`scripts/ci/assert-apply-preconditions.mjs`) só aceita a
-**mais antiga pendente**. Enquanto a 12B não for aplicada, qualquer tentativa de
-aplicar a migration da 12C.1 será recusada — e deve ser.
+**A 12C.1 dependia, e a dependência foi satisfeita.** Ela cria uma forward-only
+posterior (`20260810120000`), e a pré-condição **P8**
+(`scripts/ci/assert-apply-preconditions.mjs`) só aceita a **mais antiga
+pendente**. Com a 12B aplicada, a da 12C.1 passou a ser a única pendente — e
+aplicá-la continua sendo decisão separada.
 
-Nada disso autoriza aplicar a 12B. É registro de estado, não decisão.
+Isto é registro de estado, não autorização.
 
 ## 8. Limites que permanecem
 

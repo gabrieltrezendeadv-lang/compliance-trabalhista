@@ -8,11 +8,17 @@
 > A feature flag **continua desligada**, e nenhuma variável precisa ser criada
 > na Vercel. Billing **não está disponível**.
 >
-> **Estado de aplicação (atualizado):** a 12A (`20260801120000`) **foi aplicada
-> em produção** pela execução `30870009332`, e o ledger remoto passou a
-> **39**, com `20260801120000|billing_foundation` presente. A 12B
-> (`20260802093000_billing_orchestration.sql`) **continua pendente**. O estado
-> correto é **39/40**.
+> **Estado de aplicação (atualizado):** a 12A (`20260801120000`) foi aplicada
+> pela execução `30870009332` e a 12B (`20260802093000`) pela execução
+> `31041386635`. O ledger remoto está em **40**, e produção em **40/40**, sem
+> pendência. Aplicar não habilitou nada: a feature flag continua desligada e
+> nenhuma rota alcança as RPCs.
+>
+> **O conjunto autorizado em `public` deixou de ser dezesseis.** A Etapa 12C.1
+> acrescentou duas RPCs e trocou a assinatura de `fn_billing_start_trial`; o
+> estado vigente é **18**, e está descrito em
+> `docs/decisions/METADADOS-CONTRATUAIS-BILLING-12C1.md`. Onde este documento
+> diz "dezesseis", ele descreve o estado DESTA etapa, não o de hoje.
 
 ---
 
@@ -285,10 +291,14 @@ Nenhum deles é hipotético, e nenhum foi contornado.
 * **Não há interface nem checkout.** Nenhum caso de uso é exposto como rota,
   action ou página; `BO-12` reprova qualquer import da 12B a partir do runtime
   público.
-* **A 12B (`20260802093000`) continua pendente em produção.** A 12A
-  (`20260801120000`) foi aplicada pela execução `30870009332`; o ledger remoto
-  está em **39/40**. Contra a stack descartável, as duas foram aplicadas,
-  revertidas e reaplicadas muitas vezes; contra o projeto remoto, só a 12A.
+* **A 12B foi aplicada em produção** pela execução `31041386635`, depois da
+  12A pela `30870009332`. O ledger remoto está em **40/40**. Contra a stack
+  descartável, as duas foram aplicadas, revertidas e reaplicadas muitas vezes;
+  contra o projeto remoto, uma vez cada, pela rota autorizada.
+* **A 12C.1 acrescentou duas RPCs** — contato financeiro e aceite de termos —
+  e o conjunto autorizado passou a **18**. A migration
+  `20260810120000_billing_contract_metadata.sql` fica **pendente** até
+  autorização separada.
 * O provider real (Asaas) **não foi alterado**: o contrato da 12B é novo e
   separado.
 * O repositório em memória **não** reproduz RLS, grants, transação real nem
