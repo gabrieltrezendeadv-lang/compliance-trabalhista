@@ -299,6 +299,29 @@ test("MUT-CM-08b: interpolar o endereço na mensagem do repositório é DETECTAD
 
 // ── 6. A troca de assinatura ────────────────────────────────────────────────
 
+test("MUT-CM-08c: voltar a varrer `public` por substring é DETECTADO", () => {
+  // A varredura por substring foi um defeito REAL desta etapa: encontrava
+  // `public.billing_events`, tabela legada preservada pela 12C.0, e reprovava
+  // a instalação correta. Reintroduzi-la tem de doer.
+  mutar(
+    MIGRATION,
+    `     AND c.relname IN (`,
+    `     AND c.relname LIKE '%billing%' AND c.relname IN (`,
+    /varre relações de public por substring/
+  );
+});
+
+test("MUT-CM-08d: deixar o CHECK recusar o e-mail (mensagem com a linha) é DETECTADO", () => {
+  // O CHECK recusaria — mas a mensagem dele traz `Failing row contains (...)`,
+  // com o endereço, e essa mensagem vai para log.
+  mutar(
+    MIGRATION,
+    `  v_novo := billing.fn_require_email(p_billing_email);`,
+    `  v_novo := billing.fn_normalize_email(p_billing_email);`,
+    /update_billing_email não valida antes de gravar/
+  );
+});
+
 test("MUT-CM-09: manter a assinatura antiga como sobrecarga é DETECTADO", () => {
   mutar(
     MIGRATION,

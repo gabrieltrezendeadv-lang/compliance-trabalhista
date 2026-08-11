@@ -903,7 +903,9 @@ BEGIN
       pg_temp.id('dono_a'), pg_temp.id('org_a'), 'nao-e-um-email',
       '2026-08-07T00:00:00Z', 'corr-e');
     RAISE EXCEPTION 'ASSERÇÃO REPROVADA: e-mail malformado foi aceito';
-  EXCEPTION WHEN check_violation THEN
+  -- A RECUSA É LIMPA, e não do CHECK: a mensagem do CHECK traria
+  -- `Failing row contains (...)`, com o endereço, e essa mensagem vai para log.
+  EXCEPTION WHEN invalid_parameter_value THEN
     GET STACKED DIAGNOSTICS v_txt = MESSAGE_TEXT;
     IF v_txt LIKE '%nao-e-um-email%' THEN
       RAISE EXCEPTION

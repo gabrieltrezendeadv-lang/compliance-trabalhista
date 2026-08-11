@@ -269,7 +269,40 @@ BEGIN
       'VERIF 20260810120000: e-mail deveria voltar sem espacos, veio [%]', v_saida;
   END IF;
 
-  -- 4.4 A máscara não devolve o endereço.
+  -- 4.4 E-mail malformado é recusado, e a recusa NÃO reproduz o endereço.
+  --
+  -- Deixar o CHECK recusar também funcionaria, mas a mensagem dele traz
+  -- `Failing row contains (...)` — a linha inteira, endereço incluído — e
+  -- essa mensagem vai para log.
+  FOR v_saida IN
+    SELECT e FROM unnest(ARRAY['nao-e-um-email', 'sem arroba.com',
+                               'com espaco@empresa.com.br',
+                               'sem-ponto@empresa']::text[]) AS e
+  LOOP
+    BEGIN
+      PERFORM billing.fn_require_email(v_saida);
+      v_estado := 'ACEITOU';
+    EXCEPTION WHEN OTHERS THEN
+      v_estado := SQLSTATE;
+      IF SQLERRM LIKE '%' || v_saida || '%' THEN
+        RAISE EXCEPTION
+          'VERIF 20260810120000: a recusa reproduz o endereco recebido: %', SQLERRM;
+      END IF;
+    END;
+    IF v_estado <> '22023' THEN
+      RAISE EXCEPTION
+        'VERIF 20260810120000: e-mail [%] deveria ser recusado com 22023, veio %',
+        v_saida, v_estado;
+    END IF;
+  END LOOP;
+
+  SELECT billing.fn_require_email('  financeiro@empresa.com.br  ') INTO v_saida;
+  IF v_saida <> 'financeiro@empresa.com.br' THEN
+    RAISE EXCEPTION
+      'VERIF 20260810120000: e-mail valido deveria passar normalizado, veio [%]', v_saida;
+  END IF;
+
+  -- 4.5 A máscara não devolve o endereço.
   SELECT billing.fn_mask_email('financeiro@empresa.com.br') INTO v_saida;
   IF v_saida <> 'f***@empresa.com.br' THEN
     RAISE EXCEPTION
@@ -281,7 +314,7 @@ BEGIN
   END IF;
 
   RAISE NOTICE
-    'VERIF 20260810120000 OK: versao vazia/malformada recusada, e-mail normalizado, mascara sem endereco';
+    'VERIF 20260810120000 OK: versao e e-mail malformados recusados sem reproduzir o valor, mascara sem endereco';
 END
 $regras$;
 
@@ -665,17 +698,45 @@ BEGIN
     RAISE EXCEPTION 'VERIF 20260810120000: auxiliar de billing alcancavel: %', v_txt;
   END IF;
 
-  -- Nenhuma TABELA, VIEW, SEQUENCE ou TIPO de billing em `public`.
-  SELECT string_agg(c.relname, ', ') INTO v_txt
+  -- NENHUM objeto de billing em `public`. A exceção nominal vale só para
+  -- FUNÇÃO, e continua valendo.
+  --
+  -- ── POR QUE LISTA FECHADA, E NÃO `LIKE '%billing%'` ──────────────────────
+  --
+  -- A primeira versão desta asserção varria por substring e reprovava a
+  -- instalação CORRETA: `public.billing_events` é uma das cinco tabelas
+  -- LEGADAS que a 12C.0 preservou de propósito, e os índices dela também casam.
+  -- O prefixo das tabelas velhas e o nome do schema novo coincidem — varredura
+  -- por substring não distingue os dois, e nunca teve como distinguir.
+  --
+  -- A pergunta certa é nominal: nenhum objeto DESTAS migrations pode ter
+  -- nascido em `public`.
+  SELECT string_agg(format('%s.%s', n.nspname, c.relname), ', ') INTO v_txt
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public' AND c.relname LIKE '%billing%';
+   WHERE n.nspname = 'public'
+     AND c.relname IN (
+       -- 12A
+       'tiers', 'price_catalog', 'subscriptions', 'price_snapshots',
+       'grandfathering_cutoff', 'grandfathered_organizations', 'courtesies',
+       'audit_events', 'legacy_plan_state',
+       -- 12B
+       'customers', 'charges', 'idempotency_records', 'courtesy_revocations',
+       'provider_events',
+       -- 12C.1: se alguém trocar as colunas por uma tabela própria, ela cai aqui
+       'terms_acceptances', 'billing_contacts'
+     );
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION 'VERIF 20260810120000: relacao de billing em public: %', v_txt;
   END IF;
 
   SELECT string_agg(t.typname, ', ') INTO v_txt
     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-   WHERE n.nspname = 'public' AND t.typname LIKE '%billing%';
+   WHERE n.nspname = 'public'
+     AND t.typname IN (
+       'plan_slug', 'tier_slug', 'billing_period', 'subscription_state',
+       'audit_subject', 'charge_status', 'charge_method',
+       'idempotency_scope', 'idempotency_state'
+     );
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION 'VERIF 20260810120000: tipo de billing em public: %', v_txt;
   END IF;

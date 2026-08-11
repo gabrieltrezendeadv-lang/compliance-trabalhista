@@ -219,6 +219,43 @@ AS $fn$
   SELECT CASE WHEN btrim(coalesce(p_email, '')) = '' THEN NULL ELSE btrim(p_email) END;
 $fn$;
 
+-- VALIDAÇÃO DO E-MAIL, ANTES de a linha chegar ao CHECK.
+--
+-- ── POR QUE NÃO DEIXAR O CHECK RECUSAR ──────────────────────────────────────
+--
+-- O CHECK recusa, e recusar é o que importa — mas a mensagem que ele produz
+-- traz `DETAIL: Failing row contains (...)`, com a LINHA INTEIRA, endereço
+-- incluído. Essa mensagem vai para o log do PostgreSQL e para o log do
+-- servidor de aplicação, e o requisito desta etapa é que o endereço NÃO seja
+-- reproduzido em log nem em mensagem de erro.
+--
+-- Validar aqui produz uma recusa limpa, com o mesmo efeito e sem o endereço.
+-- O CHECK permanece: ele é a última linha de defesa contra uma RPC futura que
+-- erre, e `scripts/ci/assert-billing-orchestration.sql` o exercita por UPDATE
+-- direto justamente por isso.
+CREATE OR REPLACE FUNCTION billing.fn_require_email(p_email text)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = ''
+AS $fn$
+DECLARE
+  v_email text;
+BEGIN
+  v_email := billing.fn_normalize_email(p_email);
+  IF v_email IS NULL THEN
+    RETURN NULL;
+  END IF;
+  IF length(v_email) > 254
+     OR v_email !~ '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$' THEN
+    -- SEM o endereço. Nem por %, nem em DETAIL.
+    RAISE EXCEPTION 'billing: contato financeiro invalido'
+      USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  RETURN v_email;
+END
+$fn$;
+
 -- VALIDAÇÃO DA VERSÃO DOS TERMOS, com a MESMA recusa em todo caminho.
 CREATE OR REPLACE FUNCTION billing.fn_require_terms_version(p_versao text)
 RETURNS text
@@ -354,7 +391,7 @@ BEGIN
       USING ERRCODE = 'invalid_parameter_value';
   END IF;
 
-  v_email := billing.fn_normalize_email(p_billing_email);
+  v_email := billing.fn_require_email(p_billing_email);
 
   INSERT INTO billing.subscriptions (
     organization_id, plan, tier, period, state, worker_count, cnpj,
@@ -447,7 +484,7 @@ BEGIN
       USING ERRCODE = 'invalid_parameter_value';
   END IF;
 
-  v_novo := billing.fn_normalize_email(p_billing_email);
+  v_novo := billing.fn_require_email(p_billing_email);
 
   SELECT s.id, s.billing_email INTO v_id, v_antes
     FROM billing.subscriptions s
@@ -854,18 +891,45 @@ BEGIN
     RAISE EXCEPTION '12C.1: papel do PostgREST recuperou USAGE em billing';
   END IF;
 
-  -- Nenhuma TABELA, VIEW, SEQUENCE ou TIPO de billing em `public`. A exceção
-  -- nominal é só de FUNÇÃO, e continua sendo.
+  -- NENHUM objeto de billing em `public`. A exceção nominal vale só para
+  -- FUNÇÃO, e continua valendo.
+  --
+  -- ── POR QUE LISTA FECHADA, E NÃO `LIKE '%billing%'` ──────────────────────
+  --
+  -- A primeira versão desta asserção varria por substring e reprovava a
+  -- instalação CORRETA: `public.billing_events` é uma das cinco tabelas
+  -- LEGADAS que a 12C.0 preservou de propósito, e os índices dela também casam.
+  -- O prefixo das tabelas velhas e o nome do schema novo coincidem — varredura
+  -- por substring não distingue os dois, e nunca teve como distinguir.
+  --
+  -- A pergunta certa é nominal: nenhum objeto DESTAS migrations pode ter
+  -- nascido em `public`.
   SELECT string_agg(format('%s.%s', n.nspname, c.relname), ', ') INTO v_txt
     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public' AND c.relname LIKE '%billing%';
+   WHERE n.nspname = 'public'
+     AND c.relname IN (
+       -- 12A
+       'tiers', 'price_catalog', 'subscriptions', 'price_snapshots',
+       'grandfathering_cutoff', 'grandfathered_organizations', 'courtesies',
+       'audit_events', 'legacy_plan_state',
+       -- 12B
+       'customers', 'charges', 'idempotency_records', 'courtesy_revocations',
+       'provider_events',
+       -- 12C.1: se alguém trocar as colunas por uma tabela própria, ela cai aqui
+       'terms_acceptances', 'billing_contacts'
+     );
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION '12C.1: relacao de billing em public: %', v_txt;
   END IF;
 
   SELECT string_agg(t.typname, ', ') INTO v_txt
     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-   WHERE n.nspname = 'public' AND t.typname LIKE '%billing%';
+   WHERE n.nspname = 'public'
+     AND t.typname IN (
+       'plan_slug', 'tier_slug', 'billing_period', 'subscription_state',
+       'audit_subject', 'charge_status', 'charge_method',
+       'idempotency_scope', 'idempotency_state'
+     );
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION '12C.1: tipo de billing em public: %', v_txt;
   END IF;

@@ -341,6 +341,28 @@ test("CM-08: o aceite é auditado, e o e-mail entra na trilha MASCARADO", () => 
     "o endereço cru é gravado na trilha"
   );
 
+  // O E-MAIL É VALIDADO ANTES DE CHEGAR AO CHECK.
+  //
+  // O CHECK recusa — e é a última linha de defesa contra uma RPC futura que
+  // erre —, mas a mensagem dele traz `Failing row contains (...)`, com a linha
+  // inteira e o endereço junto, e essa mensagem vai para log. A validação
+  // prévia produz recusa limpa, com o mesmo efeito e sem o endereço.
+  assert.match(sql, /CREATE OR REPLACE FUNCTION billing\.fn_require_email/, "não há validação prévia do e-mail");
+  assert.match(email, /billing\.fn_require_email\(p_billing_email\)/, "update_billing_email não valida antes de gravar");
+  assert.match(
+    sql,
+    /CREATE OR REPLACE FUNCTION public\.fn_billing_start_trial[\s\S]*?billing\.fn_require_email\(p_billing_email\)/,
+    "start_trial não valida o contato antes de gravar"
+  );
+  // A recusa NÃO interpola o valor recebido.
+  const validador =
+    /CREATE OR REPLACE FUNCTION billing\.fn_require_email[\s\S]*?\n\$fn\$;/.exec(sql)?.[0] ?? "";
+  assert.doesNotMatch(
+    validador,
+    /RAISE EXCEPTION[^;]*%[^;]*USING ERRCODE|RAISE EXCEPTION '[^']*%[^']*'/,
+    "a recusa do contato financeiro interpola o valor recebido"
+  );
+
   // Auditoria dentro da transação do efeito: engolir a exceção seria auditar
   // "por fora", e a operação sobreviveria à falha da trilha.
   assert.doesNotMatch(
@@ -368,6 +390,47 @@ test("CM-08: o aceite é auditado, e o e-mail entra na trilha MASCARADO", () => 
     /CREATE TABLE/i,
     "a migration cria tabela — audit_events já comporta a prova do aceite"
   );
+});
+
+test("CM-08b: as asserções sobre `public` são NOMINAIS, e não por substring", () => {
+  // ── UM DEFEITO REAL, E A GUARDA QUE NASCEU DELE ───────────────────────────
+  //
+  // A primeira versão da pós-condição 9.9 varria `public` por
+  // `relname LIKE '%billing%'` e reprovava a instalação CORRETA: encontrava
+  // `public.billing_events` — uma das CINCO tabelas legadas que a 12C.0
+  // preservou de propósito — e os três índices dela.
+  //
+  // O prefixo das tabelas velhas e o nome do schema novo coincidem. Varredura
+  // por substring não distingue os dois, e nunca teve como distinguir. Só a
+  // lista fechada faz a pergunta certa.
+  for (const rel of [MIGRATION, VERIFICADOR]) {
+    const sql = sqlExecutavel(rel);
+    assert.doesNotMatch(
+      sql,
+      /relname\s+LIKE\s+'%billing/i,
+      `${rel}: varre relações de public por substring — alcança as tabelas legadas`
+    );
+    assert.doesNotMatch(
+      sql,
+      /typname\s+LIKE\s+'%billing/i,
+      `${rel}: varre tipos de public por substring`
+    );
+    // E a lista fechada existe, com os nomes que importam.
+    assert.match(
+      sql,
+      /c\.relname IN \([\s\S]{0,600}?'audit_events'/,
+      `${rel}: a asserção sobre relações em public não é nominal`
+    );
+  }
+
+  // E as tabelas legadas continuam FORA de qualquer lista de proibição: elas
+  // são preservadas, não erradicadas.
+  for (const legada of ["billing_events", "tenant_subscriptions", "invoices"]) {
+    assert.ok(
+      !sqlExecutavel(MIGRATION).includes(legada),
+      `a migration menciona a tabela legada ${legada}`
+    );
+  }
 });
 
 test("CM-09: o conteúdo dos termos NÃO entra no banco", () => {
@@ -487,6 +550,8 @@ test("CM-13: o verificador independente é somente leitura e prova o que promete
     [/is_nullable = 'YES'/, "não prova a nulidade permitida para linhas anteriores"],
     [/fn_require_terms_version/, "não executa a regra de versão"],
     [/fn_normalize_email/, "não executa a normalização do e-mail"],
+    [/fn_require_email/, "não executa a recusa de e-mail malformado"],
+    [/a recusa reproduz o endereco recebido/, "não prova que a recusa do e-mail não reproduz o valor"],
     [/fn_mask_email/, "não prova que a máscara não devolve o endereço"],
     [/42501/, "não prova a recusa de autorização"],
     [/DISTINCT FROM v_msg_b/, "não compara as mensagens de recusa entre si"],

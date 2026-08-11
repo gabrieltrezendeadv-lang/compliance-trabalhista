@@ -203,6 +203,7 @@ $fn$;
 -- ─────────────────────────────────────────────────────────────────────────────
 
 DROP FUNCTION IF EXISTS billing.fn_mask_email(text);
+DROP FUNCTION IF EXISTS billing.fn_require_email(text);
 DROP FUNCTION IF EXISTS billing.fn_normalize_email(text);
 DROP FUNCTION IF EXISTS billing.fn_require_terms_version(text);
 
@@ -316,7 +317,8 @@ BEGIN
   SELECT string_agg(p.proname, ', ') INTO v_txt
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
    WHERE n.nspname = 'billing'
-     AND p.proname IN ('fn_mask_email', 'fn_normalize_email', 'fn_require_terms_version');
+     AND p.proname IN ('fn_mask_email', 'fn_normalize_email',
+                       'fn_require_email', 'fn_require_terms_version');
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION 'ROLLBACK 20260810120000: auxiliar da 12C.1 sobreviveu: %', v_txt;
   END IF;
