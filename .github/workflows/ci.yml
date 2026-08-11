@@ -360,6 +360,19 @@ jobs:
           # e reverter a 12B com a assinatura nova instalada deixaria em public uma
           # função que a 12B não conhece.
           P -f supabase/rollbacks/20260810120000_billing_contract_metadata_rollback.sql
+
+          # ── O RESÍDUO DO ENUM, CONFERIDO AQUI E NÃO DENTRO DO ROLLBACK ────
+          #
+          # Agora, entre o rollback da 12C.1 e o da 12B: a 12B derruba o schema
+          # `billing` inteiro e levaria o enum junto, e depois dela não haveria
+          # o que conferir.
+          #
+          # A asserção do conjunto EXATO mora aqui, e não no arquivo de
+          # rollback, porque lá seria eterna: a 12C.2 e qualquer etapa que
+          # acrescente um assunto de auditoria passariam a reprovar ao reverter
+          # a 12C.1, por uma mudança que não é dela.
+          P -f scripts/ci/assert-rollback-enum-residue.sql
+
           P -f supabase/rollbacks/20260802093000_billing_orchestration_rollback.sql
           P -f supabase/rollbacks/20260801120000_billing_foundation_rollback.sql
 

@@ -192,6 +192,78 @@ test("MUT-CM-03c: a recusa passar a revelar a versão vigente é DETECTADO", () 
   );
 });
 
+// ── 2.1 A fronteira do INSTANTE ─────────────────────────────────────────────
+//
+// A versão já tinha par (MUT-CM-03); o instante não tinha nenhum, e era o
+// instante que carrega a data do contrato. Estas cinco fecham a assimetria.
+
+test("MUT-CM-03d: declarar termsAcceptedAt na entrada do caso de uso é DETECTADO", () => {
+  // Âncora pelo comentário que só existe em `StartTrialInput`: a linha
+  // `readonly termsVersion: string;` sozinha aparece também em
+  // `AcceptTermsInput`, e âncora ambígua muta o lugar errado.
+  mutar(
+    CASOS,
+    `   * \`TERMS_VERSION\` — o que chega aqui é afirmação, não escolha.
+   */
+  readonly termsVersion: string;
+}`,
+    `   * \`TERMS_VERSION\` — o que chega aqui é afirmação, não escolha.
+   */
+  readonly termsVersion: string;
+  readonly termsAcceptedAt: string;
+}`,
+    /StartTrialInput declara `termsAcceptedAt`/
+  );
+});
+
+test("MUT-CM-03e: persistir o instante vindo do chamador é DETECTADO", () => {
+  mutar(
+    CASOS,
+    `    termsAcceptedAt: agora,`,
+    `    termsAcceptedAt: input.termsAcceptedAt,`,
+    /termsAcceptedAt recebe `input\.termsAcceptedAt`|um instante é lido da entrada do chamador/
+  );
+});
+
+test("MUT-CM-03f: carimbar o novo aceite com valor do chamador é DETECTADO", () => {
+  mutar(
+    CASOS,
+    `  return env.repo.acceptTerms(contexto(env), versao.value, env.clock.now());`,
+    `  return env.repo.acceptTerms(contexto(env), versao.value, input.acceptedAt);`,
+    /acceptTerms não carimba o instante do relógio injetado/
+  );
+});
+
+test("MUT-CM-03g: trocar a origem de `agora` é DETECTADO", () => {
+  mutar(
+    CASOS,
+    `  const agora = env.clock.now();
+  const faixa = selectTier(input.workerCount);`,
+    `  const agora = input.termsAcceptedAt;
+  const faixa = selectTier(input.workerCount);`,
+    /`agora` deixou de ser o relógio injetado/
+  );
+});
+
+test("MUT-CM-03h: remover o teste da fronteira é DETECTADO", () => {
+  mutar(
+    "tests/unit/billing/usecases/contract-metadata.spec.ts",
+    `describe("fronteira cliente → servidor", () => {`,
+    `describe.skip("fronteira removida", () => {`,
+    /não há teste da fronteira/
+  );
+});
+
+test("MUT-CM-03i: declarar organização ou ator na entrada do cliente é DETECTADO", () => {
+  mutar(
+    CASOS,
+    `export interface AcceptTermsInput extends ComandoBase {`,
+    `export interface AcceptTermsInput extends ComandoBase {
+  readonly actorId: string;`,
+    /AcceptTermsInput declara `actorId`/
+  );
+});
+
 // ── 3. A auditoria ──────────────────────────────────────────────────────────
 
 test("MUT-CM-04: retirar a auditoria do novo aceite é DETECTADO", () => {
@@ -590,9 +662,10 @@ test("MUT-CM-16d: limpar o dado contratual ANTES de provar a barreira é DETECTA
 test("MUT-CM-16c: reverter a 12B antes da 12C.1 é DETECTADO", () => {
   mutar(
     ".github/workflows/ci.yml",
-    `          P -f supabase/rollbacks/20260810120000_billing_contract_metadata_rollback.sql
-          P -f supabase/rollbacks/20260802093000_billing_orchestration_rollback.sql`,
     `          P -f supabase/rollbacks/20260802093000_billing_orchestration_rollback.sql
+          P -f supabase/rollbacks/20260801120000_billing_foundation_rollback.sql`,
+    `          P -f supabase/rollbacks/20260801120000_billing_foundation_rollback.sql
+          P -f supabase/rollbacks/20260802093000_billing_orchestration_rollback.sql
           P -f supabase/rollbacks/20260810120000_billing_contract_metadata_rollback.sql`,
     /rollback da 12C\.1 não roda antes do da 12B/
   );
@@ -604,6 +677,96 @@ test("MUT-CM-16e: voltar a escrever a contagem de blocos à mão é DETECTADO", 
     `          [ "$BLOCOS" -eq "$ESPERADOS" ] || {`,
     `          [ "$BLOCOS" -eq 18 ] || {`,
     /compara os blocos contra um número escrito à mão/
+  );
+});
+
+// ── 11.1 O resíduo do enum ──────────────────────────────────────────────────
+
+const RESIDUO = "scripts/ci/assert-rollback-enum-residue.sql";
+
+test("MUT-CM-16f: remover um dos rótulos ANTERIORES esperados é DETECTADO", () => {
+  mutar(
+    RESIDUO,
+    `    'grandfathering', 'subscription_state', 'price_catalog',`,
+    `    'subscription_state', 'price_catalog',`,
+    /os nove rótulos anteriores à 12C.1 mudaram/
+  );
+});
+
+test("MUT-CM-16g: remover um dos rótulos RESIDUAIS esperados é DETECTADO", () => {
+  mutar(
+    RESIDUO,
+    `  v_residuos text[] := ARRAY['terms_acceptance', 'billing_email'];`,
+    `  v_residuos text[] := ARRAY['terms_acceptance'];`,
+    /a lista de resíduos deixou de ser exatamente os dois rótulos/
+  );
+});
+
+test("MUT-CM-16h: aceitar um TERCEIRO rótulo residual é DETECTADO", () => {
+  // Declarar um resíduo a mais faria o script tolerar um rótulo que ninguém
+  // revisou — e a guarda exige a lista fechada, com os onze e só eles.
+  mutar(
+    RESIDUO,
+    `  v_residuos text[] := ARRAY['terms_acceptance', 'billing_email'];`,
+    `  v_residuos text[] := ARRAY['terms_acceptance', 'billing_email', 'qualquer_coisa'];`,
+    /a lista de resíduos deixou de ser exatamente os dois rótulos/
+  );
+});
+
+test("MUT-CM-16i: retirar a consulta a pg_enum é DETECTADO", () => {
+  mutar(
+    RESIDUO,
+    `    FROM pg_enum en`,
+    `    FROM pg_type en`,
+    /não consulta pg_enum/
+  );
+});
+
+test("MUT-CM-16j: afrouxar a comparação EXATA de contagem é DETECTADO", () => {
+  mutar(
+    RESIDUO,
+    `  IF v_int <> array_length(v_anteriores, 1) + array_length(v_residuos, 1) THEN`,
+    `  IF v_int < array_length(v_anteriores, 1) THEN`,
+    /a comparação de contagem foi afrouxada/
+  );
+});
+
+test("MUT-CM-16k: parar de exigir que os rótulos sejam INERTES é DETECTADO", () => {
+  mutar(
+    RESIDUO,
+    `      'RESIDUO 20260810120000: funcao instalada ainda escreve com os rotulos residuais: %', v_txt;`,
+    `      'RESIDUO 20260810120000: aviso informativo: %', v_txt;`,
+    /não prova que os rótulos são inertes/
+  );
+});
+
+test("MUT-CM-16l: rodar a prova DEPOIS do rollback da 12B é DETECTADO", () => {
+  // Depois da 12B o schema `billing` não existe mais, e o enum foi junto: a
+  // prova passaria a rodar contra o nada.
+  mutar(
+    ".github/workflows/ci.yml",
+    `          P -f scripts/ci/assert-rollback-enum-residue.sql
+
+          P -f supabase/rollbacks/20260802093000_billing_orchestration_rollback.sql`,
+    `          P -f supabase/rollbacks/20260802093000_billing_orchestration_rollback.sql
+          P -f scripts/ci/assert-rollback-enum-residue.sql
+`,
+    /não roda entre o rollback da 12C\.1 e o da 12B/
+  );
+});
+
+test("MUT-CM-16m: mover a asserção ETERNA para dentro do rollback é DETECTADO", () => {
+  mutar(
+    ROLLBACK,
+    `  RAISE NOTICE
+    'ROLLBACK 20260810120000 OK: 16 RPCs, assinatura anterior restaurada, colunas removidas';`,
+    `  IF (SELECT count(*) FROM pg_enum en JOIN pg_type t ON t.oid = en.enumtypid
+       WHERE t.typname = 'audit_subject') <> 11 THEN
+    RAISE EXCEPTION 'enum inesperado';
+  END IF;
+  RAISE NOTICE
+    'ROLLBACK 20260810120000 OK: 16 RPCs, assinatura anterior restaurada, colunas removidas';`,
+    /o rollback passou a afirmar o conjunto de rótulos/
   );
 });
 

@@ -727,6 +727,88 @@ test("CM-16b: nenhum workflow escreve o tamanho da allowlist à mão", () => {
   );
 });
 
+test("CM-16c: o resíduo do enum é provado por COMPORTAMENTO, e no lugar certo", () => {
+  const rel = "scripts/ci/assert-rollback-enum-residue.sql";
+  assert.ok(existe(rel), `${rel} ausente`);
+  const sql = sqlExecutavel(rel);
+  const ci = ler(CI);
+
+  // Somente leitura, e sem deixar rastro.
+  assert.match(sql, /BEGIN TRANSACTION READ ONLY;/, `${rel}: não é READ ONLY`);
+  assert.match(sql, /^ROLLBACK;$/m, `${rel}: não termina em ROLLBACK`);
+
+  // Pergunta ao CATÁLOGO, e não ao arquivo de rollback.
+  assert.match(sql, /FROM pg_enum/, `${rel}: não consulta pg_enum`);
+
+  // ── AS DUAS LISTAS, EXTRAÍDAS E COMPARADAS ────────────────────────────────
+  //
+  // Procurar `'billing_email'` no arquivo inteiro não serve: o rótulo aparece
+  // também na conferência de COLUNAS da seção 2, e tirá-lo da lista de resíduos
+  // passava despercebido — foi o que `MUT-CM-16g` mostrou. As listas são
+  // extraídas pelo nome da variável e comparadas termo a termo.
+  const extrair = (variavel) => {
+    const m = new RegExp(`${variavel} text\\[\\] :=\\s*ARRAY\\[([\\s\\S]*?)\\];`).exec(sql);
+    assert.ok(m, `${rel}: a lista ${variavel} sumiu`);
+    return [...m[1].matchAll(/'([a-z_]+)'/g)].map((x) => x[1]).sort();
+  };
+
+  assert.deepEqual(
+    extrair("v_anteriores"),
+    [
+      "charge", "courtesy", "grandfathering", "payment", "plan_change",
+      "price_catalog", "subscription_state", "tier_change", "worker_count",
+    ],
+    `${rel}: os nove rótulos anteriores à 12C.1 mudaram — nenhum deles é desta etapa`
+  );
+  assert.deepEqual(
+    extrair("v_residuos"),
+    ["billing_email", "terms_acceptance"],
+    `${rel}: a lista de resíduos deixou de ser exatamente os dois rótulos da 12C.1`
+  );
+
+  // AUSENTE, EXTRA e CONTAGEM — as três, senão renomear passa.
+  assert.match(sql, /desapareceu do enum/, `${rel}: não reprova rótulo ausente`);
+  assert.match(sql, /NAO DECLARADO no enum/, `${rel}: não reprova rótulo extra`);
+  assert.match(
+    sql,
+    /array_length\(v_real, 1\)[\s\S]{0,200}?<>[\s\S]{0,120}?array_length\(v_anteriores, 1\)/,
+    `${rel}: a comparação de contagem foi afrouxada`
+  );
+
+  // E o resto da 12C.1 tem de ter sumido, com os rótulos inertes.
+  for (const [re, queixa] of [
+    [/coluna sobreviveu/, "não confere as colunas"],
+    [/CHECK sobreviveu/, "não confere as constraints"],
+    [/RPC da 12C\.1 sobreviveu/, "não confere as RPCs"],
+    [/auxiliar da 12C\.1 sobreviveu/, "não confere os auxiliares"],
+    [/esperadas 16/, "não confere o regime de privilégio da 12B"],
+    [/ainda escreve com os rotulos residuais/, "não prova que os rótulos são inertes"],
+  ]) {
+    assert.match(sql, re, `${rel}: ${queixa}`);
+  }
+
+  // ── E ROda NA JANELA CERTA ────────────────────────────────────────────────
+  //
+  // Depois do rollback da 12C.1 e ANTES do da 12B, que derruba o schema inteiro
+  // e levaria o enum junto.
+  const iC1 = ci.lastIndexOf(`rollbacks/${VERSAO}_billing_contract_metadata_rollback.sql`);
+  const iResiduo = ci.indexOf("assert-rollback-enum-residue.sql");
+  const iB = ci.lastIndexOf("rollbacks/20260802093000_billing_orchestration_rollback.sql");
+  assert.ok(iResiduo > 0, "o CI não roda a prova do resíduo do enum");
+  assert.ok(
+    iC1 < iResiduo && iResiduo < iB,
+    "a prova do resíduo não roda entre o rollback da 12C.1 e o da 12B"
+  );
+
+  // E a asserção de conjunto ETERNO não pode ter ido parar dentro do rollback:
+  // lá ela reprovaria toda etapa futura que acrescentasse um assunto.
+  assert.doesNotMatch(
+    sqlExecutavel(ROLLBACK),
+    /FROM pg_enum/,
+    "o rollback passou a afirmar o conjunto de rótulos — isso reprovaria etapas futuras"
+  );
+});
+
 // ── 8. O caminho TypeScript ────────────────────────────────────────────────
 
 test("CM-17: o contrato TypeScript ganhou as três propriedades e as duas operações", () => {
@@ -895,6 +977,111 @@ test("CM-20: a versão oficial mora num lugar só, e o cliente não a escolhe", 
   );
   // Relógio injetado: `new Date()` aqui tornaria a borda do aceite intestável.
   assert.doesNotMatch(casos, /new Date\(\)|Date\.now\(\)/, "o caso de uso lê o relógio do processo");
+});
+
+test("CM-23: nenhuma entrada de caso de uso declara o instante do aceite", () => {
+  // ── A FRONTEIRA QUE AINDA NÃO EXISTE, E JÁ TEM REGRA ──────────────────────
+  //
+  // Não há server action de billing: a 12C.0 aposentou as antigas e a 12C.1 não
+  // cria nenhuma. A regra nasce ANTES do entrypoint de propósito — quando a
+  // 12C.3 escrever a action, o jeito natural de errar é repassar o corpo do
+  // formulário ao caso de uso, e é aqui que isso passa a doer.
+  //
+  // Proibir `new Date()`/`Date.now()` NÃO cobre isto: aquilo impede ler o
+  // relógio do processo; isto impede aceitar o instante de QUEM CHAMA. São
+  // buracos diferentes, e o segundo é o que entrega a data do contrato ao
+  // navegador.
+  const dir = path.join(raiz, "src/lib/billing/usecases");
+  const arquivos = fs.readdirSync(dir).filter((f) => f.endsWith(".ts"));
+  assert.ok(arquivos.length > 0, "não há casos de uso para inspecionar");
+
+  /** Campos que o cliente NUNCA pode escolher, mesmo que os envie. */
+  const PROIBIDOS = [
+    "termsAcceptedAt",
+    "acceptedAt",
+    "occurredAt",
+    "now",
+    "updatedAt",
+    "actorId",
+    "organizationId",
+    "origin",
+    "correlationId",
+  ];
+
+  let interfaces = 0;
+  for (const arquivo of arquivos) {
+    const src = tsExecutavel(`src/lib/billing/usecases/${arquivo}`);
+    // Toda entrada de caso de uso estende `ComandoBase` — é o que a torna
+    // alcançável a partir do cliente.
+    for (const m of src.matchAll(
+      /export interface (\w+) extends ComandoBase \{([\s\S]*?)\n\}/g
+    )) {
+      interfaces += 1;
+      const [, nome, corpo] = m;
+      for (const proibido of PROIBIDOS) {
+        assert.ok(
+          !new RegExp(`readonly\\s+${proibido}\\??\\s*:`).test(corpo),
+          `${arquivo}: ${nome} declara \`${proibido}\`, que é resolvido no servidor e não pode vir do chamador`
+        );
+      }
+    }
+  }
+  assert.ok(
+    interfaces >= 10,
+    `apenas ${interfaces} entradas de caso de uso inspecionadas — a varredura deixou de alcançá-las`
+  );
+  console.log(`       (${interfaces} entradas de caso de uso inspecionadas)`);
+});
+
+test("CM-24: o instante que chega ao repositório vem SEMPRE do Clock", () => {
+  const src = tsExecutavel(CASOS_DE_USO);
+
+  // Todo valor passado como instante de aceite é `agora` ou `env.clock.now()`,
+  // e `agora` é, no arquivo inteiro, sempre `env.clock.now()`.
+  for (const m of src.matchAll(/const\s+agora\s*=\s*([^;]+);/g)) {
+    assert.equal(
+      m[1].trim(),
+      "env.clock.now()",
+      "`agora` deixou de ser o relógio injetado"
+    );
+  }
+
+  for (const m of src.matchAll(/termsAcceptedAt:\s*([^,\n]+)/g)) {
+    const origem = m[1].trim();
+    assert.ok(
+      origem === "agora" || origem === "env.clock.now()",
+      `termsAcceptedAt recebe \`${origem}\`; só o relógio injetado é aceito`
+    );
+  }
+
+  // E a chamada de aceite carimba o relógio no terceiro argumento.
+  assert.match(
+    src,
+    /repo\.acceptTerms\(contexto\(env\), versao\.value, env\.clock\.now\(\)\)/,
+    "acceptTerms não carimba o instante do relógio injetado"
+  );
+  assert.match(
+    src,
+    /repo\.updateBillingEmail\([\s\S]{0,120}?env\.clock\.now\(\)\s*\)/,
+    "updateBillingEmail não carimba o instante do relógio injetado"
+  );
+
+  // Nenhum instante derivado do que chegou.
+  assert.doesNotMatch(
+    src,
+    /(termsAcceptedAt|acceptedAt|now):\s*input\./,
+    "um instante é lido da entrada do chamador"
+  );
+  assert.doesNotMatch(src, /new Date\(\)|Date\.now\(\)/, "o caso de uso lê o relógio do processo");
+
+  // E os testes exercitam a fronteira em tempo de execução, não só no tipo.
+  const boundary = ler("tests/unit/billing/usecases/contract-metadata.spec.ts");
+  assert.match(boundary, /fronteira cliente → servidor/, "não há teste da fronteira");
+  assert.match(
+    boundary,
+    /instante enviado pelo formulário é IGNORADO/,
+    "nenhum teste manda o instante pelo corpo e exige que seja ignorado"
+  );
 });
 
 // ── 9. A prova comportamental existe onde só ela cabe ──────────────────────
