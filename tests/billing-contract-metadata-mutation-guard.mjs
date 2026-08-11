@@ -574,6 +574,19 @@ test("MUT-CM-16b: o CI rodar o verificador só UMA vez é DETECTADO", () => {
   );
 });
 
+test("MUT-CM-16d: limpar o dado contratual ANTES de provar a barreira é DETECTADO", () => {
+  // Limpar primeiro faria o rollback passar — e o passo deixaria de provar que
+  // a barreira existe. Passaria verde sem exercitar nada.
+  mutar(
+    ".github/workflows/ci.yml",
+    `          echo "== a barreira do rollback da 12C.1 ABORTA com dado contratual =="`,
+    `          echo "== limpando o dado contratual da stack descartável =="
+          P -c "UPDATE billing.subscriptions SET terms_version = NULL, terms_accepted_at = NULL;"
+          echo "== a barreira do rollback da 12C.1 seria exercitada aqui =="`,
+    /não exercita a barreira do rollback/
+  );
+});
+
 test("MUT-CM-16c: reverter a 12B antes da 12C.1 é DETECTADO", () => {
   mutar(
     ".github/workflows/ci.yml",

@@ -673,10 +673,34 @@ test("CM-16: a migration está na rota, com verificação independente", () => {
     "o CI não reaplica a 12C.1 depois do rollback"
   );
 
+  // A BARREIRA É EXERCITADA, não só declarada. A corrida real deixa uma
+  // assinatura com aceite gravado — exatamente o estado em que reverter
+  // apagaria prova —, e o CI exige que o rollback RECUSE antes de limpar e
+  // reverter de verdade.
+  assert.ok(
+    ci.includes("a barreira do rollback da 12C.1 ABORTA com dado contratual"),
+    "o CI não exercita a barreira do rollback"
+  );
+  assert.ok(
+    ci.includes("o rollback destruiu dado contratual em silêncio"),
+    "o CI não reprova quando o rollback destrói dado contratual"
+  );
+  const iBarreira = ci.indexOf("a barreira do rollback da 12C.1 ABORTA");
+  const iLimpeza = ci.indexOf("limpando o dado contratual da stack descartável");
+  assert.ok(
+    iBarreira > 0 && iLimpeza > iBarreira,
+    "o CI limpa o dado contratual ANTES de provar que a barreira recusa"
+  );
+
   // ORDEM INVERSA: a 12C.1 sai primeiro. Reverter a 12B com a assinatura nova
   // instalada deixaria em `public` uma função que a 12B não conhece.
-  const iC1 = ci.indexOf(`rollbacks/${VERSAO}_billing_contract_metadata_rollback.sql`);
-  const iB = ci.indexOf("rollbacks/20260802093000_billing_orchestration_rollback.sql");
+  // `lastIndexOf`, e não `indexOf`: o arquivo do rollback da 12C.1 aparece
+  // DUAS vezes — na prova da barreira, que recusa de propósito, e na cadeia
+  // real. Medir a primeira tornava a asserção vácua, porque a prova da barreira
+  // vem antes do rollback da 12B faça o que fizer a cadeia. `MUT-CM-16c`
+  // encontrou isso.
+  const iC1 = ci.lastIndexOf(`rollbacks/${VERSAO}_billing_contract_metadata_rollback.sql`);
+  const iB = ci.lastIndexOf("rollbacks/20260802093000_billing_orchestration_rollback.sql");
   assert.ok(iC1 > 0 && iB > 0 && iC1 < iB, "o rollback da 12C.1 não roda antes do da 12B");
 });
 

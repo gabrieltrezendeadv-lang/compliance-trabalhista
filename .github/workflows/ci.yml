@@ -323,6 +323,34 @@ jobs:
           ANTES=$(P -At -c "SELECT count(*) FROM pg_namespace WHERE nspname='billing';")
           [ "$ANTES" = "1" ] || { echo "FALHA: schema billing ausente antes do rollback"; exit 1; }
 
+          # ── A BARREIRA DO ROLLBACK DA 12C.1, EXERCITADA ────────────────────
+          #
+          # A corrida real (assert-billing-concurrency.sh) deixa uma assinatura
+          # com aceite gravado. Isso não é sujeira: é exatamente o estado em que
+          # reverter a 12C.1 APAGARIA prova contratual, e o rollback tem de
+          # recusar. Provar isso aqui é mais barato do que descobrir em produção.
+          echo "== a barreira do rollback da 12C.1 ABORTA com dado contratual =="
+          COM_DADO=$(P -At -c "SELECT count(*) FROM billing.subscriptions WHERE terms_version IS NOT NULL;")
+          echo "  assinaturas com aceite: $COM_DADO"
+          [ "$COM_DADO" != "0" ] || {
+            echo "FALHA: nenhuma assinatura com aceite — a barreira não seria exercitada,"
+            echo "       e este passo passaria sem provar nada"; exit 1; }
+
+          if P -f supabase/rollbacks/20260810120000_billing_contract_metadata_rollback.sql                > /tmp/barreira.log 2>&1; then
+            echo "FALHA: o rollback destruiu dado contratual em silêncio"; exit 1
+          fi
+          grep -q "ABORTADO" /tmp/barreira.log || {
+            echo "FALHA: o rollback falhou, mas por outro motivo:"; cat /tmp/barreira.log; exit 1; }
+          grep -q "assinatura(s) com e-mail financeiro" /tmp/barreira.log || {
+            echo "FALHA: a recusa não trouxe diagnóstico"; cat /tmp/barreira.log; exit 1; }
+          echo "  confere: recusou, com diagnóstico"
+
+          # Só DEPOIS de provado, o dado sai — explicitamente, nesta stack
+          # descartável, e nunca por dentro do rollback.
+          echo "== limpando o dado contratual da stack descartável =="
+          P -c "DELETE FROM billing.audit_events WHERE subject::text IN ('terms_acceptance', 'billing_email');"
+          P -c "UPDATE billing.subscriptions SET billing_email = NULL, terms_version = NULL, terms_accepted_at = NULL;"
+
           echo "== rollback (12C.1, depois 12B, depois 12A — ordem inversa da aplicação) =="
           # A 12C.1 sai PRIMEIRO: ela troca a assinatura de fn_billing_start_trial,
           # e reverter a 12B com a assinatura nova instalada deixaria em public uma
