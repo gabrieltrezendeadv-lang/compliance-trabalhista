@@ -91,6 +91,10 @@ INSERT INTO b12_ids VALUES
   ('dono_a',     '0b12a000-0000-4000-8000-000000000011'),
   ('dono_b',     '0b12a000-0000-4000-8000-000000000012'),
   ('colab_a',    '0b12a000-0000-4000-8000-000000000013'),
+  -- Organização C nasce SEM assinatura, e continua sem: ela existe para os
+  -- casos da 12C.1 que precisam de um trial que NÃO deve chegar a ser gravado.
+  ('org_c',      '0b12a000-0000-4000-8000-000000000003'),
+  ('dono_c',     '0b12a000-0000-4000-8000-000000000014'),
   ('fantasma',   '0b12a000-0000-4000-8000-0000000000ff');
 
 CREATE OR REPLACE FUNCTION pg_temp.id(text) RETURNS uuid
@@ -101,21 +105,23 @@ $$;
 INSERT INTO auth.users (id, instance_id, aud, role, email)
 SELECT valor, '00000000-0000-0000-0000-000000000000', 'authenticated',
        'authenticated', rotulo || '@b12.test'
-  FROM b12_ids WHERE rotulo IN ('dono_a', 'dono_b', 'colab_a');
+  FROM b12_ids WHERE rotulo IN ('dono_a', 'dono_b', 'colab_a', 'dono_c');
 
 INSERT INTO public.profiles (id, full_name, email)
 SELECT valor, rotulo, rotulo || '@b12.test'
-  FROM b12_ids WHERE rotulo IN ('dono_a', 'dono_b', 'colab_a')
+  FROM b12_ids WHERE rotulo IN ('dono_a', 'dono_b', 'colab_a', 'dono_c')
 ON CONFLICT (id) DO UPDATE SET full_name = EXCLUDED.full_name;
 
 INSERT INTO public.organizations (id, name, slug) VALUES
   (pg_temp.id('org_a'), 'Fixture 12B A', 'fixture-12b-a'),
-  (pg_temp.id('org_b'), 'Fixture 12B B', 'fixture-12b-b');
+  (pg_temp.id('org_b'), 'Fixture 12B B', 'fixture-12b-b'),
+  (pg_temp.id('org_c'), 'Fixture 12B C', 'fixture-12b-c');
 
 INSERT INTO public.organization_members (tenant_id, user_id, role, created_at) VALUES
   (pg_temp.id('org_a'), pg_temp.id('dono_a'),  'owner',        '2026-01-01T00:00:00Z'),
   (pg_temp.id('org_b'), pg_temp.id('dono_b'),  'owner',        '2026-01-01T00:00:00Z'),
-  (pg_temp.id('org_a'), pg_temp.id('colab_a'), 'collaborator', '2026-01-01T00:00:00Z');
+  (pg_temp.id('org_a'), pg_temp.id('colab_a'), 'collaborator', '2026-01-01T00:00:00Z'),
+  (pg_temp.id('org_c'), pg_temp.id('dono_c'),  'owner',        '2026-01-01T00:00:00Z');
 
 -- ── B.1 AUTORIZAÇÃO ─────────────────────────────────────────────────────────
 
@@ -129,7 +135,8 @@ BEGIN
     PERFORM public.fn_billing_start_trial(
       pg_temp.id('colab_a'), pg_temp.id('org_a'), 'essencial', 't1_20', 'monthly',
       10, '00000000000191', '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
-      '2026-08-08T00:00:00Z', 9990, '2026-07-30.1', 'corr-1');
+      '2026-08-08T00:00:00Z', 9990, '2026-07-30.1', 'corr-1',
+      NULL, '2026-08-10', '2026-08-01T00:00:00Z');
     RAISE EXCEPTION 'ASSERÇÃO REPROVADA: colaborador iniciou trial';
   EXCEPTION WHEN insufficient_privilege THEN NULL;
   END;
@@ -170,7 +177,8 @@ BEGIN
   v_json := public.fn_billing_start_trial(
     pg_temp.id('dono_a'), pg_temp.id('org_a'), 'essencial', 't1_20', 'monthly',
     10, '00000000000191', '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
-    '2026-08-08T00:00:00Z', 9990, '2026-07-30.1', 'corr-1');
+    '2026-08-08T00:00:00Z', 9990, '2026-07-30.1', 'corr-1',
+    NULL, '2026-08-10', '2026-08-01T00:00:00Z');
 
   IF v_json->>'state' <> 'trialing' THEN
     RAISE EXCEPTION 'ASSERÇÃO REPROVADA: trial não iniciou (%)', v_json;
@@ -181,16 +189,32 @@ BEGIN
 
   -- Assinatura, snapshot e auditoria numa transação só: se a RPC não fosse
   -- atômica, um destes três estaria faltando.
+  -- DOIS eventos, não um: `subscription_state` (a assinatura entrou em
+  -- trial) e `terms_acceptance` (esta pessoa aceitou a versão X neste
+  -- instante). São fatos distintos, e quem audita contrato procura o segundo.
   SELECT count(*) INTO v_int FROM billing.audit_events
    WHERE organization_id = pg_temp.id('org_a');
+  IF v_int <> 2 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: esperados 2 eventos no trial (estado + aceite), vieram %', v_int;
+  END IF;
+
+  SELECT count(*) INTO v_int FROM billing.audit_events
+   WHERE organization_id = pg_temp.id('org_a')
+     AND subject::text = 'terms_acceptance'
+     AND actor_id = pg_temp.id('dono_a')
+     AND occurred_at = '2026-08-01T00:00:00Z'
+     AND new_value->>'termsVersion' = '2026-08-10';
   IF v_int <> 1 THEN
-    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: auditoria do trial ausente (%)', v_int;
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: aceite sem ator, instante ou versao na trilha (%)', v_int;
   END IF;
 
   v_json := public.fn_billing_start_trial(
     pg_temp.id('dono_b'), pg_temp.id('org_b'), 'completo', 't1_20', 'monthly',
     10, '00000000000272', '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
-    '2026-08-08T00:00:00Z', 24990, '2026-07-30.1', 'corr-b');
+    '2026-08-08T00:00:00Z', 24990, '2026-07-30.1', 'corr-b',
+    'financeiro@fixture-b.test', '2026-08-10', '2026-08-01T00:00:00Z');
 
   -- ATOMICIDADE: uma RPC que falhe no meio não pode deixar rastro. Aqui o
   -- `worker_count` inválido reprova DEPOIS da checagem de autorização, e nada
@@ -645,6 +669,308 @@ BEGIN
 END
 $cortesia$;
 
+-- ── B.7 METADADOS CONTRATUAIS (Etapa 12C.1) ────────────────────────────────
+--
+-- O verificador somente-leitura de 20260810120000 prova o que dá para provar
+-- sem escrever. O que SÓ se prova escrevendo está aqui: CHECK rejeitando linha
+-- real, recusa a membro comum de verdade, e — o caso mais importante — falha da
+-- AUDITORIA desfazendo a operação inteira.
+
+DO $contrato$
+DECLARE
+  v_json   jsonb;
+  v_int    integer;
+  v_antes  integer;
+  v_txt    text;
+BEGIN
+  -- B.7.1 TRIAL SEM ACEITE É RECUSADO, E NÃO DEIXA RASTRO.
+  --
+  -- A organização C não tem assinatura, e tem de continuar sem depois de cada
+  -- uma destas tentativas.
+  FOREACH v_txt IN ARRAY ARRAY['', '   ', 'termos-v1', '10-08-2026']
+  LOOP
+    BEGIN
+      PERFORM public.fn_billing_start_trial(
+        pg_temp.id('dono_c'), pg_temp.id('org_c'), 'essencial', 't1_20', 'monthly',
+        10, '00000000000191', '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
+        '2026-08-08T00:00:00Z', 9990, '2026-07-30.1', 'corr-c',
+        NULL, v_txt, '2026-08-01T00:00:00Z');
+      RAISE EXCEPTION
+        'ASSERÇÃO REPROVADA: trial com versao [%] foi aceito', v_txt;
+    EXCEPTION WHEN invalid_parameter_value THEN NULL;
+    END;
+  END LOOP;
+
+  BEGIN
+    PERFORM public.fn_billing_start_trial(
+      pg_temp.id('dono_c'), pg_temp.id('org_c'), 'essencial', 't1_20', 'monthly',
+      10, '00000000000191', '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
+      '2026-08-08T00:00:00Z', 9990, '2026-07-30.1', 'corr-c',
+      NULL, NULL, '2026-08-01T00:00:00Z');
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: trial sem versao de termos foi aceito';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL;
+  END;
+
+  SELECT count(*) INTO v_int FROM billing.subscriptions
+   WHERE organization_id = pg_temp.id('org_c');
+  IF v_int <> 0 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: trial recusado deixou % assinatura(s) para tras', v_int;
+  END IF;
+
+  -- B.7.2 FALHA DA AUDITORIA DESFAZ A OPERAÇÃO INTEIRA.
+  --
+  -- Uma constraint NOT VALID recusa QUALQUER evento de aceite novo sem
+  -- reprovar os já gravados. Com ela no lugar, fn_billing_start_trial
+  -- consegue inserir a assinatura e falha ao auditar — e o que se exige é que
+  -- a assinatura NÃO sobreviva. Se sobrevivesse, existiria trial sem prova de
+  -- aceite, que é exatamente o estado que esta etapa veio impedir.
+  ALTER TABLE billing.audit_events
+    ADD CONSTRAINT tmp_falha_auditoria
+    CHECK (subject <> 'terms_acceptance'::billing.audit_subject) NOT VALID;
+
+  SELECT count(*) INTO v_antes FROM billing.audit_events
+   WHERE organization_id = pg_temp.id('org_c');
+
+  BEGIN
+    PERFORM public.fn_billing_start_trial(
+      pg_temp.id('dono_c'), pg_temp.id('org_c'), 'essencial', 't1_20', 'monthly',
+      10, '00000000000191', '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
+      '2026-08-08T00:00:00Z', 9990, '2026-07-30.1', 'corr-c',
+      NULL, '2026-08-10', '2026-08-01T00:00:00Z');
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: trial concluiu apesar de a auditoria do aceite falhar';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+
+  SELECT count(*) INTO v_int FROM billing.subscriptions
+   WHERE organization_id = pg_temp.id('org_c');
+  IF v_int <> 0 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: auditoria falhou e a assinatura ficou gravada (%)', v_int;
+  END IF;
+
+  SELECT count(*) INTO v_int FROM billing.audit_events
+   WHERE organization_id = pg_temp.id('org_c');
+  IF v_int <> v_antes THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: auditoria parcial sobreviveu (% -> %)', v_antes, v_int;
+  END IF;
+
+  ALTER TABLE billing.audit_events DROP CONSTRAINT tmp_falha_auditoria;
+
+  -- Sem a constraint, o MESMO pedido passa. Sem isto, o caso acima poderia
+  -- estar reprovando por qualquer outro motivo.
+  v_json := public.fn_billing_start_trial(
+    pg_temp.id('dono_c'), pg_temp.id('org_c'), 'essencial', 't1_20', 'monthly',
+    10, '00000000000191', '2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z',
+    '2026-08-08T00:00:00Z', 9990, '2026-07-30.1', 'corr-c',
+    '  Financeiro@Fixture-C.test  ', '2026-08-10', '2026-08-01T00:00:00Z');
+
+  IF v_json->>'terms_version' <> '2026-08-10' THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: versao de termos nao voltou no estado (%)', v_json;
+  END IF;
+  -- Espaços nas pontas são removidos ANTES de gravar.
+  IF v_json->>'billing_email' <> 'Financeiro@Fixture-C.test' THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: contato financeiro nao foi normalizado (%)', v_json->>'billing_email';
+  END IF;
+
+  -- B.7.3 O CHECK DO PAR MORDE, mesmo contra escrita DIRETA do dono da tabela.
+  --
+  -- As RPCs são a única porta para a aplicação, mas o CHECK existe para o caso
+  -- em que uma RPC futura erre. Aqui ele é exercitado por UPDATE direto.
+  BEGIN
+    UPDATE billing.subscriptions
+       SET terms_accepted_at = NULL
+     WHERE organization_id = pg_temp.id('org_c');
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: versao sem instante foi aceita';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+
+  BEGIN
+    UPDATE billing.subscriptions
+       SET terms_version = '   '
+     WHERE organization_id = pg_temp.id('org_c');
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: versao so com espacos foi aceita';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+
+  BEGIN
+    UPDATE billing.subscriptions
+       SET billing_email = repeat('a', 250) || '@empresa.com.br'
+     WHERE organization_id = pg_temp.id('org_c');
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: e-mail acima de 254 caracteres foi aceito';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+
+  -- Linha ANTERIOR à 12C.1 continua válida: os três nulos passam.
+  UPDATE billing.subscriptions
+     SET billing_email = NULL, terms_version = NULL, terms_accepted_at = NULL
+   WHERE organization_id = pg_temp.id('org_c');
+  UPDATE billing.subscriptions
+     SET terms_version = '2026-08-10', terms_accepted_at = '2026-08-01T00:00:00Z',
+         billing_email = 'financeiro@fixture-c.test'
+   WHERE organization_id = pg_temp.id('org_c');
+
+  RAISE NOTICE
+    'billing12B/contrato OK: trial sem aceite recusado, auditoria que falha desfaz tudo, CHECKs mordem';
+END
+$contrato$;
+
+-- ── B.8 CONTATO FINANCEIRO E NOVO ACEITE, DEPOIS DO TRIAL ──────────────────
+
+DO $pos_trial$
+DECLARE
+  v_json  jsonb;
+  v_int   integer;
+  v_txt   text;
+BEGIN
+  -- SOMENTE OWNER. Colaborador de A é membro de verdade, e mesmo assim recusado
+  -- — é a diferença entre "não é da organização" e "não é o dono".
+  BEGIN
+    PERFORM public.fn_billing_update_billing_email(
+      pg_temp.id('colab_a'), pg_temp.id('org_a'),
+      'colaborador@fixture-a.test', '2026-08-05T00:00:00Z', 'corr-e');
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: colaborador trocou o contato financeiro';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+
+  BEGIN
+    PERFORM public.fn_billing_accept_terms(
+      pg_temp.id('colab_a'), pg_temp.id('org_a'),
+      '2026-11-01', '2026-08-05T00:00:00Z', 'corr-e');
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: colaborador aceitou termos';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+
+  -- E o dono de A não alcança B.
+  BEGIN
+    PERFORM public.fn_billing_update_billing_email(
+      pg_temp.id('dono_a'), pg_temp.id('org_b'),
+      'invasor@fixture-a.test', '2026-08-05T00:00:00Z', 'corr-e');
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: dono de A trocou o contato de B';
+  EXCEPTION WHEN insufficient_privilege THEN NULL;
+  END;
+
+  -- O DONO TROCA. E a trilha guarda a MÁSCARA, não o endereço.
+  v_json := public.fn_billing_update_billing_email(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'),
+    'contas@fixture-a.test', '2026-08-05T00:00:00Z', 'corr-e');
+  IF v_json->>'billing_email' <> 'contas@fixture-a.test' THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: contato nao foi gravado (%)', v_json;
+  END IF;
+
+  SELECT new_value->>'mask' INTO v_txt FROM billing.audit_events
+   WHERE organization_id = pg_temp.id('org_a') AND subject::text = 'billing_email'
+   ORDER BY id DESC LIMIT 1;
+  IF v_txt <> 'c***@fixture-a.test' THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: mascara inesperada na trilha (%)', v_txt;
+  END IF;
+
+  SELECT count(*) INTO v_int FROM billing.audit_events
+   WHERE organization_id = pg_temp.id('org_a') AND subject::text = 'billing_email'
+     AND new_value::text LIKE '%contas@fixture-a.test%';
+  IF v_int <> 0 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: o endereco inteiro foi para a trilha append-only';
+  END IF;
+
+  -- REPETIR O MESMO VALOR não gera evento novo.
+  SELECT count(*) INTO v_int FROM billing.audit_events
+   WHERE organization_id = pg_temp.id('org_a') AND subject::text = 'billing_email';
+  PERFORM public.fn_billing_update_billing_email(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'),
+    'contas@fixture-a.test', '2026-08-06T00:00:00Z', 'corr-e');
+  IF (SELECT count(*) FROM billing.audit_events
+       WHERE organization_id = pg_temp.id('org_a')
+         AND subject::text = 'billing_email') <> v_int THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: repetir o mesmo contato gerou evento';
+  END IF;
+
+  -- LIMPAR é intenção válida, e vira NULL.
+  v_json := public.fn_billing_update_billing_email(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'), '   ',
+    '2026-08-07T00:00:00Z', 'corr-e');
+  IF v_json->>'billing_email' IS NOT NULL THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: limpar o contato nao produziu NULL (%)', v_json;
+  END IF;
+
+  -- E-MAIL MALFORMADO é recusado pelo CHECK, e a mensagem do banco cita a
+  -- constraint, não o endereço.
+  BEGIN
+    PERFORM public.fn_billing_update_billing_email(
+      pg_temp.id('dono_a'), pg_temp.id('org_a'), 'nao-e-um-email',
+      '2026-08-07T00:00:00Z', 'corr-e');
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: e-mail malformado foi aceito';
+  EXCEPTION WHEN check_violation THEN
+    GET STACKED DIAGNOSTICS v_txt = MESSAGE_TEXT;
+    IF v_txt LIKE '%nao-e-um-email%' THEN
+      RAISE EXCEPTION
+        'ASSERÇÃO REPROVADA: a mensagem de recusa reproduz o endereco: %', v_txt;
+    END IF;
+  END;
+
+  -- NOVO ACEITE de versão posterior.
+  v_json := public.fn_billing_accept_terms(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'),
+    '2026-11-01', '2026-08-08T00:00:00Z', 'corr-e');
+  IF v_json->>'terms_version' <> '2026-11-01' THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: novo aceite nao gravou a versao (%)', v_json;
+  END IF;
+  IF v_json->>'terms_accepted_at' IS NULL THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: novo aceite ficou sem instante';
+  END IF;
+
+  SELECT count(*) INTO v_int FROM billing.audit_events
+   WHERE organization_id = pg_temp.id('org_a') AND subject::text = 'terms_acceptance';
+  IF v_int <> 2 THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: esperados 2 aceites na trilha (trial + novo), vieram %', v_int;
+  END IF;
+
+  -- REPETIÇÃO IDEMPOTENTE: mesma versão, sem evento novo e SEM mexer no
+  -- instante original — que é a prova de quando a pessoa aceitou.
+  PERFORM public.fn_billing_accept_terms(
+    pg_temp.id('dono_a'), pg_temp.id('org_a'),
+    '2026-11-01', '2026-09-01T00:00:00Z', 'corr-e');
+  SELECT count(*) INTO v_int FROM billing.audit_events
+   WHERE organization_id = pg_temp.id('org_a') AND subject::text = 'terms_acceptance';
+  IF v_int <> 2 THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: reenvio do mesmo aceite gerou evento (%)', v_int;
+  END IF;
+  SELECT terms_accepted_at::text INTO v_txt FROM billing.subscriptions
+   WHERE organization_id = pg_temp.id('org_a');
+  IF v_txt IS DISTINCT FROM (SELECT ('2026-08-08T00:00:00Z'::timestamptz)::text) THEN
+    RAISE EXCEPTION
+      'ASSERÇÃO REPROVADA: reenvio sobrescreveu o instante do aceite (%)', v_txt;
+  END IF;
+
+  -- REGREDIR é recusado pelo BANCO.
+  BEGIN
+    PERFORM public.fn_billing_accept_terms(
+      pg_temp.id('dono_a'), pg_temp.id('org_a'),
+      '2026-08-10', '2026-09-01T00:00:00Z', 'corr-e');
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: versao anterior de termos foi aceita';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL;
+  END;
+
+  -- Sem assinatura, as duas respondem "não há registro" — e não "não existe
+  -- organização", que seria informação a mais.
+  BEGIN
+    PERFORM public.fn_billing_accept_terms(
+      pg_temp.id('dono_b'), pg_temp.id('org_b'),
+      '2026-11-01', '2026-08-08T00:00:00Z', 'corr-e');
+  EXCEPTION WHEN no_data_found THEN
+    RAISE EXCEPTION 'ASSERÇÃO REPROVADA: B tem assinatura e respondeu no_data_found';
+  END;
+
+  RAISE NOTICE
+    'billing12B/pos-trial OK: so o dono altera, mascara na trilha, aceite idempotente e sem regressao';
+END
+$pos_trial$;
+
+
 ROLLBACK;
 
 -- ═════════════════════════════════════════════════════════════════════════════
@@ -656,7 +982,7 @@ DECLARE
   v_int integer;
 BEGIN
   SELECT count(*) INTO v_int FROM public.organizations
-   WHERE slug IN ('fixture-12b-a', 'fixture-12b-b');
+   WHERE slug IN ('fixture-12b-a', 'fixture-12b-b', 'fixture-12b-c');
   IF v_int <> 0 THEN
     RAISE EXCEPTION 'ASSERÇÃO REPROVADA: % organização(ões) de fixture sobreviveram', v_int;
   END IF;
