@@ -100,7 +100,9 @@ export type InMemoryFailurePoint =
   | "applyProviderEvent"
   | "grantCourtesy"
   | "revokeCourtesy"
-  | "saveGrandfathering";
+  | "saveGrandfathering"
+  | "updateBillingEmail"
+  | "acceptTerms";
 
 export interface InMemoryOptions {
   readonly clock: Clock;
@@ -118,6 +120,50 @@ export class InMemoryRepositoryForbiddenInProductionError extends Error {
     super(`InMemoryBillingRepository é proibido em produção (${qual}).`);
     this.name = "InMemoryRepositoryForbiddenInProductionError";
   }
+}
+
+// ─── Metadados contratuais — as regras do banco, refeitas aqui ─────────────
+//
+// Duplicação DELIBERADA e vigiada. O dublê só serve para alguma coisa se
+// recusar o que o banco recusa; se aceitasse versão vazia, o teste de unidade
+// passaria e a chamada real quebraria em produção — que é exatamente o buraco
+// que o contrato compartilhado existe para fechar.
+//
+// A divergência entre estas regras e as de
+// `20260810120000_billing_contract_metadata.sql` é detectada por
+// `tests/contract/postgrest.spec.ts`, que roda as MESMAS expectativas contra o
+// PostgREST real. Não é confiança: é dois lados do mesmo caso de teste.
+
+/** O mesmo formato do CHECK `subscriptions_termos_versao_valida`. */
+const FORMATO_DE_VERSAO = /^\d{4}-\d{2}-\d{2}$/;
+
+/** O mesmo do CHECK `subscriptions_billing_email_valido`. */
+const FORMA_DE_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** RFC 5321: 254 é o máximo de um endereço. Acima disso não é e-mail, é carga. */
+const LIMITE_DE_EMAIL = 254;
+
+/** Vazio e só-espaços viram `null` — "limpar" e "não informar" são a mesma coisa. */
+function normalizarEmail(bruto: string | null): string | null {
+  const limpo = (bruto ?? "").trim();
+  return limpo === "" ? null : limpo;
+}
+
+function ehEmailAceitavel(email: string): boolean {
+  return email.length <= LIMITE_DE_EMAIL && FORMA_DE_EMAIL.test(email);
+}
+
+/** Devolve a versão sem espaços, ou `null` quando vazia ou malformada. */
+function normalizarVersaoDeTermos(bruto: string | null): string | null {
+  const limpo = (bruto ?? "").trim();
+  return limpo !== "" && FORMATO_DE_VERSAO.test(limpo) ? limpo : null;
+}
+
+/** Primeira letra, três asteriscos, domínio. Nunca o endereço. */
+function mascararEmail(email: string | null): string | null {
+  if (email === null || email.trim() === "") return null;
+  const [local = "", dominio = ""] = email.split("@");
+  return `${local.slice(0, 1)}***@${dominio}`;
 }
 
 type EstadoDeReserva = "in_progress" | "completed" | "failed";
@@ -254,7 +300,14 @@ export class InMemoryBillingRepository implements BillingRepository {
     newValue: Record<string, unknown> | null,
     reason: string | null,
     idempotencyKey: string | null,
-    correlationId: string | null
+    correlationId: string | null,
+    /**
+     * Instante do evento. Omitido, vale o relógio injetado — que é o que as
+     * operações da 12B fazem. As da 12C.1 passam o instante EXPLÍCITO porque a
+     * RPC equivalente carimba `p_accepted_at`/`p_now`, e uma divergência aqui
+     * apareceria como diferença de paridade contra o PostgREST.
+     */
+    occurredAt?: string
   ): void {
     this.#auditoria.push({
       id: this.#proximoId("aud"),
@@ -264,7 +317,7 @@ export class InMemoryBillingRepository implements BillingRepository {
       // Ator humano só quando a origem é humana. Webhook e rotina não têm autor.
       actorId: origin === "owner" || origin === "admin" ? actorId : null,
       origin,
-      occurredAt: this.#clock.now(),
+      occurredAt: occurredAt ?? this.#clock.now(),
       previousValue,
       newValue,
       reason,
@@ -340,6 +393,22 @@ export class InMemoryBillingRepository implements BillingRepository {
     if (input.workerCount < 1) {
       return fail("invalid_input", "número de trabalhadores inválido");
     }
+
+    // As MESMAS recusas da RPC, na MESMA ordem: autorização, depois conteúdo,
+    // e o aceite antes de qualquer escrita. O contrato compartilhado roda estes
+    // casos contra as duas implementações — se uma delas relaxar, aparece lá.
+    const versao = normalizarVersaoDeTermos(input.termsVersion);
+    if (versao === null) {
+      return fail("invalid_input", "aceite dos termos é obrigatório");
+    }
+    if (input.termsAcceptedAt.trim() === "") {
+      return fail("invalid_input", "instante do aceite é obrigatório");
+    }
+    const email = normalizarEmail(input.billingEmail);
+    if (email !== null && !ehEmailAceitavel(email)) {
+      return fail("invalid_input", "contato financeiro rejeitado pelo banco");
+    }
+
     if (this.#assinaturas.has(input.organizationId)) {
       return fail("conflict", "já existe assinatura para esta organização");
     }
@@ -363,6 +432,9 @@ export class InMemoryBillingRepository implements BillingRepository {
       state: "trialing",
       workerCount: input.workerCount,
       cnpj: input.cnpj,
+      billingEmail: email,
+      termsVersion: versao,
+      termsAcceptedAt: input.termsAcceptedAt,
       currentPeriodStart: input.periodStart,
       currentPeriodEnd: input.periodEnd,
       trialEndsAt: input.trialEndsAt,
@@ -393,7 +465,151 @@ export class InMemoryBillingRepository implements BillingRepository {
       input.correlationId
     );
 
+    // O aceite é evento PRÓPRIO, e não um detalhe do `subscription_state`.
+    // Quem audita contrato procura por este, não por aquele.
+    this.#registrarAuditoria(
+      input.organizationId,
+      id,
+      "terms_acceptance",
+      input.actorId,
+      "owner",
+      null,
+      { termsVersion: versao, acceptedAt: input.termsAcceptedAt },
+      "aceite dos termos no início do trial",
+      null,
+      input.correlationId,
+      input.termsAcceptedAt
+    );
+
+    if (email !== null) {
+      this.#registrarAuditoria(
+        input.organizationId,
+        id,
+        "billing_email",
+        input.actorId,
+        "owner",
+        null,
+        { mask: mascararEmail(email) },
+        "contato financeiro informado no início do trial",
+        null,
+        input.correlationId,
+        input.periodStart
+      );
+    }
+
     return ok(assinatura);
+  }
+
+  async updateBillingEmail(
+    ctx: ComandoContexto,
+    billingEmail: string | null,
+    now: string
+  ): Promise<Result<StoredSubscription>> {
+    const f = this.#talvezFalhar<StoredSubscription>("updateBillingEmail");
+    if (f) return f;
+    const negado = this.#autorizar<StoredSubscription>(
+      ctx.actorId,
+      ctx.organizationId,
+      true
+    );
+    if (negado) return negado;
+
+    const novo = normalizarEmail(billingEmail);
+    if (novo !== null && !ehEmailAceitavel(novo)) {
+      // A MENSAGEM NÃO CITA O ENDEREÇO. Mensagem de erro vai para log, tela e
+      // relatório — e um e-mail rejeitado ainda é um e-mail de alguém.
+      return fail("invalid_input", "contato financeiro rejeitado pelo banco");
+    }
+
+    const antes = this.#assinaturas.get(ctx.organizationId);
+    if (antes === undefined) {
+      return fail("not_found", "nenhuma assinatura para esta organização");
+    }
+
+    // Repetir o mesmo valor não gera evento: a trilha registra MUDANÇA.
+    if (antes.billingEmail === novo) return ok(antes);
+
+    const depois: StoredSubscription = { ...antes, billingEmail: novo };
+    this.#assinaturas.set(ctx.organizationId, depois);
+
+    this.#registrarAuditoria(
+      ctx.organizationId,
+      antes.id,
+      "billing_email",
+      ctx.actorId,
+      "owner",
+      { mask: mascararEmail(antes.billingEmail) },
+      { mask: mascararEmail(novo) },
+      "contato financeiro alterado",
+      null,
+      ctx.correlationId,
+      now
+    );
+
+    return ok(depois);
+  }
+
+  async acceptTerms(
+    ctx: ComandoContexto,
+    termsVersion: string,
+    acceptedAt: string
+  ): Promise<Result<StoredSubscription>> {
+    const f = this.#talvezFalhar<StoredSubscription>("acceptTerms");
+    if (f) return f;
+    const negado = this.#autorizar<StoredSubscription>(
+      ctx.actorId,
+      ctx.organizationId,
+      true
+    );
+    if (negado) return negado;
+
+    const versao = normalizarVersaoDeTermos(termsVersion);
+    if (versao === null) {
+      return fail("invalid_input", "versão de termos inválida");
+    }
+    if (acceptedAt.trim() === "") {
+      return fail("invalid_input", "instante do aceite é obrigatório");
+    }
+
+    const antes = this.#assinaturas.get(ctx.organizationId);
+    if (antes === undefined) {
+      return fail("not_found", "nenhuma assinatura para esta organização");
+    }
+
+    // IDEMPOTENTE. Reenviar o aceite vigente devolve o estado e PRESERVA o
+    // instante original — que é a prova. Sobrescrevê-lo apagaria a data.
+    if (antes.termsVersion === versao) return ok(antes);
+
+    // Regressão proibida. `AAAA-MM-DD` faz a comparação lexical coincidir com a
+    // cronológica, exatamente como no banco.
+    if (antes.termsVersion !== null && versao < antes.termsVersion) {
+      return fail("invalid_input", "versão de termos anterior à já aceita");
+    }
+
+    const depois: StoredSubscription = {
+      ...antes,
+      termsVersion: versao,
+      termsAcceptedAt: acceptedAt,
+    };
+    this.#assinaturas.set(ctx.organizationId, depois);
+
+    this.#registrarAuditoria(
+      ctx.organizationId,
+      antes.id,
+      "terms_acceptance",
+      ctx.actorId,
+      "owner",
+      antes.termsVersion === null
+        ? null
+        : { termsVersion: antes.termsVersion, acceptedAt: antes.termsAcceptedAt },
+      { termsVersion: versao, acceptedAt },
+      "aceite de nova versão dos termos",
+      null,
+      ctx.correlationId,
+      acceptedAt
+    );
+
+    return ok(depois);
   }
 
   /** Escrita de assinatura + snapshot + auditoria, como `fn_write_subscription`. */

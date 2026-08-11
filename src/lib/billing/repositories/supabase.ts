@@ -72,7 +72,12 @@ import type {
 } from "../plans/model";
 
 /**
- * As dezesseis, e nada mais.
+ * As dezoito, e nada mais.
+ *
+ * Eram dezesseis até a 12B. A 12C.1 acrescentou duas — contato financeiro e
+ * aceite de termos — porque nenhuma das dezesseis tinha semântica para elas:
+ * trocar o e-mail do financeiro não é trocar de plano, e aceitar uma versão
+ * nova dos termos não é registrar contagem de trabalhadores.
  *
  * Mantida em sincronia com `scripts/ci/billing-rpc-allowlist.mjs` por
  * `BO-23` — que reprova se as duas divergirem.
@@ -93,7 +98,9 @@ type NomeDeRpc =
   | "fn_billing_apply_provider_event"
   | "fn_billing_grant_courtesy"
   | "fn_billing_revoke_courtesy"
-  | "fn_billing_save_grandfathering";
+  | "fn_billing_save_grandfathering"
+  | "fn_billing_update_billing_email"
+  | "fn_billing_accept_terms";
 
 type Cliente = ReturnType<typeof createServiceClient>;
 
@@ -290,9 +297,52 @@ export class SupabaseBillingRepository implements BillingRepository {
         p_amount_cents: input.amountCents,
         p_catalog_version: input.catalogVersion,
         p_correlation_id: input.correlationId,
+        p_billing_email: input.billingEmail,
+        p_terms_version: input.termsVersion,
+        p_terms_accepted_at: input.termsAcceptedAt,
       },
       (b) => (ehObjeto(b) ? paraAssinatura(b) : null),
       "início de trial"
+    );
+  }
+
+  async updateBillingEmail(
+    ctx: ComandoContexto,
+    billingEmail: string | null,
+    now: string
+  ): Promise<Result<StoredSubscription>> {
+    return this.#chamar(
+      "fn_billing_update_billing_email",
+      {
+        p_actor_id: ctx.actorId,
+        p_organization_id: ctx.organizationId,
+        p_billing_email: billingEmail,
+        p_now: now,
+        p_correlation_id: ctx.correlationId,
+      },
+      (b) => (ehObjeto(b) ? paraAssinatura(b) : null),
+      // O CONTEXTO NÃO CITA O ENDEREÇO. Ele entra na mensagem de erro do
+      // `Result`, e mensagem de erro vai para log, para tela e para relatório.
+      "contato financeiro"
+    );
+  }
+
+  async acceptTerms(
+    ctx: ComandoContexto,
+    termsVersion: string,
+    acceptedAt: string
+  ): Promise<Result<StoredSubscription>> {
+    return this.#chamar(
+      "fn_billing_accept_terms",
+      {
+        p_actor_id: ctx.actorId,
+        p_organization_id: ctx.organizationId,
+        p_terms_version: termsVersion,
+        p_accepted_at: acceptedAt,
+        p_correlation_id: ctx.correlationId,
+      },
+      (b) => (ehObjeto(b) ? paraAssinatura(b) : null),
+      "aceite dos termos"
     );
   }
 
@@ -689,6 +739,12 @@ function paraAssinatura(bruto: Json): StoredSubscription | null {
     state: state as StoredSubscription["state"],
     workerCount: trabalhadores,
     cnpj,
+    // Ausentes em assinatura anterior à 12C.1: `texto()` devolve `null` tanto
+    // para chave ausente quanto para valor nulo, e as duas significam a mesma
+    // coisa aqui — não há aceite registrado.
+    billingEmail: texto(bruto.billing_email),
+    termsVersion: texto(bruto.terms_version),
+    termsAcceptedAt: texto(bruto.terms_accepted_at),
     currentPeriodStart: inicio,
     currentPeriodEnd: fim,
     trialEndsAt: texto(bruto.trial_ends_at),

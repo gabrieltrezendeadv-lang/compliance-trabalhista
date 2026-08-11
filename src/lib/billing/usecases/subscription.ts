@@ -25,6 +25,7 @@ import { CATALOG_VERSION } from "../plans/catalog";
 import { resolveState, trialEndsAt } from "../plans/lifecycle";
 import type { BillingPeriod, PlanSlug, SubscriptionState, TierSlug } from "../plans/model";
 import { addMonths, priceCents, prorationCents, selectTier } from "../plans/pricing";
+import { exigirVersaoVigente, TermsVersionMismatchError } from "../terms";
 import {
   assertTenant,
   contexto,
@@ -40,6 +41,13 @@ export interface StartTrialInput extends ComandoBase {
   readonly period: BillingPeriod;
   readonly workerCount: number;
   readonly cnpj: string;
+  /** Contato financeiro. OPCIONAL: ausente e vazio significam a mesma coisa. */
+  readonly billingEmail?: string | null;
+  /**
+   * Versão dos termos que a tela EXIBIU. OBRIGATÓRIA, e conferida contra
+   * `TERMS_VERSION` — o que chega aqui é afirmação, não escolha.
+   */
+  readonly termsVersion: string;
 }
 
 /**
@@ -47,6 +55,12 @@ export interface StartTrialInput extends ComandoBase {
  *
  * CNPJ é obrigatório por decisão comercial — não é validação de formato, é
  * requisito do modelo aprovado. Sem ele não há trial.
+ *
+ * ── ACEITE DOS TERMOS É CONDIÇÃO, NÃO CAMPO ─────────────────────────────────
+ *
+ * Trial novo sem aceite não existe. A versão vem da tela e é comparada com a
+ * vigente: uma sessão aberta antes da publicação de termos novos manda a versão
+ * antiga, e tem de ser recusada — a pessoa leu outro documento.
  */
 export async function startTrial(
   env: UseCaseEnv,
@@ -61,6 +75,9 @@ export async function startTrial(
   if (!Number.isInteger(input.workerCount) || input.workerCount < 1) {
     return fail("invalid_input", "número de trabalhadores inválido");
   }
+
+  const versao = conferirVersaoDosTermos(input.termsVersion);
+  if (!versao.ok) return versao;
 
   const agora = env.clock.now();
   const faixa = selectTier(input.workerCount);
@@ -80,7 +97,91 @@ export async function startTrial(
     // isso que impede o checkout automático mais adiante.
     amountCents: valor,
     catalogVersion: valor === null ? null : CATALOG_VERSION,
+    billingEmail: input.billingEmail ?? null,
+    // A versão OFICIAL, devolvida por `exigirVersaoVigente` — nunca a string
+    // que chegou do cliente. Assim nenhum caminho a jusante persiste o que foi
+    // recebido, mesmo que a comparação um dia vire só um aviso.
+    termsVersion: versao.value,
+    termsAcceptedAt: agora,
   });
+}
+
+// ─── 1.1 Metadados contratuais depois do trial ─────────────────────────────
+
+/**
+ * Confere a versão afirmada pelo cliente contra a vigente e devolve a OFICIAL.
+ *
+ * `exigirVersaoVigente` lança; aqui a exceção vira `Result`, porque é assim que
+ * o resto desta camada fala. A recusa NÃO diz qual é a versão vigente: quem
+ * está com a tela velha recarrega e recebe a nova, e quem está sondando não
+ * ganha nada.
+ */
+function conferirVersaoDosTermos(recebida: string): Result<string> {
+  try {
+    return ok(exigirVersaoVigente(recebida));
+  } catch (erro) {
+    if (erro instanceof TermsVersionMismatchError) {
+      return fail("invalid_input", "aceite dos termos ausente ou desatualizado");
+    }
+    throw erro;
+  }
+}
+
+export interface UpdateBillingEmailInput extends ComandoBase {
+  /** Vazio ou `null` LIMPA o contato. É intenção, não erro. */
+  readonly billingEmail: string | null;
+}
+
+/**
+ * Troca o contato financeiro — depois do trial, quantas vezes for preciso.
+ *
+ * Existe separado de `startTrial` por exigência do desenho: uma coluna que só
+ * se preenche na criação é uma coluna que ninguém consegue corrigir.
+ *
+ * A mensagem de recusa NÃO reproduz o endereço. Ela vai para log, para tela e
+ * para relatório, e um e-mail rejeitado continua sendo o e-mail de alguém.
+ */
+export async function updateBillingEmail(
+  env: UseCaseEnv,
+  input: UpdateBillingEmailInput
+): Promise<Result<StoredSubscription>> {
+  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  if (negado) return negado;
+
+  const bruto = (input.billingEmail ?? "").trim();
+  if (bruto.length > 254) {
+    return fail("invalid_input", "contato financeiro excede o tamanho permitido");
+  }
+
+  return env.repo.updateBillingEmail(
+    contexto(env),
+    bruto === "" ? null : bruto,
+    env.clock.now()
+  );
+}
+
+export interface AcceptTermsInput extends ComandoBase {
+  /** Versão que a tela exibiu. Conferida contra a vigente. */
+  readonly termsVersion: string;
+}
+
+/**
+ * Registra o aceite de uma versão dos termos, depois do trial.
+ *
+ * Reenviar a versão já aceita é no-op idempotente — o instante original é a
+ * prova, e sobrescrevê-lo por um reenvio apagaria a data que interessa.
+ */
+export async function acceptTerms(
+  env: UseCaseEnv,
+  input: AcceptTermsInput
+): Promise<Result<StoredSubscription>> {
+  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  if (negado) return negado;
+
+  const versao = conferirVersaoDosTermos(input.termsVersion);
+  if (!versao.ok) return versao;
+
+  return env.repo.acceptTerms(contexto(env), versao.value, env.clock.now());
 }
 
 // ─── 2. choosePlan ─────────────────────────────────────────────────────────
