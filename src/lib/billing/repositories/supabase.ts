@@ -161,6 +161,19 @@ function inteiro(v: unknown): number | null {
 }
 
 /**
+ * Resposta do banco que não dá para interpretar.
+ *
+ * Levantada, e não devolvida como `null`, para que `#chamar` a converta em
+ * `repository_unavailable` — o nome do campo vai no erro, o VALOR nunca.
+ */
+class RespostaMalformadaError extends Error {
+  constructor(readonly campo: string) {
+    super("resposta do banco em formato inesperado");
+    this.name = "RespostaMalformadaError";
+  }
+}
+
+/**
  * Instante em ISO 8601 UTC — o formato que o contrato declara.
  *
  * ── UMA DIVERGÊNCIA REAL, ACHADA PELO CONTRATO ──────────────────────────────
@@ -173,16 +186,26 @@ function inteiro(v: unknown): number | null {
  * Não é detalhe cosmético: qualquer comparação de igualdade a jusante — "este
  * aceite é o mesmo de antes?", uma chave de cache, um `===` numa tela — daria
  * resultados diferentes conforme a implementação. `Clock.now()` promete ISO
- * 8601 UTC, e é isso que este repositório passa a devolver.
+ * 8601 UTC, e é isso que este repositório devolve.
  *
- * Valor não textual ou data inválida viram `null`, como todo o resto deste
- * arquivo: caminho quebrado NEGA.
+ * ── AUSENTE E INVÁLIDO SÃO COISAS DIFERENTES ────────────────────────────────
+ *
+ * A primeira versão devolvia `null` para os dois, e isso MASCARAVA defeito: um
+ * `terms_accepted_at` corrompido virava "sem aceite", e o objeto saía com
+ * versão preenchida e instante nulo — um par que o banco garante impossível.
+ * O chamador não teria como distinguir "nunca aceitou" de "a resposta veio
+ * quebrada", e a segunda é justamente a que precisa negar.
+ *
+ * Agora:
+ *   ausente (`null`/`undefined`) → `null`, e só para campo de fato opcional;
+ *   presente e inválido          → LEVANTA, e vira `repository_unavailable`.
  */
-function instante(v: unknown): string | null {
-  const bruto = texto(v);
-  if (bruto === null) return null;
-  const ms = Date.parse(bruto);
-  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+function instante(v: unknown, campo: string): string | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v !== "string") throw new RespostaMalformadaError(campo);
+  const ms = Date.parse(v);
+  if (Number.isNaN(ms)) throw new RespostaMalformadaError(campo);
+  return new Date(ms).toISOString();
 }
 
 export class SupabaseBillingRepository implements BillingRepository {
@@ -235,16 +258,29 @@ export class SupabaseBillingRepository implements BillingRepository {
       (bruto) => {
         if (!ehObjeto(bruto)) return null;
         const cortesias = Array.isArray(bruto.courtesies) ? bruto.courtesies : [];
-        const assinatura = ehObjeto(bruto.subscription)
-          ? paraAssinatura(bruto.subscription)
-          : null;
+
+        // ── AUSENTE E ILEGÍVEL, DE NOVO ─────────────────────────────────────
+        //
+        // Esta linha convertia assinatura ILEGÍVEL em `subscription: null`, que
+        // é o mesmo valor de "esta organização não tem assinatura". A diferença
+        // não é acadêmica: `resolveBillingAccess` lê ausência de assinatura como
+        // ausência de plano, e uma resposta corrompida viraria uma DECISÃO DE
+        // ACESSO em vez de uma falha.
+        //
+        // Objeto presente que não mapeia agora NEGA a leitura inteira.
+        let assinatura: StoredSubscription | null = null;
+        if (ehObjeto(bruto.subscription)) {
+          assinatura = paraAssinatura(bruto.subscription);
+          if (assinatura === null) return null;
+        }
+
         return {
           subscription: assinatura,
           courtesies: cortesias.map(paraCortesia).filter((c): c is StoredCourtesy => c !== null),
           grandfathering: ehObjeto(bruto.grandfathering)
             ? paraGrandfathering(bruto.grandfathering)
             : null,
-          grandfatheringCutoff: instante(bruto.grandfatheringCutoff),
+          grandfatheringCutoff: instante(bruto.grandfatheringCutoff, "grandfatheringCutoff"),
         } satisfies BillingState;
       },
       "estado de billing"
@@ -722,7 +758,7 @@ function paraSnapshot(bruto: unknown): PriceSnapshot | null {
   const tier = texto(bruto.tier);
   const period = texto(bruto.period);
   const versao = texto(bruto.catalog_version);
-  const quando = instante(bruto.captured_at);
+  const quando = instante(bruto.captured_at, "captured_at");
   if (valor === null || !plan || !tier || !period || !versao || !quando) return null;
   return Object.freeze({
     plan: plan as PriceSnapshot["plan"],
@@ -743,8 +779,8 @@ function paraAssinatura(bruto: Json): StoredSubscription | null {
   const state = texto(bruto.state);
   const trabalhadores = inteiro(bruto.worker_count);
   const cnpj = texto(bruto.cnpj);
-  const inicio = instante(bruto.current_period_start);
-  const fim = instante(bruto.current_period_end);
+  const inicio = instante(bruto.current_period_start, "current_period_start");
+  const fim = instante(bruto.current_period_end, "current_period_end");
   if (
     !id || !org || !plan || !tier || !period || !state ||
     trabalhadores === null || !cnpj || !inicio || !fim
@@ -755,6 +791,18 @@ function paraAssinatura(bruto: Json): StoredSubscription | null {
   const downPlan = texto(bruto.scheduled_downgrade_plan);
   const downTier = texto(bruto.scheduled_downgrade_tier);
 
+  // ── O PAR CONTRATUAL, CONFERIDO TAMBÉM AQUI ───────────────────────────────
+  //
+  // `subscriptions_termos_par_completo` garante no banco que versão e instante
+  // são os dois nulos ou os dois preenchidos. Repetir a conferência na leitura
+  // não é desconfiança do CHECK: é o ponto em que um par quebrado — por
+  // resposta truncada, por coluna renomeada, por uma RPC futura que serialize
+  // errado — deixaria de ser detectável. Um objeto com versão e sem instante
+  // seria um aceite sem data, e ninguém a jusante teria como saber que faltou.
+  const versaoDeTermos = texto(bruto.terms_version);
+  const aceitoEm = instante(bruto.terms_accepted_at, "terms_accepted_at");
+  if ((versaoDeTermos === null) !== (aceitoEm === null)) return null;
+
   return {
     id,
     organizationId: org,
@@ -764,16 +812,16 @@ function paraAssinatura(bruto: Json): StoredSubscription | null {
     state: state as StoredSubscription["state"],
     workerCount: trabalhadores,
     cnpj,
-    // Ausentes em assinatura anterior à 12C.1: `texto()` devolve `null` tanto
-    // para chave ausente quanto para valor nulo, e as duas significam a mesma
-    // coisa aqui — não há aceite registrado.
+    // Ausentes em assinatura anterior à 12C.1: chave ausente e valor nulo
+    // significam a mesma coisa aqui — não há aceite registrado. O que NÃO é a
+    // mesma coisa é valor presente e ilegível, e disso cuida `instante`.
     billingEmail: texto(bruto.billing_email),
-    termsVersion: texto(bruto.terms_version),
-    termsAcceptedAt: instante(bruto.terms_accepted_at),
+    termsVersion: versaoDeTermos,
+    termsAcceptedAt: aceitoEm,
     currentPeriodStart: inicio,
     currentPeriodEnd: fim,
-    trialEndsAt: instante(bruto.trial_ends_at),
-    paymentFailedAt: instante(bruto.payment_failed_at),
+    trialEndsAt: instante(bruto.trial_ends_at, "trial_ends_at"),
+    paymentFailedAt: instante(bruto.payment_failed_at, "payment_failed_at"),
     scheduledDowngrade:
       downPlan && downTier
         ? {
@@ -808,9 +856,9 @@ function paraCobranca(bruto: unknown): Charge | null {
   const moeda = texto(bruto.currency);
   const periodicidade = texto(bruto.billing_period);
   const status = texto(bruto.status);
-  const inicio = instante(bruto.period_start);
-  const fim = instante(bruto.period_end);
-  const criada = instante(bruto.created_at);
+  const inicio = instante(bruto.period_start, "period_start");
+  const fim = instante(bruto.period_end, "period_end");
+  const criada = instante(bruto.created_at, "created_at");
   if (
     !id || !org || !sub || !provider || !conta || !cliente || !externo ||
     !metodo || valor === null || !moeda || !periodicidade || !status ||
@@ -834,9 +882,9 @@ function paraCobranca(bruto: unknown): Charge | null {
     periodStart: inicio,
     periodEnd: fim,
     createdAt: criada,
-    paidAt: instante(bruto.paid_at),
-    failedAt: instante(bruto.failed_at),
-    cancelledAt: instante(bruto.cancelled_at),
+    paidAt: instante(bruto.paid_at, "paid_at"),
+    failedAt: instante(bruto.failed_at, "failed_at"),
+    cancelledAt: instante(bruto.cancelled_at, "cancelled_at"),
     idempotencyKey: texto(bruto.idempotency_key),
   };
 }
@@ -846,8 +894,8 @@ function paraCortesia(bruto: unknown): StoredCourtesy | null {
   const id = texto(bruto.id);
   const org = texto(bruto.organizationId) ?? texto(bruto.organization_id);
   const plan = texto(bruto.plan);
-  const inicio = instante(bruto.startsAt) ?? instante(bruto.starts_at);
-  const fim = instante(bruto.endsAt) ?? instante(bruto.ends_at);
+  const inicio = instante(bruto.startsAt, "startsAt") ?? instante(bruto.starts_at, "starts_at");
+  const fim = instante(bruto.endsAt, "endsAt") ?? instante(bruto.ends_at, "ends_at");
   const motivo = texto(bruto.reason);
   const autor = texto(bruto.grantedBy) ?? texto(bruto.granted_by);
   if (!id || !org || !plan || !inicio || !fim || !motivo || !autor) return null;
@@ -859,14 +907,14 @@ function paraCortesia(bruto: unknown): StoredCourtesy | null {
     endsAt: fim,
     reason: motivo,
     grantedBy: autor,
-    revokedAt: instante(bruto.revokedAt) ?? instante(bruto.revoked_at),
+    revokedAt: instante(bruto.revokedAt, "revokedAt") ?? instante(bruto.revoked_at, "revoked_at"),
   };
 }
 
 function paraGrandfathering(bruto: Json): Grandfathering | null {
   const org = texto(bruto.organizationId) ?? texto(bruto.organization_id);
-  const corte = instante(bruto.cutoffAt) ?? instante(bruto.cutoff_at);
-  const concedido = instante(bruto.grantedAt) ?? instante(bruto.granted_at);
+  const corte = instante(bruto.cutoffAt, "cutoffAt") ?? instante(bruto.cutoff_at, "cutoff_at");
+  const concedido = instante(bruto.grantedAt, "grantedAt") ?? instante(bruto.granted_at, "granted_at");
   if (!org || !corte || !concedido) return null;
   return { organizationId: org, cutoffAt: corte, grantedAt: concedido };
 }
@@ -891,7 +939,7 @@ function paraAuditoria(bruto: unknown): AuditEvent | null {
   const id = texto(bruto.id);
   const org = texto(bruto.organization_id);
   const assunto = texto(bruto.subject);
-  const quando = instante(bruto.occurred_at);
+  const quando = instante(bruto.occurred_at, "occurred_at");
   if (!id || !org || !assunto || !quando) return null;
   return {
     id,
