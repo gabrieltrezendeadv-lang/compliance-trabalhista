@@ -210,10 +210,11 @@ jobs:
       # A EXCEÇÃO NOMINAL EM `public`, CONFERIDA NO CATÁLOGO
       #
       # A 12B abre uma exceção à regra "nenhum objeto de billing em public":
-      # dezesseis RPCs, porque `public` é o único schema exposto ao PostgREST e
-      # sem elas o repositório não alcança o banco.
+      # RPCs da allowlist — dezesseis na 12B, DEZOITO desde a 12C.1 — porque
+      # `public` é o único schema exposto ao PostgREST e sem elas o repositório
+      # não alcança o banco.
       #
-      # Os blocos dessas dezesseis saem da âncora textual do
+      # Os blocos dessas funções saem da âncora textual do
       # migration-rebuild-verify (split-public-rpcs.mjs). Esta asserção é a
       # contrapartida — e é MAIS forte do que o diff que substitui, porque os
       # dumps são tirados com --no-owner --no-privileges e nunca enxergaram
@@ -308,6 +309,8 @@ jobs:
             -f scripts/ci/verify-applied/20260801120000.sql
           "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
             -f scripts/ci/verify-applied/20260802093000.sql
+          "$PGBIN/psql" "$DB_URL" -v ON_ERROR_STOP=1 \
+            -f scripts/ci/verify-applied/20260810120000.sql
 
       - name: Rollback e reaplicação da nova forward-only
         run: |
@@ -320,7 +323,11 @@ jobs:
           ANTES=$(P -At -c "SELECT count(*) FROM pg_namespace WHERE nspname='billing';")
           [ "$ANTES" = "1" ] || { echo "FALHA: schema billing ausente antes do rollback"; exit 1; }
 
-          echo "== rollback (12B primeiro, depois 12A — ordem inversa da aplicação) =="
+          echo "== rollback (12C.1, depois 12B, depois 12A — ordem inversa da aplicação) =="
+          # A 12C.1 sai PRIMEIRO: ela troca a assinatura de fn_billing_start_trial,
+          # e reverter a 12B com a assinatura nova instalada deixaria em public uma
+          # função que a 12B não conhece.
+          P -f supabase/rollbacks/20260810120000_billing_contract_metadata_rollback.sql
           P -f supabase/rollbacks/20260802093000_billing_orchestration_rollback.sql
           P -f supabase/rollbacks/20260801120000_billing_foundation_rollback.sql
 
@@ -339,13 +346,15 @@ jobs:
             exit 1
           fi
 
-          echo "== reaplicação (as DUAS, na ordem) =="
+          echo "== reaplicação (as TRÊS, na ordem) =="
           P -f supabase/migrations/20260801120000_billing_foundation.sql
           P -f supabase/migrations/20260802093000_billing_orchestration.sql
+          P -f supabase/migrations/20260810120000_billing_contract_metadata.sql
 
           echo "== verificadores independentes, de novo =="
           P -f scripts/ci/verify-applied/20260801120000.sql
           P -f scripts/ci/verify-applied/20260802093000.sql
+          P -f scripts/ci/verify-applied/20260810120000.sql
 
           P -At -c "SELECT slug, coalesce(is_active::text,'NULO') FROM public.subscription_plans ORDER BY slug;" \
             > /tmp/planos-reaplicado.txt

@@ -301,16 +301,62 @@ BEGIN
     RAISE EXCEPTION 'VERIF 20260802093000: privilegio direto sobrevivente: %', v_txt;
   END IF;
 
-  -- E as dezesseis existem e são executáveis pelo service_role — senão a
-  -- aplicação ficaria sem porta nenhuma, que é o defeito que esta migration
-  -- veio corrigir.
+  -- E as dezesseis DESTA migration existem e são executáveis pelo
+  -- service_role — senão a aplicação ficaria sem porta nenhuma, que é o
+  -- defeito que esta migration veio corrigir.
+  --
+  -- ── POR NOME, E NÃO POR TOTAL ─────────────────────────────────────────────
+  --
+  -- Este bloco exigia `count(*) = 16`. A 12C.1 acrescentou duas RPCs, e um
+  -- total fixo passaria a reprovar a instalação CORRETA — o verificador da 12B
+  -- roda contra um banco que já tem a 12C.1 aplicada.
+  --
+  -- A troca não afrouxa: exigir cada um dos dezesseis NOMES é mais forte do que
+  -- exigir que eles sejam dezesseis, porque um total certo com um nome trocado
+  -- passava antes e não passa agora. A TOTALIDADE — nenhuma RPC além das
+  -- autorizadas — continua exigida, em `scripts/ci/assert-billing-rpcs.sql`,
+  -- que roda no mesmo job e confere o conjunto EXATO por assinatura.
+  SELECT string_agg(e, ', ' ORDER BY e) INTO v_txt
+    FROM unnest(ARRAY[
+      'fn_billing_read_state', 'fn_billing_read_catalog', 'fn_billing_read_ledger',
+      'fn_billing_start_trial', 'fn_billing_change_plan',
+      'fn_billing_schedule_downgrade', 'fn_billing_cancel_at_period_end',
+      'fn_billing_transition_state', 'fn_billing_record_worker_count',
+      'fn_billing_claim_idempotency', 'fn_billing_fail_idempotency',
+      'fn_billing_finalize_checkout', 'fn_billing_apply_provider_event',
+      'fn_billing_grant_courtesy', 'fn_billing_revoke_courtesy',
+      'fn_billing_save_grandfathering'
+    ]) AS e
+   WHERE NOT EXISTS (
+     SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.proname = e
+        AND has_function_privilege('service_role', p.oid, 'EXECUTE')
+   );
+  IF v_txt IS NOT NULL THEN
+    RAISE EXCEPTION
+      'VERIF 20260802093000: RPC(s) da 12B ausente(s) ou fora do alcance do service_role: %',
+      v_txt;
+  END IF;
+
+  -- E nenhuma delas pode estar SOBRECARREGADA: duas versões do mesmo nome
+  -- deixam o PostgREST escolher pela forma do corpo JSON.
+  SELECT string_agg(format('%s (%s versoes)', p.proname, count(*)), ', ')
+    INTO v_txt
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
+   GROUP BY p.proname
+  HAVING count(*) > 1;
+  IF v_txt IS NOT NULL THEN
+    RAISE EXCEPTION 'VERIF 20260802093000: RPC sobrecarregada: %', v_txt;
+  END IF;
+
   SELECT count(*) INTO v_int
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
    WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
      AND has_function_privilege('service_role', p.oid, 'EXECUTE');
-  IF v_int <> 16 THEN
+  IF v_int < 16 THEN
     RAISE EXCEPTION
-      'VERIF 20260802093000: service_role alcanca % RPC(s), esperadas 16', v_int;
+      'VERIF 20260802093000: service_role alcanca % RPC(s), menos que as 16 da 12B', v_int;
   END IF;
 
   SELECT string_agg(p.oid::regprocedure::text, ', ')
@@ -324,7 +370,8 @@ BEGIN
   END IF;
 
   RAISE NOTICE
-    'VERIF 20260802093000 OK: billing fechado, 16 RPCs so para service_role';
+    'VERIF 20260802093000 OK: billing fechado, as 16 RPCs da 12B alcancaveis so pelo service_role (total instalado: %)',
+    v_int;
 END
 $porta$;
 

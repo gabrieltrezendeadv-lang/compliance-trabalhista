@@ -136,7 +136,7 @@ $$;`,
     rpcs: RPCS_DE_BILLING,
     nota:
       "Etapa 12B. As TABELAS, TIPOS e TRIGGERS continuam inteiramente em " +
-      "`billing` e não aparecem em `pg_dump --schema=public`. As dezesseis " +
+      "`billing` e não aparecem em `pg_dump --schema=public`. As " +
       "RPCs, porém, VIVEM EM `public` — é o único schema exposto ao PostgREST, " +
       "e sem elas o repositório não alcança o banco. Funções de `public` ESTÃO " +
       "no dump, logo o efeito estrutural NÃO é nulo, e declará-lo nulo seria " +
@@ -145,6 +145,22 @@ $$;`,
       "verificados por catálogo em `scripts/ci/assert-billing-rpcs.sql` — que " +
       "confere owner, SECURITY DEFINER, search_path e ACL, coisas que o dump " +
       "é tirado com `--no-owner --no-privileges` e nunca teve como enxergar.",
+  },
+  {
+    migration: "20260810120000_billing_contract_metadata.sql",
+    efeitoEstrutural: "nominal",
+    rpcs: RPCS_DE_BILLING,
+    nota:
+      "Etapa 12C.1. As TRÊS COLUNAS novas (`billing_email`, `terms_version`, " +
+      "`terms_accepted_at`) e os CHECKs delas ficam em `billing.subscriptions` " +
+      "— fora de `pg_dump --schema=public`. O que toca `public` são as funções: " +
+      "duas RPCs novas e a assinatura TROCADA de `fn_billing_start_trial`. " +
+      "A allowlist compartilhada já reflete as dezoito assinaturas vigentes, e " +
+      "é por isso que este delta reaproveita `RPCS_DE_BILLING` em vez de " +
+      "declarar uma lista própria: duas listas se contradizem, uma não. " +
+      "A assinatura ANTIGA de `start_trial` não está na allowlist e não deve " +
+      "estar — foi removida nominalmente pela migration, e sobrevivência dela " +
+      "reprova como RPC não autorizada.",
   },
 ];
 

@@ -298,7 +298,7 @@ jobs:
       # search_path, proprietário e ACL efetivamente aparecem — o dump é tirado
       # `--no-owner --no-privileges` e nunca os viu.
       #
-      # A retirada é CONDICIONAL: as 48 linhas das 16 RPCs só saem se o perfil
+      # A retirada é CONDICIONAL: as linhas das RPCs da allowlist só saem se o perfil
       # for exatamente o declarado. EXECUTE para PUBLIC/anon/authenticated, dono
       # diferente, `SECURITY DEFINER` ausente, `search_path` divergente,
       # sobrecarga não declarada, presença parcial — qualquer um REPROVA aqui,
@@ -314,9 +314,10 @@ jobs:
             artifacts/rebuilt-security-sem-rpcs.txt \
             artifacts/rebuilt-security-rpcs.txt
 
-      # ── SPLITTER: separa as 16 RPCs nominais do dump REAL ───────────────────
+      # ── SPLITTER: separa as RPCs nominais do dump REAL ──────────────────────
       #
-      # A 12B cria dezesseis funções em `public`, e funções de `public` estão no
+      # A 12B criou dezesseis funções em `public` e a 12C.1 levou o conjunto a
+      # dezoito; funções de `public` estão no
       # dump. Sem esta separação a âncora B divergiria — e as duas saídas ruins
       # seriam redigir à mão o texto que o pg_dump emite (adivinhar formatação)
       # ou gerar o esperado a partir do dump (o que aprovaria qualquer coisa que
