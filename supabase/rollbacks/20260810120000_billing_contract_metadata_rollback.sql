@@ -53,20 +53,43 @@ BEGIN
     FROM billing.audit_events ae
    WHERE ae.subject::text IN ('terms_acceptance', 'billing_email');
 
-  IF v_subs > 0 OR v_trilha > 0 THEN
+  -- ── O QUE ABORTA, E O QUE APENAS AVISA ───────────────────────────────────
+  --
+  -- A barreira existe para impedir DESTRUICAO, e as duas situacoes sao
+  -- diferentes:
+  --
+  --   ASSINATURA com e-mail, versao ou instante  -> o valor mora nas colunas
+  --     que este arquivo remove. Removê-las APAGA o dado. ABORTA.
+  --
+  --   TRILHA com terms_acceptance/billing_email  -> as linhas ficam onde
+  --     estao. `billing.audit_events` e append-only por gatilho, e este
+  --     rollback nao a toca. Nada e destruido, entao abortar seria impedir a
+  --     reversao por causa de um dado que sobrevive a ela.
+  --
+  -- Avisar alto, porem, e obrigatorio: depois de reverter, a trilha continua
+  -- atestando aceites que o schema deixou de registrar.
+  IF v_subs > 0 THEN
     RAISE EXCEPTION
       'ROLLBACK 20260810120000 ABORTADO: existe dado contratual que seria destruido'
       USING DETAIL = format(
         '%s assinatura(s) com e-mail financeiro, versao ou instante de aceite '
-        '(organizacoes: %s); %s evento(s) de auditoria de aceite ou de contato. '
-        'Remover as colunas apagaria prova de aceite contratual.',
+        '(organizacoes: %s). Remover as colunas apagaria prova de aceite '
+        'contratual. Ha ainda %s evento(s) de auditoria de aceite ou de contato, '
+        'que sobrevivem a reversao.',
         v_subs, coalesce(v_orgs, '-'), v_trilha),
       HINT = 'Decida o destino do dado contratual antes de reverter. '
              'Este rollback nao decide isso por voce.';
   END IF;
 
+  IF v_trilha > 0 THEN
+    RAISE WARNING
+      'ROLLBACK 20260810120000: % evento(s) de aceite/contato PERMANECEM na trilha e passarao a atestar algo que o schema nao registra mais',
+      v_trilha;
+  END IF;
+
   RAISE NOTICE
-    'ROLLBACK 20260810120000: nenhuma assinatura com dado contratual, nenhum evento de aceite';
+    'ROLLBACK 20260810120000: nenhuma assinatura com dado contratual (trilha: % evento(s), preservados)',
+    v_trilha;
 END
 $barreira$;
 

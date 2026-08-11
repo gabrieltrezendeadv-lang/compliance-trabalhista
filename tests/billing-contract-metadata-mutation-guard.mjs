@@ -496,7 +496,7 @@ test("MUT-CM-14c: o catálogo independente divergir da allowlist é DETECTADO", 
 test("MUT-CM-15: permitir rollback destrutivo com dado contratual é DETECTADO", () => {
   mutar(
     ROLLBACK,
-    `  IF v_subs > 0 OR v_trilha > 0 THEN
+    `  IF v_subs > 0 THEN
     RAISE EXCEPTION
       'ROLLBACK 20260810120000 ABORTADO: existe dado contratual que seria destruido'`,
     `  IF false THEN

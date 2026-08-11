@@ -348,8 +348,12 @@ jobs:
           # Só DEPOIS de provado, o dado sai — explicitamente, nesta stack
           # descartável, e nunca por dentro do rollback.
           echo "== limpando o dado contratual da stack descartável =="
-          P -c "DELETE FROM billing.audit_events WHERE subject::text IN ('terms_acceptance', 'billing_email');"
+          # SÓ as colunas da assinatura. A trilha NÃO é tocada: `audit_events` é
+          # append-only por gatilho, e um DELETE nela é recusado pelo banco —
+          # como tem de ser. Ela sobrevive à reversão, e por isso não impede.
           P -c "UPDATE billing.subscriptions SET billing_email = NULL, terms_version = NULL, terms_accepted_at = NULL;"
+          RESTOU=$(P -At -c "SELECT count(*) FROM billing.audit_events WHERE subject::text IN ('terms_acceptance', 'billing_email');")
+          echo "  eventos de aceite preservados na trilha: $RESTOU"
 
           echo "== rollback (12C.1, depois 12B, depois 12A — ordem inversa da aplicação) =="
           # A 12C.1 sai PRIMEIRO: ela troca a assinatura de fn_billing_start_trial,

@@ -105,11 +105,23 @@ devolve a assinatura anterior de `fn_billing_start_trial` (mesmo corpo, não
 "equivalente"), remove as duas RPCs desta etapa, restaura ACL e owner, e só
 então remove as três colunas.
 
-**Ele aborta antes de destruir prova.** Se qualquer assinatura tiver e-mail
-financeiro, versão ou instante de aceite, ou se a trilha já registrar
-`terms_acceptance`/`billing_email`, o arquivo para com diagnóstico — quantas
-linhas, quais organizações — e não remove nada. Reverter nessa situação é
-decisão humana, com destino declarado para o dado contratual.
+**Ele aborta antes de destruir prova**, e distingue duas situações que parecem
+uma só:
+
+| Situação | O rollback | Por quê |
+| --- | --- | --- |
+| Assinatura com e-mail, versão ou instante | **aborta**, com diagnóstico | o valor mora nas colunas que ele remove; removê-las apaga o dado |
+| Trilha com `terms_acceptance`/`billing_email` | **avisa alto**, e segue | as linhas ficam onde estão: `audit_events` é append-only por gatilho, e o rollback não a toca |
+
+Abortar pela trilha impediria a reversão por causa de um dado que **sobrevive**
+a ela — e tornaria o próprio rollback impossível de ensaiar, já que o gatilho
+append-only recusa qualquer `DELETE` na trilha, inclusive do dono da tabela.
+O aviso é obrigatório: depois de reverter, a trilha continua atestando aceites
+que o schema deixou de registrar.
+
+O CI **exercita** a recusa: com dado contratual presente, exige que o rollback
+recuse com `ABORTADO` e com diagnóstico; só então limpa as colunas da
+assinatura — nunca a trilha — e reverte de verdade.
 
 **O que não volta, e está dito:** os rótulos `terms_acceptance` e
 `billing_email` permanecem em `billing.audit_subject`. O PostgreSQL não tem
