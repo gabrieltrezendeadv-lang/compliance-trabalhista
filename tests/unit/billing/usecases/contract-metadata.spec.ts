@@ -104,6 +104,109 @@ describe("aceite dos termos no início do trial", () => {
   });
 });
 
+describe("fronteira cliente → servidor", () => {
+  // ── O QUE ESTES CASOS SIMULAM ─────────────────────────────────────────────
+  //
+  // A 12C.3 vai criar a server action, e o jeito mais natural — e mais errado —
+  // de escrevê-la é repassar o corpo do formulário inteiro ao caso de uso. Os
+  // casos abaixo fazem exatamente isso, com campos que o cliente NÃO pode
+  // escolher, e exigem que o servidor os ignore.
+  //
+  // O `as unknown as` é o ponto: o tipo já recusa esses campos, e é por isso
+  // que precisa de teste em tempo de execução — um `as any` numa action futura
+  // apagaria a proteção do tipo sem apagar esta.
+
+  const NO_PASSADO = "2020-01-01T00:00:00.000Z";
+
+  it("instante enviado pelo formulário é IGNORADO; vale o relógio do servidor", async () => {
+    const b = montarBancada();
+    const doFormulario = {
+      plan: "essencial",
+      period: "monthly",
+      workerCount: 10,
+      cnpj: "00000000000191",
+      termsVersion: TERMS_VERSION,
+      // Campos que o navegador não pode escolher, mandados assim mesmo.
+      termsAcceptedAt: NO_PASSADO,
+      acceptedAt: NO_PASSADO,
+      occurredAt: NO_PASSADO,
+    };
+
+    const r = await startTrial(
+      b.env,
+      doFormulario as unknown as Parameters<typeof startTrial>[1]
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.termsAcceptedAt).toBe(b.relogio.now());
+    expect(r.value.termsAcceptedAt).not.toBe(NO_PASSADO);
+  });
+
+  it("no novo aceite, o instante do formulário também é IGNORADO", async () => {
+    const b = await comTrial();
+    const doTrial = b.relogio.now();
+    b.relogio.avancarDias(45);
+
+    const r = await acceptTerms(
+      b.env,
+      {
+        termsVersion: TERMS_VERSION,
+        termsAcceptedAt: NO_PASSADO,
+        acceptedAt: NO_PASSADO,
+      } as unknown as Parameters<typeof acceptTerms>[1]
+    );
+    expect(r.ok).toBe(true);
+    // A versão vigente já estava aceita: o reenvio é idempotente e PRESERVA o
+    // instante ORIGINAL, que é a prova. Nem o relógio de agora, nem — muito
+    // menos — o que o formulário mandou.
+    if (r.ok) {
+      expect(r.value.termsAcceptedAt).toBe(doTrial);
+      expect(r.value.termsAcceptedAt).not.toBe(NO_PASSADO);
+    }
+  });
+
+  it("aceite de versão POSTERIOR carimba o relógio, não o corpo enviado", async () => {
+    const b = await comTrial();
+    b.relogio.avancarDias(60);
+
+    // A versão vigente é a constante; para exercer o caminho de gravação sem
+    // publicar termos novos, o reenvio idempotente não serve. Este caso prova
+    // o carimbo pelo contato financeiro, que grava sempre que muda.
+    const r = await updateBillingEmail(
+      b.env,
+      {
+        billingEmail: "financeiro@empresa.com.br",
+        now: NO_PASSADO,
+        updatedAt: NO_PASSADO,
+      } as unknown as Parameters<typeof updateBillingEmail>[1]
+    );
+    expect(r.ok).toBe(true);
+
+    const ledger = await b.repo.readLedger(b.env.auth.userId, b.env.auth.organizationId);
+    expect(ledger.ok).toBe(true);
+    if (!ledger.ok) return;
+    const contato = ledger.value.auditEvents.filter((e) => e.subject === "billing_email");
+    expect(contato).toHaveLength(1);
+    expect(contato[0]!.occurredAt).toBe(b.relogio.now());
+    expect(contato[0]!.occurredAt).not.toBe(NO_PASSADO);
+  });
+
+  it("versão enviada pelo formulário só serve para comparação", async () => {
+    const b = montarBancada();
+    // Versão antiga, bem formada, plausível — e recusada.
+    const r = await startTrial(b.env, {
+      plan: "essencial",
+      period: "monthly",
+      workerCount: 10,
+      cnpj: "00000000000191",
+      termsVersion: "2020-01-01",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("invalid_input");
+    expect(await b.assinatura()).toBeNull();
+  });
+});
+
 describe("contato financeiro depois do trial", () => {
   it("o dono grava, e depois limpa", async () => {
     const b = await comTrial();
