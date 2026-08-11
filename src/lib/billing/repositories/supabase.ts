@@ -160,6 +160,31 @@ function inteiro(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+/**
+ * Instante em ISO 8601 UTC — o formato que o contrato declara.
+ *
+ * ── UMA DIVERGÊNCIA REAL, ACHADA PELO CONTRATO ──────────────────────────────
+ *
+ * O PostgREST serializa `timestamptz` como `2026-08-01T00:00:00+00:00`; o dublê
+ * guarda a string ISO que recebeu, `2026-08-01T00:00:00.000Z`. Os dois
+ * representam o MESMO instante e são strings DIFERENTES — e enquanto nenhuma
+ * expectativa comparasse instante, a divergência ficou invisível.
+ *
+ * Não é detalhe cosmético: qualquer comparação de igualdade a jusante — "este
+ * aceite é o mesmo de antes?", uma chave de cache, um `===` numa tela — daria
+ * resultados diferentes conforme a implementação. `Clock.now()` promete ISO
+ * 8601 UTC, e é isso que este repositório passa a devolver.
+ *
+ * Valor não textual ou data inválida viram `null`, como todo o resto deste
+ * arquivo: caminho quebrado NEGA.
+ */
+function instante(v: unknown): string | null {
+  const bruto = texto(v);
+  if (bruto === null) return null;
+  const ms = Date.parse(bruto);
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+}
+
 export class SupabaseBillingRepository implements BillingRepository {
   readonly #db: Cliente;
 
@@ -219,7 +244,7 @@ export class SupabaseBillingRepository implements BillingRepository {
           grandfathering: ehObjeto(bruto.grandfathering)
             ? paraGrandfathering(bruto.grandfathering)
             : null,
-          grandfatheringCutoff: texto(bruto.grandfatheringCutoff),
+          grandfatheringCutoff: instante(bruto.grandfatheringCutoff),
         } satisfies BillingState;
       },
       "estado de billing"
@@ -697,7 +722,7 @@ function paraSnapshot(bruto: unknown): PriceSnapshot | null {
   const tier = texto(bruto.tier);
   const period = texto(bruto.period);
   const versao = texto(bruto.catalog_version);
-  const quando = texto(bruto.captured_at);
+  const quando = instante(bruto.captured_at);
   if (valor === null || !plan || !tier || !period || !versao || !quando) return null;
   return Object.freeze({
     plan: plan as PriceSnapshot["plan"],
@@ -718,8 +743,8 @@ function paraAssinatura(bruto: Json): StoredSubscription | null {
   const state = texto(bruto.state);
   const trabalhadores = inteiro(bruto.worker_count);
   const cnpj = texto(bruto.cnpj);
-  const inicio = texto(bruto.current_period_start);
-  const fim = texto(bruto.current_period_end);
+  const inicio = instante(bruto.current_period_start);
+  const fim = instante(bruto.current_period_end);
   if (
     !id || !org || !plan || !tier || !period || !state ||
     trabalhadores === null || !cnpj || !inicio || !fim
@@ -744,11 +769,11 @@ function paraAssinatura(bruto: Json): StoredSubscription | null {
     // coisa aqui — não há aceite registrado.
     billingEmail: texto(bruto.billing_email),
     termsVersion: texto(bruto.terms_version),
-    termsAcceptedAt: texto(bruto.terms_accepted_at),
+    termsAcceptedAt: instante(bruto.terms_accepted_at),
     currentPeriodStart: inicio,
     currentPeriodEnd: fim,
-    trialEndsAt: texto(bruto.trial_ends_at),
-    paymentFailedAt: texto(bruto.payment_failed_at),
+    trialEndsAt: instante(bruto.trial_ends_at),
+    paymentFailedAt: instante(bruto.payment_failed_at),
     scheduledDowngrade:
       downPlan && downTier
         ? {
@@ -783,9 +808,9 @@ function paraCobranca(bruto: unknown): Charge | null {
   const moeda = texto(bruto.currency);
   const periodicidade = texto(bruto.billing_period);
   const status = texto(bruto.status);
-  const inicio = texto(bruto.period_start);
-  const fim = texto(bruto.period_end);
-  const criada = texto(bruto.created_at);
+  const inicio = instante(bruto.period_start);
+  const fim = instante(bruto.period_end);
+  const criada = instante(bruto.created_at);
   if (
     !id || !org || !sub || !provider || !conta || !cliente || !externo ||
     !metodo || valor === null || !moeda || !periodicidade || !status ||
@@ -809,9 +834,9 @@ function paraCobranca(bruto: unknown): Charge | null {
     periodStart: inicio,
     periodEnd: fim,
     createdAt: criada,
-    paidAt: texto(bruto.paid_at),
-    failedAt: texto(bruto.failed_at),
-    cancelledAt: texto(bruto.cancelled_at),
+    paidAt: instante(bruto.paid_at),
+    failedAt: instante(bruto.failed_at),
+    cancelledAt: instante(bruto.cancelled_at),
     idempotencyKey: texto(bruto.idempotency_key),
   };
 }
@@ -821,8 +846,8 @@ function paraCortesia(bruto: unknown): StoredCourtesy | null {
   const id = texto(bruto.id);
   const org = texto(bruto.organizationId) ?? texto(bruto.organization_id);
   const plan = texto(bruto.plan);
-  const inicio = texto(bruto.startsAt) ?? texto(bruto.starts_at);
-  const fim = texto(bruto.endsAt) ?? texto(bruto.ends_at);
+  const inicio = instante(bruto.startsAt) ?? instante(bruto.starts_at);
+  const fim = instante(bruto.endsAt) ?? instante(bruto.ends_at);
   const motivo = texto(bruto.reason);
   const autor = texto(bruto.grantedBy) ?? texto(bruto.granted_by);
   if (!id || !org || !plan || !inicio || !fim || !motivo || !autor) return null;
@@ -834,14 +859,14 @@ function paraCortesia(bruto: unknown): StoredCourtesy | null {
     endsAt: fim,
     reason: motivo,
     grantedBy: autor,
-    revokedAt: texto(bruto.revokedAt) ?? texto(bruto.revoked_at),
+    revokedAt: instante(bruto.revokedAt) ?? instante(bruto.revoked_at),
   };
 }
 
 function paraGrandfathering(bruto: Json): Grandfathering | null {
   const org = texto(bruto.organizationId) ?? texto(bruto.organization_id);
-  const corte = texto(bruto.cutoffAt) ?? texto(bruto.cutoff_at);
-  const concedido = texto(bruto.grantedAt) ?? texto(bruto.granted_at);
+  const corte = instante(bruto.cutoffAt) ?? instante(bruto.cutoff_at);
+  const concedido = instante(bruto.grantedAt) ?? instante(bruto.granted_at);
   if (!org || !corte || !concedido) return null;
   return { organizationId: org, cutoffAt: corte, grantedAt: concedido };
 }
@@ -866,7 +891,7 @@ function paraAuditoria(bruto: unknown): AuditEvent | null {
   const id = texto(bruto.id);
   const org = texto(bruto.organization_id);
   const assunto = texto(bruto.subject);
-  const quando = texto(bruto.occurred_at);
+  const quando = instante(bruto.occurred_at);
   if (!id || !org || !assunto || !quando) return null;
   return {
     id,

@@ -68,7 +68,7 @@ function exigirLoopback(url: string): void {
  * UUIDs determinísticos: o mesmo par sempre tem o mesmo identificador, o que
  * torna a falha reproduzível e a limpeza conferível.
  */
-const PARES = 40;
+const PARES = 60;
 let proximoPar = 0;
 
 function uuidDeFixture(tipo: "orgA" | "orgB" | "donoA" | "donoB" | "colabA", i: number): string {
