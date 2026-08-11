@@ -648,10 +648,10 @@ test("MUT-B43: comparar o dump BRUTO na âncora B é DETECTADO", () => {
   assert.match(r.out, /BO-25/);
 });
 
-test("MUT-B44: afrouxar a contagem de 16 blocos é DETECTADO", () => {
+test("MUT-B44: afrouxar a contagem de blocos é DETECTADO", () => {
   const r = mutar(
     REBUILD,
-    '[ "$BLOCOS" -eq 16 ]',
+    '[ "$BLOCOS" -eq "$ESPERADOS" ]',
     '[ "$BLOCOS" -ge 1 ]',
     GUARDA
   );

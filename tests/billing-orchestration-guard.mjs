@@ -535,7 +535,21 @@ test("BO-25: o splitter está ligado à âncora B, e só a ela", () => {
   );
 
   // ── CONTAGEM E CONJUNTO ───────────────────────────────────────────────────
-  assert.match(executavel, /\[ "\$BLOCOS" -eq 16 \]/, "a contagem de 16 blocos foi afrouxada");
+  // A contagem continua exigida, e agora DERIVADA da allowlist.
+  //
+  // Era `-eq 16`, escrito à mão em YAML. A 12C.1 levou o conjunto a dezoito e a
+  // reconstrução — correta — reprovou com "esperados 16 blocos, extraídos 18".
+  // Exigir o literal aqui era exigir que o número ficasse velho.
+  assert.match(
+    executavel,
+    /\[ "\$BLOCOS" -eq "\$ESPERADOS" \]/,
+    "a contagem de blocos foi afrouxada"
+  );
+  assert.match(
+    executavel,
+    /RPCS_DE_BILLING\.length/,
+    "a contagem de blocos deixou de vir da allowlist"
+  );
   assert.match(
     executavel,
     /grep -q 'fn_billing_' artifacts\/rebuilt-sem-rpcs\.sql/,
