@@ -31,6 +31,7 @@ import {
 } from "@/lib/billing/usecases/access";
 import { monthlyPriceCents, selectTier, yearlyPriceCents } from "@/lib/billing/plans/pricing";
 import { montarBancada, T0 } from "./harness";
+import { TERMS_VERSION } from "@/lib/billing/terms";
 
 const DIA = 86_400_000;
 
@@ -45,6 +46,7 @@ async function trial(
     period: "monthly",
     workerCount: trabalhadores,
     cnpj: "00000000000191",
+    termsVersion: TERMS_VERSION,
   });
   expect(r.ok).toBe(true);
   return b;
@@ -64,6 +66,7 @@ describe("trial", () => {
       period: "monthly",
       workerCount: 10,
       cnpj: "   ",
+      termsVersion: TERMS_VERSION,
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe("invalid_input");

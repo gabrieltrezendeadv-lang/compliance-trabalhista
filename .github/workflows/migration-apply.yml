@@ -52,6 +52,7 @@ on:
           - 20260731094500_make_tenant_resolution_deterministic.sql
           - 20260801120000_billing_foundation.sql
           - 20260802093000_billing_orchestration.sql
+          - 20260810120000_billing_contract_metadata.sql
       confirmacao:
         description: 'Digite APLICAR para confirmar. Qualquer outro valor aborta.'
         required: true

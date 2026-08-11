@@ -150,7 +150,11 @@ export type AuditSubject =
   | "subscription_state"
   | "price_catalog"
   | "payment"
-  | "charge";
+  | "charge"
+  /** Aceite dos termos. `newValue` traz a VERSÃO e o instante, nunca o texto. */
+  | "terms_acceptance"
+  /** Troca de contato financeiro. `newValue` traz a MÁSCARA, nunca o endereço. */
+  | "billing_email";
 
 export interface AuditEvent {
   readonly id: string;
@@ -189,6 +193,18 @@ export interface CatalogPrice {
 export interface StoredSubscription extends Subscription {
   readonly id: string;
   readonly cnpj: string;
+  /**
+   * Contato financeiro. OPCIONAL — nulo é estado válido, e não pendência.
+   *
+   * Fica aqui, e não em `Subscription`, porque é metadado CONTRATUAL: nenhuma
+   * regra de acesso, preço ou ciclo de vida o consulta. O domínio da 12A não
+   * precisa saber que ele existe.
+   */
+  readonly billingEmail: string | null;
+  /** Versão do documento aceito. Nulo nas assinaturas anteriores à 12C.1. */
+  readonly termsVersion: string | null;
+  /** Instante do aceite. Sempre casado com `termsVersion`, por CHECK no banco. */
+  readonly termsAcceptedAt: string | null;
 }
 
 /** Cortesia com identidade e estado de revogação. */
@@ -239,6 +255,15 @@ export interface StartTrialInput extends ComandoContexto {
   readonly trialEndsAt: string;
   readonly amountCents: number | null;
   readonly catalogVersion: string | null;
+  /** Contato financeiro, OPCIONAL. `null` e `""` significam a mesma coisa. */
+  readonly billingEmail: string | null;
+  /**
+   * Versão dos termos, OBRIGATÓRIA. Já conferida contra `TERMS_VERSION` pelo
+   * caso de uso — o repositório recebe a versão OFICIAL, não a do cliente.
+   */
+  readonly termsVersion: string;
+  /** Instante do aceite, do relógio injetado. Nunca `new Date()` aqui dentro. */
+  readonly termsAcceptedAt: string;
 }
 
 export interface ChangePlanInput extends ComandoContexto {
@@ -335,6 +360,33 @@ export interface BillingRepository {
     ctx: ComandoContexto,
     workerCount: number,
     now: string
+  ): Promise<Result<StoredSubscription>>;
+
+  // Metadados contratuais — Etapa 12C.1.
+  //
+  // Duas operações ESTREITAS, e não um `updateSubscription` genérico. Um método
+  // que aceitasse um patch livre seria um método que se pode enganar a mudar
+  // plano junto com o e-mail, e a auditoria registraria o assunto errado.
+  /**
+   * Troca o contato financeiro. Vazio limpa o campo. Repetir o mesmo valor não
+   * gera evento de auditoria — a trilha registra mudança, não requisição.
+   */
+  updateBillingEmail(
+    ctx: ComandoContexto,
+    billingEmail: string | null,
+    now: string
+  ): Promise<Result<StoredSubscription>>;
+  /**
+   * Registra o aceite de uma versão dos termos.
+   *
+   * `termsVersion` já vem conferida contra a vigente. Reenviar a versão já
+   * aceita é no-op idempotente: preserva o instante original, que é a prova.
+   * Versão anterior à já aceita é RECUSADA pelo banco.
+   */
+  acceptTerms(
+    ctx: ComandoContexto,
+    termsVersion: string,
+    acceptedAt: string
   ): Promise<Result<StoredSubscription>>;
 
   // Máquina de estados da idempotência.

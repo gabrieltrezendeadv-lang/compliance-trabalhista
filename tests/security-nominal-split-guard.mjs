@@ -76,7 +76,24 @@ const RUIDO = Object.freeze([
   "7|policy|organizations|org_select|cmd=r|permissive=t|roles=authenticated|using=true|check=<NULO>",
 ]);
 
-/** Extração completa e ÍNTEGRA das 16, mais ruído. */
+/**
+ * Assinatura da allowlist pelo NOME.
+ *
+ * Era por ÍNDICE. A 12C.1 acrescentou `fn_billing_accept_terms`, que ordena antes
+ * de tudo, e cada índice passou a apontar para outra função — as mutações
+ * continuavam passando, mirando alvos diferentes dos que os nomes dos testes
+ * anunciavam. Índice em lista ordenada não é identidade.
+ */
+function porNome(nome) {
+  const a = RPCS_DE_BILLING.find((x) => x.startsWith(nome + "("));
+  if (a === undefined) throw new Error("assinatura ausente na allowlist: " + nome);
+  return a;
+}
+
+/** Quantas linhas a extração íntegra produz: propriedade + dois ACL por RPC. */
+const LINHAS_NOMINAIS = RPCS_DE_BILLING.length * 3;
+
+/** Extração completa e ÍNTEGRA de todas as da allowlist, mais ruído. */
 function extracaoIntegra() {
   const linhas = [...RUIDO];
   for (const a of RPCS_DE_BILLING) {
@@ -119,13 +136,17 @@ function rodar(linhas) {
 
 // ── Controle ────────────────────────────────────────────────────────────────
 
-test("SN-00: extração íntegra — 48 linhas retiradas, ruído intacto", () => {
+test(`SN-00: extração íntegra — ${LINHAS_NOMINAIS} linhas retiradas, ruído intacto`, () => {
   const r = rodar(extracaoIntegra());
   assert.equal(r.code, 0, r.out);
-  assert.equal(r.rpcs.trim().split("\n").length, 48, "não foram 48 linhas nominais");
+  assert.equal(
+    r.rpcs.trim().split("\n").length,
+    LINHAS_NOMINAIS,
+    `não foram ${LINHAS_NOMINAIS} linhas nominais`
+  );
   const restante = r.sem.trim().split("\n");
   assert.deepEqual(restante, [...RUIDO], "o ruído não passou incólume");
-  assert.match(r.out, /assinaturas \.+ 16/);
+  assert.match(r.out, new RegExp(`assinaturas \\.+ ${RPCS_DE_BILLING.length}`));
 });
 
 test("SN-01: sem nenhuma nominal (a `main`), a extração sai inalterada", () => {
@@ -137,7 +158,7 @@ test("SN-01: sem nenhuma nominal (a `main`), a extração sai inalterada", () =>
 
 test("SN-02: nada é retirado quando o script reprova", () => {
   const linhas = extracaoIntegra();
-  linhas.push(acl(RPCS_DE_BILLING[0], "anon"));
+  linhas.push(acl(porNome("fn_billing_apply_provider_event"), "anon"));
   const r = rodar(linhas);
   assert.equal(r.code, 1);
   assert.equal(r.sem, null, "escreveu a saída mesmo tendo reprovado");
@@ -160,11 +181,16 @@ test("SN-M1: RPC EXTRA em public (nome fora da allowlist) NÃO é retirada", () 
 
 test("SN-M2: RPC AUSENTE (presença parcial) é DETECTADA", () => {
   const linhas = extracaoIntegra().filter(
-    (l) => !l.includes(comoExtracao(RPCS_DE_BILLING[9]))
+    (l) => !l.includes(comoExtracao(porNome("fn_billing_read_state")))
   );
   const r = rodar(linhas);
   assert.equal(r.code, 1, "presença parcial passou");
-  assert.match(r.out, /presença parcial: 15 de 16/);
+  assert.match(
+    r.out,
+    new RegExp(
+      `presença parcial: ${RPCS_DE_BILLING.length - 1} de ${RPCS_DE_BILLING.length}`
+    )
+  );
   assert.match(r.out, /fn_billing_read_state/);
 });
 
@@ -182,7 +208,7 @@ test("SN-M3: SOBRECARGA não declarada é DETECTADA", () => {
 for (const papel of ["PUBLIC", "anon", "authenticated"]) {
   test(`SN-M4/${papel}: EXECUTE para ${papel} é DETECTADO`, () => {
     const linhas = extracaoIntegra();
-    linhas.push(acl(RPCS_DE_BILLING[3], papel));
+    linhas.push(acl(porNome("fn_billing_accept_terms"), papel));
     const r = rodar(linhas);
     assert.equal(r.code, 1, `EXECUTE para ${papel} passou`);
     assert.match(r.out, new RegExp(`EXECUTE concedido a "${papel}"`));
@@ -191,8 +217,8 @@ for (const papel of ["PUBLIC", "anon", "authenticated"]) {
 
 test("SN-M5: proprietário diferente de postgres é DETECTADO", () => {
   const linhas = extracaoIntegra().map((l) =>
-    l.startsWith(`5|funcao|${comoExtracao(RPCS_DE_BILLING[5])}|`)
-      ? propriedade(RPCS_DE_BILLING[5], { dono: "service_role" })
+    l.startsWith(`5|funcao|${comoExtracao(porNome("fn_billing_finalize_checkout"))}|`)
+      ? propriedade(porNome("fn_billing_finalize_checkout"), { dono: "service_role" })
       : l
   );
   const r = rodar(linhas);
@@ -202,8 +228,8 @@ test("SN-M5: proprietário diferente de postgres é DETECTADO", () => {
 
 test("SN-M6: ausência de SECURITY DEFINER é DETECTADA", () => {
   const linhas = extracaoIntegra().map((l) =>
-    l.startsWith(`5|funcao|${comoExtracao(RPCS_DE_BILLING[7])}|`)
-      ? propriedade(RPCS_DE_BILLING[7], { secdef: "f" })
+    l.startsWith(`5|funcao|${comoExtracao(porNome("fn_billing_update_billing_email"))}|`)
+      ? propriedade(porNome("fn_billing_update_billing_email"), { secdef: "f" })
       : l
   );
   const r = rodar(linhas);
@@ -213,8 +239,8 @@ test("SN-M6: ausência de SECURITY DEFINER é DETECTADA", () => {
 
 test("SN-M7: search_path divergente é DETECTADO", () => {
   const linhas = extracaoIntegra().map((l) =>
-    l.startsWith(`5|funcao|${comoExtracao(RPCS_DE_BILLING[11])}|`)
-      ? propriedade(RPCS_DE_BILLING[11], { config: "search_path=public, pg_temp" })
+    l.startsWith(`5|funcao|${comoExtracao(porNome("fn_billing_accept_terms"))}|`)
+      ? propriedade(porNome("fn_billing_accept_terms"), { config: "search_path=public, pg_temp" })
       : l
   );
   const r = rodar(linhas);
@@ -223,7 +249,7 @@ test("SN-M7: search_path divergente é DETECTADO", () => {
 });
 
 test("SN-M8: EXECUTE faltando para service_role é DETECTADO", () => {
-  const alvo = comoExtracao(RPCS_DE_BILLING[2]);
+  const alvo = comoExtracao(porNome("fn_billing_change_plan"));
   const linhas = extracaoIntegra().filter(
     (l) => l !== `6|funcao-acl|${alvo}|service_role|EXECUTE`
   );
@@ -234,7 +260,7 @@ test("SN-M8: EXECUTE faltando para service_role é DETECTADO", () => {
 
 test("SN-M9: privilégio que não seja EXECUTE é DETECTADO", () => {
   const linhas = extracaoIntegra();
-  linhas.push(acl(RPCS_DE_BILLING[1], "service_role", "UPDATE"));
+  linhas.push(acl(porNome("fn_billing_update_billing_email"), "service_role", "UPDATE"));
   const r = rodar(linhas);
   assert.equal(r.code, 1, "privilégio estranho passou");
   assert.match(r.out, /privilégio "UPDATE", esperado EXECUTE/);
@@ -242,8 +268,8 @@ test("SN-M9: privilégio que não seja EXECUTE é DETECTADO", () => {
 
 test("SN-M10: linguagem diferente de plpgsql é DETECTADA", () => {
   const linhas = extracaoIntegra().map((l) =>
-    l.startsWith(`5|funcao|${comoExtracao(RPCS_DE_BILLING[0])}|`)
-      ? propriedade(RPCS_DE_BILLING[0], { lang: "sql" })
+    l.startsWith(`5|funcao|${comoExtracao(porNome("fn_billing_accept_terms"))}|`)
+      ? propriedade(porNome("fn_billing_accept_terms"), { lang: "sql" })
       : l
   );
   const r = rodar(linhas);

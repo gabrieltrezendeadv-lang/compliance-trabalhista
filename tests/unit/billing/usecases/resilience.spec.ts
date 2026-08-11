@@ -22,6 +22,7 @@ import {
   COLAB_A,
   type Bancada,
 } from "./harness";
+import { TERMS_VERSION } from "@/lib/billing/terms";
 
 const CHAVE = "ck-1";
 
@@ -32,6 +33,7 @@ async function comAssinatura(opcoes: Parameters<typeof montarBancada>[0] = {}) {
     period: "monthly",
     workerCount: 10,
     cnpj: "00000000000191",
+    termsVersion: TERMS_VERSION,
   });
   expect(r.ok).toBe(true);
   return b;

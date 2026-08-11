@@ -15,10 +15,12 @@ import { describe, expect, it } from "vitest";
 
 import { applyProviderEvent, createCheckout } from "@/lib/billing/usecases/payments";
 import {
+  acceptTerms,
   cancelAtPeriodEnd,
   choosePlan,
   scheduleDowngradeUseCase,
   startTrial,
+  updateBillingEmail,
   upgradeSubscription,
 } from "@/lib/billing/usecases/subscription";
 import {
@@ -35,6 +37,7 @@ import {
   ORG_FANTASMA,
   montarBancada,
 } from "./harness";
+import { TERMS_VERSION } from "@/lib/billing/terms";
 
 async function comTrial(opcoes: Parameters<typeof montarBancada>[0] = {}) {
   const b = montarBancada(opcoes);
@@ -43,6 +46,7 @@ async function comTrial(opcoes: Parameters<typeof montarBancada>[0] = {}) {
     period: "monthly",
     workerCount: 10,
     cnpj: "00000000000191",
+    termsVersion: TERMS_VERSION,
   });
   expect(r.ok).toBe(true);
   return b;
@@ -86,7 +90,9 @@ describe("recusa indistinguível", () => {
 
 describe("somente o proprietário administra", () => {
   const comandos: ReadonlyArray<[string, (b: Awaited<ReturnType<typeof comTrial>>) => Promise<{ ok: boolean }>]> = [
-    ["startTrial", (b) => startTrial(b.env, { plan: "essencial", period: "monthly", workerCount: 5, cnpj: "00000000000191" })],
+    ["startTrial", (b) => startTrial(b.env, { plan: "essencial", period: "monthly", workerCount: 5, cnpj: "00000000000191", termsVersion: TERMS_VERSION })],
+    ["updateBillingEmail", (b) => updateBillingEmail(b.env, { billingEmail: "financeiro@empresa.com.br" })],
+    ["acceptTerms", (b) => acceptTerms(b.env, { termsVersion: TERMS_VERSION })],
     ["choosePlan", (b) => choosePlan(b.env, { plan: "completo", period: "monthly" })],
     ["upgradeSubscription", (b) => upgradeSubscription(b.env, { plan: "completo" })],
     ["scheduleDowngrade", (b) => scheduleDowngradeUseCase(b.env, { plan: "essencial" })],

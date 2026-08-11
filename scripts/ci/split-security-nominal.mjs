@@ -8,7 +8,9 @@
  *
  * A âncora B compara a extração de segurança da BASELINE restaurada (as 36
  * históricas, sem a 12B) contra a da RECONSTRUÇÃO completa (com a 12B). Para as
- * 16 RPCs nominais, diferir não é defeito: é o efeito declarado da migration.
+ * RPCs nominais da allowlist, diferir não é defeito: é o efeito declarado da
+ * migration. A contagem vem da allowlist — eram 16 na 12B, são 18 desde a
+ * 12C.1 — e nunca de um número escrito aqui.
  * Sem tratamento, a comparação acusa 48 linhas em categorias bloqueantes — 16 de
  * propriedade de função e 32 de ACL — e o veredito fica permanentemente
  * vermelho por um motivo que não é regressão.

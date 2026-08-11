@@ -2,8 +2,19 @@
  * ALLOWLIST DAS RPCs DE BILLING EM `public`
  *
  * A 12A estabeleceu "nenhum objeto de billing em public". A 12B abre UMA
- * exceção, e ela é nominal: exatamente estas dezesseis funções, com estas
- * assinaturas.
+ * exceção, e ela é nominal: exatamente estas funções, com estas assinaturas.
+ *
+ * ── DE DEZESSEIS PARA DEZOITO, NA 12C.1 ─────────────────────────────────────
+ *
+ * A 12B declarou dezesseis. A 12C.1 acrescentou duas —
+ * `fn_billing_update_billing_email` e `fn_billing_accept_terms` — e MUDOU a
+ * assinatura de `fn_billing_start_trial`, que ganhou contato financeiro,
+ * versão dos termos e instante do aceite.
+ *
+ * A assinatura antiga de `start_trial` NÃO está nesta lista, e não pode estar:
+ * ela foi removida nominalmente pela migration justamente para não sobrar
+ * sobrecarga. Se ela reaparecer, `assert-billing-rpcs.sql` reprova por RPC não
+ * autorizada, e o verificador da 12C.1 reprova por sobrecarga.
  *
  * ── POR QUE ASSINATURA COMPLETA, E NÃO NOME ─────────────────────────────────
  *
@@ -33,6 +44,7 @@
 
 /** Assinaturas exatas, ordenadas. Formato: `nome(tipo, tipo, …)`. */
 export const RPCS_DE_BILLING = Object.freeze([
+  "fn_billing_accept_terms(uuid, uuid, text, timestamp with time zone, text)",
   "fn_billing_apply_provider_event(text, text, text, text, text, timestamp with time zone, text, timestamp with time zone)",
   "fn_billing_cancel_at_period_end(uuid, uuid, text, text, timestamp with time zone)",
   "fn_billing_change_plan(uuid, uuid, text, text, text, text, timestamp with time zone, timestamp with time zone, integer, text, text, text, text, text, timestamp with time zone)",
@@ -47,8 +59,9 @@ export const RPCS_DE_BILLING = Object.freeze([
   "fn_billing_revoke_courtesy(uuid, uuid, uuid, timestamp with time zone, text, text)",
   "fn_billing_save_grandfathering(uuid, uuid, timestamp with time zone, timestamp with time zone, text)",
   "fn_billing_schedule_downgrade(uuid, uuid, text, text, text, text, timestamp with time zone)",
-  "fn_billing_start_trial(uuid, uuid, text, text, text, integer, text, timestamp with time zone, timestamp with time zone, timestamp with time zone, integer, text, text)",
+  "fn_billing_start_trial(uuid, uuid, text, text, text, integer, text, timestamp with time zone, timestamp with time zone, timestamp with time zone, integer, text, text, text, text, timestamp with time zone)",
   "fn_billing_transition_state(uuid, uuid, text, text, text, text, timestamp with time zone)",
+  "fn_billing_update_billing_email(uuid, uuid, text, timestamp with time zone, text)",
 ]);
 
 /** Só os nomes — para asserções que não dependem dos tipos. */

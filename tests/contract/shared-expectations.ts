@@ -97,6 +97,9 @@ export function definirContrato(opcoes: ContratoOptions): void {
         period: "monthly",
         workerCount: 10,
         cnpj: "00000000000191",
+        billingEmail: null,
+        termsVersion: "2026-08-10",
+        termsAcceptedAt: amb.agora,
         periodStart: amb.agora,
         periodEnd: maisDias(amb.agora, 30),
         trialEndsAt: maisDias(amb.agora, 7),
@@ -193,6 +196,9 @@ export function definirContrato(opcoes: ContratoOptions): void {
           period: "monthly",
           workerCount: 10,
           cnpj: "00000000000191",
+          billingEmail: null,
+          termsVersion: "2026-08-10",
+          termsAcceptedAt: amb.agora,
           periodStart: amb.agora,
           periodEnd: maisDias(amb.agora, 30),
           trialEndsAt: maisDias(amb.agora, 7),
@@ -907,6 +913,369 @@ export function definirContrato(opcoes: ContratoOptions): void {
         const estadoB = await amb.repo.readState(amb.donoB, amb.orgB);
         expect(estadoB.ok).toBe(true);
         if (estadoB.ok) expect(estadoB.value.grandfathering).toBeNull();
+      });
+    });
+
+    // ── Metadados contratuais — Etapa 12C.1 ───────────────────────────────
+    //
+    // Nove casos, e o ponto de todos é a PARIDADE: o dublê refaz as regras do
+    // banco (par completo, formato da versão, e-mail vazio virando nulo,
+    // regressão proibida, máscara na trilha), e um dublê que refaz regra é um
+    // dublê que pode refazê-la ERRADO. Estes casos rodam contra as duas
+    // implementações; divergência reprova de um lado só, e é assim que se
+    // descobre.
+
+    describe("metadados contratuais", () => {
+      it("trial COM contato financeiro persiste o endereço e mascara a trilha", async () => {
+        await comAmbiente(async (amb) => {
+          const r = await amb.repo.startTrial({
+            ...ctx(amb),
+            plan: "essencial",
+            tier: "t1_20",
+            period: "monthly",
+            workerCount: 10,
+            cnpj: "00000000000191",
+            periodStart: amb.agora,
+            periodEnd: maisDias(amb.agora, 30),
+            trialEndsAt: maisDias(amb.agora, 7),
+            amountCents: 9900,
+            catalogVersion: amb.catalogVersion,
+            billingEmail: "financeiro@empresa.com.br",
+            termsVersion: "2026-08-10",
+            termsAcceptedAt: amb.agora,
+          });
+          expect(r.ok).toBe(true);
+          if (!r.ok) return;
+          expect(r.value.billingEmail).toBe("financeiro@empresa.com.br");
+          expect(r.value.termsVersion).toBe("2026-08-10");
+          expect(r.value.termsAcceptedAt).toBe(amb.agora);
+
+          const ledger = await amb.repo.readLedger(amb.donoA, amb.orgA);
+          expect(ledger.ok).toBe(true);
+          if (!ledger.ok) return;
+
+          // O ACEITE É EVENTO PRÓPRIO, com versão e instante.
+          const aceite = ledger.value.auditEvents.filter(
+            (e) => e.subject === "terms_acceptance"
+          );
+          expect(aceite).toHaveLength(1);
+          expect(aceite[0]!.actorId).toBe(amb.donoA);
+          expect(aceite[0]!.organizationId).toBe(amb.orgA);
+          expect(aceite[0]!.newValue?.termsVersion).toBe("2026-08-10");
+          expect(aceite[0]!.correlationId).toBe("corr-contrato");
+
+          // E O ENDEREÇO NÃO ENTRA NA TRILHA. `audit_events` é append-only:
+          // gravar o e-mail inteiro criaria histórico imutável de dado pessoal.
+          const serializada = JSON.stringify(ledger.value.auditEvents);
+          expect(serializada).not.toContain("financeiro@empresa.com.br");
+          expect(serializada).toContain("f***@empresa.com.br");
+        });
+      });
+
+      it("trial SEM contato financeiro é válido, e não gera evento de contato", async () => {
+        await comAmbiente(async (amb) => {
+          await comTrial(amb);
+          const estado = await amb.repo.readState(amb.donoA, amb.orgA);
+          expect(estado.ok).toBe(true);
+          if (!estado.ok) return;
+          expect(estado.value.subscription?.billingEmail).toBeNull();
+          // O aceite, porém, é obrigatório — e está lá.
+          expect(estado.value.subscription?.termsVersion).toBe("2026-08-10");
+          expect(estado.value.subscription?.termsAcceptedAt).not.toBeNull();
+
+          const ledger = await amb.repo.readLedger(amb.donoA, amb.orgA);
+          expect(ledger.ok).toBe(true);
+          if (!ledger.ok) return;
+          expect(
+            ledger.value.auditEvents.filter((e) => e.subject === "billing_email")
+          ).toHaveLength(0);
+        });
+      });
+
+      for (const [rotulo, versao] of [
+        ["ausente", ""],
+        ["só com espaços", "   "],
+        ["inventada", "termos-v1"],
+        ["fora do formato de data", "10-08-2026"],
+      ] as const) {
+        it(`trial com versão de termos ${rotulo} é RECUSADO`, async () => {
+          await comAmbiente(async (amb) => {
+            const r = await amb.repo.startTrial({
+              ...ctx(amb),
+              plan: "essencial",
+              tier: "t1_20",
+              period: "monthly",
+              workerCount: 10,
+              cnpj: "00000000000191",
+              periodStart: amb.agora,
+              periodEnd: maisDias(amb.agora, 30),
+              trialEndsAt: maisDias(amb.agora, 7),
+              amountCents: 9900,
+              catalogVersion: amb.catalogVersion,
+              billingEmail: null,
+              termsVersion: versao,
+              termsAcceptedAt: amb.agora,
+            });
+            expect(r.ok).toBe(false);
+            if (!r.ok) expect(r.error.code).toBe("invalid_input");
+
+            // E NADA FOI GRAVADO. Recusa que deixa assinatura para trás é
+            // pior do que aceitação: fica um trial sem aceite nenhum.
+            const estado = await amb.repo.readState(amb.donoA, amb.orgA);
+            expect(estado.ok).toBe(true);
+            if (estado.ok) expect(estado.value.subscription).toBeNull();
+          });
+        });
+      }
+
+      it("aceite de versão POSTERIOR atualiza versão e instante, e audita", async () => {
+        await comAmbiente(async (amb) => {
+          await comTrial(amb);
+          const depois = maisDias(amb.agora, 90);
+
+          const r = await amb.repo.acceptTerms(ctx(amb), "2026-11-01", depois);
+          expect(r.ok).toBe(true);
+          if (!r.ok) return;
+          expect(r.value.termsVersion).toBe("2026-11-01");
+          expect(r.value.termsAcceptedAt).toBe(depois);
+
+          const ledger = await amb.repo.readLedger(amb.donoA, amb.orgA);
+          expect(ledger.ok).toBe(true);
+          if (!ledger.ok) return;
+          const aceites = ledger.value.auditEvents.filter(
+            (e) => e.subject === "terms_acceptance"
+          );
+          // Dois: o do trial e o novo. A trilha é append-only, e o primeiro
+          // continua lá — é a prova de que a versão anterior foi aceita.
+          expect(aceites).toHaveLength(2);
+          const novo = aceites[1]!;
+          expect(novo.previousValue?.termsVersion).toBe("2026-08-10");
+          expect(novo.newValue?.termsVersion).toBe("2026-11-01");
+        });
+      });
+
+      it("repetir o MESMO aceite é idempotente e preserva o instante original", async () => {
+        await comAmbiente(async (amb) => {
+          await comTrial(amb);
+          const original = await amb.repo.readState(amb.donoA, amb.orgA);
+          expect(original.ok).toBe(true);
+          if (!original.ok) return;
+          const instante = original.value.subscription!.termsAcceptedAt;
+
+          const r = await amb.repo.acceptTerms(
+            ctx(amb),
+            "2026-08-10",
+            maisDias(amb.agora, 30)
+          );
+          expect(r.ok).toBe(true);
+          if (!r.ok) return;
+          // O INSTANTE NÃO MUDA. Ele é a prova de quando a pessoa aceitou;
+          // sobrescrevê-lo por um reenvio apagaria a data que interessa.
+          expect(r.value.termsAcceptedAt).toBe(instante);
+
+          const ledger = await amb.repo.readLedger(amb.donoA, amb.orgA);
+          expect(ledger.ok).toBe(true);
+          if (!ledger.ok) return;
+          expect(
+            ledger.value.auditEvents.filter((e) => e.subject === "terms_acceptance")
+          ).toHaveLength(1);
+        });
+      });
+
+      it("aceitar versão ANTERIOR à já aceita é recusado", async () => {
+        await comAmbiente(async (amb) => {
+          await comTrial(amb);
+          const r = await amb.repo.acceptTerms(
+            ctx(amb),
+            "2025-01-01",
+            maisDias(amb.agora, 1)
+          );
+          expect(r.ok).toBe(false);
+          if (!r.ok) expect(r.error.code).toBe("invalid_input");
+
+          const estado = await amb.repo.readState(amb.donoA, amb.orgA);
+          expect(estado.ok).toBe(true);
+          if (estado.ok) {
+            expect(estado.value.subscription?.termsVersion).toBe("2026-08-10");
+          }
+        });
+      });
+
+      it("o dono troca o contato financeiro, e a trilha guarda só a máscara", async () => {
+        await comAmbiente(async (amb) => {
+          await comTrial(amb);
+          const r = await amb.repo.updateBillingEmail(
+            ctx(amb),
+            "  contas@acme.com.br  ",
+            maisDias(amb.agora, 2)
+          );
+          expect(r.ok).toBe(true);
+          // Espaços nas pontas são removidos ANTES de gravar.
+          if (r.ok) expect(r.value.billingEmail).toBe("contas@acme.com.br");
+
+          // E limpar é possível: vazio significa "sem contato", não erro.
+          const limpo = await amb.repo.updateBillingEmail(
+            ctx(amb),
+            "   ",
+            maisDias(amb.agora, 3)
+          );
+          expect(limpo.ok).toBe(true);
+          if (limpo.ok) expect(limpo.value.billingEmail).toBeNull();
+
+          const ledger = await amb.repo.readLedger(amb.donoA, amb.orgA);
+          expect(ledger.ok).toBe(true);
+          if (!ledger.ok) return;
+          const contatos = ledger.value.auditEvents.filter(
+            (e) => e.subject === "billing_email"
+          );
+          expect(contatos).toHaveLength(2);
+          expect(contatos[0]!.newValue?.mask).toBe("c***@acme.com.br");
+          expect(contatos[1]!.previousValue?.mask).toBe("c***@acme.com.br");
+          expect(contatos[1]!.newValue?.mask).toBeNull();
+          expect(JSON.stringify(contatos)).not.toContain("contas@acme.com.br");
+        });
+      });
+
+      it("repetir o MESMO contato não gera evento novo", async () => {
+        await comAmbiente(async (amb) => {
+          await comTrial(amb);
+          await amb.repo.updateBillingEmail(ctx(amb), "contas@acme.com.br", amb.agora);
+          await amb.repo.updateBillingEmail(
+            ctx(amb),
+            "contas@acme.com.br",
+            maisDias(amb.agora, 1)
+          );
+
+          const ledger = await amb.repo.readLedger(amb.donoA, amb.orgA);
+          expect(ledger.ok).toBe(true);
+          if (!ledger.ok) return;
+          expect(
+            ledger.value.auditEvents.filter((e) => e.subject === "billing_email")
+          ).toHaveLength(1);
+        });
+      });
+
+      it("membro comum NÃO troca contato nem aceita termos", async () => {
+        await comAmbiente(async (amb) => {
+          await comTrial(amb);
+          const comoColaborador = {
+            actorId: amb.colaboradorA,
+            organizationId: amb.orgA,
+            correlationId: "corr-contrato",
+          };
+
+          const email = await amb.repo.updateBillingEmail(
+            comoColaborador,
+            "colaborador@acme.com.br",
+            amb.agora
+          );
+          expect(email.ok).toBe(false);
+          if (!email.ok) expect(email.error.code).toBe("not_owner");
+
+          const termos = await amb.repo.acceptTerms(
+            comoColaborador,
+            "2026-11-01",
+            amb.agora
+          );
+          expect(termos.ok).toBe(false);
+          if (!termos.ok) expect(termos.error.code).toBe("not_owner");
+
+          // E nada mudou.
+          const estado = await amb.repo.readState(amb.donoA, amb.orgA);
+          expect(estado.ok).toBe(true);
+          if (estado.ok) {
+            expect(estado.value.subscription?.billingEmail).toBeNull();
+            expect(estado.value.subscription?.termsVersion).toBe("2026-08-10");
+          }
+        });
+      });
+
+      it("organização ALHEIA e INEXISTENTE recebem a MESMA recusa", async () => {
+        await comAmbiente(async (amb) => {
+          await comTrial(amb);
+          await comTrial(amb, amb.orgB);
+
+          const alheia = await amb.repo.updateBillingEmail(
+            { actorId: amb.donoA, organizationId: amb.orgB, correlationId: "c" },
+            "invasor@acme.com.br",
+            amb.agora
+          );
+          const inexistente = await amb.repo.updateBillingEmail(
+            { actorId: amb.donoA, organizationId: amb.orgFantasma, correlationId: "c" },
+            "invasor@acme.com.br",
+            amb.agora
+          );
+
+          expect(alheia.ok).toBe(false);
+          expect(inexistente.ok).toBe(false);
+          if (!alheia.ok && !inexistente.ok) {
+            // MESMO código E mesma mensagem: distingui-las entregaria "esta
+            // organização existe" a quem varre identificadores.
+            expect(alheia.error.code).toBe(inexistente.error.code);
+            expect(alheia.error.message).toBe(inexistente.error.message);
+          }
+
+          // E o mesmo para o aceite.
+          const aceiteAlheio = await amb.repo.acceptTerms(
+            { actorId: amb.donoA, organizationId: amb.orgB, correlationId: "c" },
+            "2026-11-01",
+            amb.agora
+          );
+          const aceiteFantasma = await amb.repo.acceptTerms(
+            { actorId: amb.donoA, organizationId: amb.orgFantasma, correlationId: "c" },
+            "2026-11-01",
+            amb.agora
+          );
+          expect(aceiteAlheio.ok).toBe(false);
+          expect(aceiteFantasma.ok).toBe(false);
+          if (!aceiteAlheio.ok && !aceiteFantasma.ok) {
+            expect(aceiteAlheio.error.code).toBe(aceiteFantasma.error.code);
+            expect(aceiteAlheio.error.message).toBe(aceiteFantasma.error.message);
+          }
+
+          // B continua com o contato dele — nulo — e com o aceite dele.
+          const estadoB = await amb.repo.readState(amb.donoB, amb.orgB);
+          expect(estadoB.ok).toBe(true);
+          if (estadoB.ok) {
+            expect(estadoB.value.subscription?.billingEmail).toBeNull();
+          }
+        });
+      });
+
+      it("contato malformado é recusado SEM reproduzir o endereço na mensagem", async () => {
+        await comAmbiente(async (amb) => {
+          await comTrial(amb);
+          const r = await amb.repo.updateBillingEmail(
+            ctx(amb),
+            "nao-e-um-email",
+            amb.agora
+          );
+          expect(r.ok).toBe(false);
+          if (!r.ok) {
+            expect(r.error.code).toBe("invalid_input");
+            expect(r.error.message).not.toContain("nao-e-um-email");
+          }
+
+          const estado = await amb.repo.readState(amb.donoA, amb.orgA);
+          expect(estado.ok).toBe(true);
+          if (estado.ok) expect(estado.value.subscription?.billingEmail).toBeNull();
+        });
+      });
+
+      it("sem assinatura, contato e aceite respondem que não há registro", async () => {
+        await comAmbiente(async (amb) => {
+          const email = await amb.repo.updateBillingEmail(
+            ctx(amb),
+            "contas@acme.com.br",
+            amb.agora
+          );
+          expect(email.ok).toBe(false);
+          if (!email.ok) expect(email.error.code).toBe("not_found");
+
+          const termos = await amb.repo.acceptTerms(ctx(amb), "2026-11-01", amb.agora);
+          expect(termos.ok).toBe(false);
+          if (!termos.ok) expect(termos.error.code).toBe("not_found");
+        });
       });
     });
 

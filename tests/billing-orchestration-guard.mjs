@@ -33,6 +33,18 @@ const ROLLBACK = `supabase/rollbacks/${VERSAO}_billing_orchestration_rollback.sq
 const VERIFICADOR = `scripts/ci/verify-applied/${VERSAO}.sql`;
 const INTEGRACAO = "scripts/ci/assert-billing-orchestration.sql";
 
+/**
+ * As migrations que criam RPC de billing em `public`, em ordem de aplicação.
+ *
+ * A allowlist versionada descreve o ESTADO VIGENTE do schema, e desde a 12C.1
+ * esse estado é a soma de duas migrations. Uma terceira que crie RPC entra
+ * aqui — e, se não entrar, BO-14 acusa a RPC como declarada e não criada.
+ */
+const MIGRATIONS_DE_BILLING = [
+  MIGRATION,
+  "supabase/migrations/20260810120000_billing_contract_metadata.sql",
+];
+
 /** Domínio puro da 12A + orquestração da 12B: nada aqui pode ser não determinístico. */
 const DOMINIO = [
   "src/lib/billing/core/errors.ts",
@@ -523,7 +535,21 @@ test("BO-25: o splitter está ligado à âncora B, e só a ela", () => {
   );
 
   // ── CONTAGEM E CONJUNTO ───────────────────────────────────────────────────
-  assert.match(executavel, /\[ "\$BLOCOS" -eq 16 \]/, "a contagem de 16 blocos foi afrouxada");
+  // A contagem continua exigida, e agora DERIVADA da allowlist.
+  //
+  // Era `-eq 16`, escrito à mão em YAML. A 12C.1 levou o conjunto a dezoito e a
+  // reconstrução — correta — reprovou com "esperados 16 blocos, extraídos 18".
+  // Exigir o literal aqui era exigir que o número ficasse velho.
+  assert.match(
+    executavel,
+    /\[ "\$BLOCOS" -eq "\$ESPERADOS" \]/,
+    "a contagem de blocos foi afrouxada"
+  );
+  assert.match(
+    executavel,
+    /RPCS_DE_BILLING\.length/,
+    "a contagem de blocos deixou de vir da allowlist"
+  );
   assert.match(
     executavel,
     /grep -q 'fn_billing_' artifacts\/rebuilt-sem-rpcs\.sql/,
@@ -732,7 +758,26 @@ test("BO-14: em public a migration só cria as RPCs nominalmente autorizadas", (
   );
 
   // 3. E todas as declaradas são realmente criadas — remover uma reprova.
-  const naoCriadas = NOMES_DE_RPC.filter((n) => !criadasEmPublic.includes(n));
+  //
+  // ── A ALLOWLIST DEIXOU DE SER DE UMA MIGRATION SÓ ─────────────────────────
+  //
+  // Até a 12B, as dezesseis assinaturas nasciam todas neste arquivo, e conferir
+  // a allowlist contra ele bastava. A 12C.1 acrescentou duas e trocou a
+  // assinatura de `start_trial` — a allowlist passou a descrever o ESTADO
+  // VIGENTE de `public`, que é a soma das migrations de billing, não o conteúdo
+  // de uma delas.
+  //
+  // A conferência de COBERTURA passa a ser contra a soma; a de FRONTEIRA
+  // (nenhuma função em public fora da allowlist) continua arquivo a arquivo,
+  // logo acima. Nenhuma das duas afrouxou: remover uma RPC de qualquer das
+  // duas migrations continua reprovando aqui.
+  const criadasNoConjunto = MIGRATIONS_DE_BILLING.flatMap((rel) => [
+    ...sqlExecutavel(rel).matchAll(
+      /\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:public\.|"public"\.)(\w+)/gi
+    ),
+  ].map((m) => m[1]));
+
+  const naoCriadas = NOMES_DE_RPC.filter((n) => !criadasNoConjunto.includes(n));
   assert.deepEqual(naoCriadas, [], `RPC declarada e não criada: ${naoCriadas.join(", ")}`);
 
   assert.equal(

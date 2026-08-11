@@ -10,10 +10,10 @@
 -- ── POR QUE ESTE ARQUIVO EXISTE ─────────────────────────────────────────────
 --
 -- A Etapa 12A estabeleceu "nenhum objeto de billing em `public`". A 12B abre
--- uma exceção — as dezesseis RPCs — e uma exceção sem vigia é só uma regra
+-- uma exceção — as dezoito RPCs — e uma exceção sem vigia é só uma regra
 -- revogada.
 --
--- Os blocos dessas dezesseis funções são RETIRADOS da âncora textual do
+-- Os blocos dessas dezoito funções são RETIRADOS da âncora textual do
 -- `migration-rebuild-verify` por `scripts/ci/split-public-rpcs.mjs`. Este
 -- arquivo é a contrapartida, e ele é MAIS FORTE do que o diff que substitui:
 -- os dumps são tirados com `--no-owner --no-privileges`, então a comparação
@@ -57,7 +57,7 @@ DECLARE
       'public.fn_billing_read_state(uuid, uuid)|jsonb|s',
       'public.fn_billing_read_catalog(uuid, uuid, text)|jsonb|s',
       'public.fn_billing_read_ledger(uuid, uuid)|jsonb|s',
-      'public.fn_billing_start_trial(uuid, uuid, text, text, text, integer, text, timestamp with time zone, timestamp with time zone, timestamp with time zone, integer, text, text)|jsonb|v',
+      'public.fn_billing_start_trial(uuid, uuid, text, text, text, integer, text, timestamp with time zone, timestamp with time zone, timestamp with time zone, integer, text, text, text, text, timestamp with time zone)|jsonb|v',
       'public.fn_billing_change_plan(uuid, uuid, text, text, text, text, timestamp with time zone, timestamp with time zone, integer, text, text, text, text, text, timestamp with time zone)|jsonb|v',
       'public.fn_billing_schedule_downgrade(uuid, uuid, text, text, text, text, timestamp with time zone)|jsonb|v',
       'public.fn_billing_cancel_at_period_end(uuid, uuid, text, text, timestamp with time zone)|jsonb|v',
@@ -69,11 +69,16 @@ DECLARE
       'public.fn_billing_apply_provider_event(text, text, text, text, text, timestamp with time zone, text, timestamp with time zone)|jsonb|v',
       'public.fn_billing_grant_courtesy(uuid, uuid, text, timestamp with time zone, timestamp with time zone, text, text)|jsonb|v',
       'public.fn_billing_revoke_courtesy(uuid, uuid, uuid, timestamp with time zone, text, text)|jsonb|v',
-      'public.fn_billing_save_grandfathering(uuid, uuid, timestamp with time zone, timestamp with time zone, text)|jsonb|v'
+      'public.fn_billing_save_grandfathering(uuid, uuid, timestamp with time zone, timestamp with time zone, text)|jsonb|v',
+      -- Etapa 12C.1. Estreitas de proposito: uma so muda contato financeiro, a
+      -- outra so registra aceite. Nenhuma das dezesseis anteriores tinha
+      -- semantica para elas.
+      'public.fn_billing_update_billing_email(uuid, uuid, text, timestamp with time zone, text)|jsonb|v',
+      'public.fn_billing_accept_terms(uuid, uuid, text, timestamp with time zone, text)|jsonb|v'
   ];
 BEGIN
-  IF array_length(v_esperadas, 1) <> 16 THEN
-    RAISE EXCEPTION 'a lista esperada deste verificador tem % entradas, deveria ter 16',
+  IF array_length(v_esperadas, 1) <> 18 THEN
+    RAISE EXCEPTION 'a lista esperada deste verificador tem % entradas, deveria ter 18',
       array_length(v_esperadas, 1);
   END IF;
 
@@ -81,7 +86,7 @@ BEGIN
   --
   -- `pg_get_function_identity_arguments` rende os NOMES dos parametros junto
   -- com os tipos — `(p_actor_id uuid, p_organization_id uuid)`, e nao
-  -- `(uuid, uuid)`. Comparar a string renderizada reprovava as dezesseis.
+  -- `(uuid, uuid)`. Comparar a string renderizada reprovava todas elas.
   -- `to_regprocedure` resolve para o OID e nao depende da impressao.
   SELECT string_agg(split_part(e, '|', 1), E'
   ' ORDER BY e) INTO v_txt
@@ -126,8 +131,8 @@ BEGIN
   SELECT count(*) INTO v_int
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
    WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%';
-  IF v_int <> 16 THEN
-    RAISE EXCEPTION 'esperadas 16 RPCs de billing, encontradas %', v_int;
+  IF v_int <> 18 THEN
+    RAISE EXCEPTION 'esperadas 18 RPCs de billing, encontradas %', v_int;
   END IF;
 
   -- Nomes dos parametros SAO contrato: o PostgREST associa as chaves do corpo
@@ -173,7 +178,7 @@ BEGIN
       v_txt;
   END IF;
 
-  RAISE NOTICE 'billingRPC/catalogo OK: 16 assinaturas por OID, nomes de parametro, SECURITY DEFINER, owner %, search_path vazio',
+  RAISE NOTICE 'billingRPC/catalogo OK: 18 assinaturas por OID, nomes de parametro, SECURITY DEFINER, owner %, search_path vazio',
     pg_get_userbyid(v_owner);
 END
 $conjunto$;
