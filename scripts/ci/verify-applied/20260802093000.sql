@@ -340,12 +340,17 @@ BEGIN
 
   -- E nenhuma delas pode estar SOBRECARREGADA: duas versões do mesmo nome
   -- deixam o PostgREST escolher pela forma do corpo JSON.
-  SELECT string_agg(format('%s (%s versoes)', p.proname, count(*)), ', ')
-    INTO v_txt
-    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-   WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
-   GROUP BY p.proname
-  HAVING count(*) > 1;
+  -- O `count(*)` precisa ficar numa subconsulta: agregar dentro de `string_agg`
+  -- é aninhar agregação, e o PostgreSQL recusa com "aggregate function calls
+  -- cannot be nested".
+  SELECT string_agg(x.rotulo, ', ' ORDER BY x.rotulo) INTO v_txt
+    FROM (
+      SELECT format('%s (%s versoes)', p.proname, count(*)) AS rotulo
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+       WHERE n.nspname = 'public' AND p.proname LIKE 'fn\_billing\_%'
+       GROUP BY p.proname
+      HAVING count(*) > 1
+    ) x;
   IF v_txt IS NOT NULL THEN
     RAISE EXCEPTION 'VERIF 20260802093000: RPC sobrecarregada: %', v_txt;
   END IF;
