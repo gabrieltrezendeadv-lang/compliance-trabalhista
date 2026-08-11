@@ -123,6 +123,16 @@ O CI **exercita** a recusa: com dado contratual presente, exige que o rollback
 recuse com `ABORTADO` e com diagnóstico; só então limpa as colunas da
 assinatura — nunca a trilha — e reverte de verdade.
 
+E o resíduo do enum deixou de ser só um aviso: `scripts/ci/assert-rollback-enum-residue.sql`
+roda **entre** o rollback da 12C.1 e o da 12B — depois da 12B o schema não
+existe mais — e exige, contra `pg_enum`, que os nove rótulos anteriores estejam
+intactos, que `terms_acceptance` e `billing_email` sejam os **únicos** resíduos,
+que a contagem feche em onze, que nenhuma coluna, CHECK, RPC, auxiliar ou
+privilégio da 12C.1 sobreviva, e que os dois rótulos sejam **inertes** —
+nenhuma função instalada os menciona. A asserção de conjunto exato mora no
+ensaio, e não no arquivo de rollback: lá ela seria eterna, e reprovaria toda
+etapa futura que acrescentasse um assunto de auditoria.
+
 **O que não volta, e está dito:** os rótulos `terms_acceptance` e
 `billing_email` permanecem em `billing.audit_subject`. O PostgreSQL não tem
 `ALTER TYPE ... DROP VALUE`, e recriar o enum exigiria derrubar a coluna
@@ -171,5 +181,22 @@ a autoriza.
 | Máscara na trilha; idempotência; regressão proibida | idem §B.8 |
 | Paridade memória × PostgREST | `tests/contract/shared-expectations.ts` |
 | Versão vigente comparada no servidor | `tests/unit/billing/terms.spec.ts` e `.../usecases/contract-metadata.spec.ts` |
+| **Instante do aceite vindo só do `Clock`**, com o corpo do formulário ignorado | `.../usecases/contract-metadata.spec.ts`, bloco "fronteira cliente → servidor" |
+| Instante ilegível NEGA em vez de virar nulo | `tests/unit/billing/repositories/supabase-mapping.spec.ts` |
+| **Resíduo exato do enum depois do rollback** | `scripts/ci/assert-rollback-enum-residue.sql` |
 | Estrutura, rota, rollback, allowlist | `tests/billing-contract-metadata-guard.mjs` |
 | Que as guardas acima têm dente | `tests/billing-contract-metadata-mutation-guard.mjs` |
+
+## 10. Evidência: quais execuções valem
+
+O head desta etapa é `9a8ea86c`. As execuções que o comprovam são:
+
+| Execução | O quê | SHA |
+| --- | --- | --- |
+| `31451192920` | CI (Verify, E2E, Dependency audit) | `9a8ea86c` |
+| `31451218554` | Reconstrução completa — âncoras A e B | `9a8ea86c` |
+
+A execução `31450305390` **não vale como evidência deste head**: ela é o CI de
+`64861e4a`, dois commits antes, e foi citada por engano num relatório anterior.
+Fica registrada aqui para que a correção não se perca — evidência de outro SHA
+prova outro código.
