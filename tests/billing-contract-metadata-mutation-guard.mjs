@@ -598,6 +598,15 @@ test("MUT-CM-16c: reverter a 12B antes da 12C.1 é DETECTADO", () => {
   );
 });
 
+test("MUT-CM-16e: voltar a escrever a contagem de blocos à mão é DETECTADO", () => {
+  mutar(
+    ".github/workflows/migration-rebuild-verify.yml",
+    `          [ "$BLOCOS" -eq "$ESPERADOS" ] || {`,
+    `          [ "$BLOCOS" -eq 18 ] || {`,
+    /compara os blocos contra um número escrito à mão/
+  );
+});
+
 // ── 12. As 40 anteriores ────────────────────────────────────────────────────
 
 test("MUT-CM-17: alterar uma das 40 migrations anteriores é DETECTADO", () => {

@@ -338,12 +338,19 @@ jobs:
             artifacts/rebuilt-sem-rpcs.sql \
             artifacts/rebuilt-rpcs.sql | tee artifacts/splitter.log
 
-          # Exatamente 16 blocos, um por assinatura da allowlist. O splitter já
-          # reprova ausente, extra e duplicada; aqui a contagem é conferida de
-          # novo, de fora, para que um afrouxamento dentro dele apareça.
+          # Um bloco por assinatura da allowlist. O splitter já reprova ausente,
+          # extra e duplicada; aqui a contagem é conferida de novo, de fora,
+          # para que um afrouxamento dentro dele apareça.
+          #
+          # O número vem da ALLOWLIST, e não escrito aqui: eram 16 na 12B, são
+          # 18 desde a 12C.1, e um literal em YAML é o tipo de lugar que ninguém
+          # lembra de atualizar — foi exatamente o que aconteceu, e a execução
+          # 31450655911 reprovou com "esperados 16 blocos, extraídos 18".
+          ESPERADOS=$(node -e "import('./scripts/ci/billing-rpc-allowlist.mjs').then(m => console.log(m.RPCS_DE_BILLING.length))")
           BLOCOS=$(grep -c '^-- Name: fn_billing_.*Type: FUNCTION' artifacts/rebuilt-rpcs.sql)
-          echo "blocos extraídos: $BLOCOS"
-          [ "$BLOCOS" -eq 16 ] || { echo "FALHA: esperados 16 blocos, extraídos $BLOCOS"; exit 1; }
+          echo "blocos extraídos: $BLOCOS (allowlist declara $ESPERADOS)"
+          [ "$BLOCOS" -eq "$ESPERADOS" ] || {
+            echo "FALHA: esperados $ESPERADOS blocos, extraídos $BLOCOS"; exit 1; }
 
           # E nenhuma sobra no dump principal.
           if grep -q 'fn_billing_' artifacts/rebuilt-sem-rpcs.sql; then

@@ -704,6 +704,29 @@ test("CM-16: a migration está na rota, com verificação independente", () => {
   assert.ok(iC1 > 0 && iB > 0 && iC1 < iB, "o rollback da 12C.1 não roda antes do da 12B");
 });
 
+test("CM-16b: nenhum workflow escreve o tamanho da allowlist à mão", () => {
+  // ── OUTRO DEFEITO REAL ────────────────────────────────────────────────────
+  //
+  // `migration-rebuild-verify.yml` conferia `[ "$BLOCOS" -eq 16 ]`. Literal em
+  // YAML é o tipo de lugar que ninguém lembra de atualizar, e a execução
+  // 31450655911 reprovou com "esperados 16 blocos, extraídos 18" — a
+  // reconstrução estava CORRETA, e a asserção é que estava velha.
+  //
+  // A contagem passa a vir da allowlist. Um número escrito à mão aqui volta a
+  // reprovar por motivo errado na próxima RPC.
+  const rebuild = ler(".github/workflows/migration-rebuild-verify.yml");
+  assert.doesNotMatch(
+    rebuild,
+    /BLOCOS"?\s+-eq\s+\d+/,
+    "o workflow de reconstrução compara os blocos contra um número escrito à mão"
+  );
+  assert.match(
+    rebuild,
+    /RPCS_DE_BILLING\.length/,
+    "o workflow de reconstrução não deriva a contagem da allowlist"
+  );
+});
+
 // ── 8. O caminho TypeScript ────────────────────────────────────────────────
 
 test("CM-17: o contrato TypeScript ganhou as três propriedades e as duas operações", () => {
