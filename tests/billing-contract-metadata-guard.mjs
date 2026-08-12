@@ -1119,8 +1119,14 @@ test("CM-22: a documentação registra o estado real e o que esta etapa NÃO faz
   const texto = ler(doc);
 
   const exigido = [
-    [/40\/40/, "não registra que produção está em 40/40"],
-    [/pendente/i, "não registra que a nova migration fica pendente"],
+    // Os DOIS estados, e a diferença entre eles: 40/40 é o desta etapa, 41/41
+    // é o vigente depois de a migration ter sido aplicada. Apagar o primeiro
+    // reescreveria a história; omitir o segundo deixaria o documento mentindo
+    // sobre hoje.
+    [/40\/40/, "não registra o estado 40/40 desta etapa"],
+    [/41\/41/, "não registra o estado VIGENTE 41/41"],
+    [/31536103242/, "não registra a execução que aplicou a migration"],
+    [/pendente/i, "não registra que a migration esteve pendente"],
     [/não habilita billing/i, "não diz que a etapa não habilita billing"],
     [/Asaas/, "não diz que o Asaas continua não implementado"],
     [/12C\.3/, "não diz que a interface só vem na 12C.3"],
