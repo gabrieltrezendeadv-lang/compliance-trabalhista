@@ -39,7 +39,10 @@ BEGIN
   -- 60 pares. Eram 40, e a 12C.1 acrescentou doze casos ao contrato — cada
   -- caso consome um par, e a suíte abortava com 'consumiu mais de 40'. A folga
   -- é deliberada: o próximo lote de casos não deve exigir mexer no seed.
-  FOR i IN 0..59 LOOP
+  -- 80 pares, em duas faixas disjuntas: 0–59 para o contrato do repositório
+  -- e 60–79 para o contrato da fachada. Faixa compartilhada permitiria que
+  -- uma suíte alcançasse a fixture da outra sem que nada acusasse.
+  FOR i IN 0..79 LOOP
     v_suf    := lpad(i::text, 8, '0');
     v_org_a  := ('0c07a000-0000-4000-8000-a001' || v_suf)::uuid;
     v_org_b  := ('0c07a000-0000-4000-8000-b001' || v_suf)::uuid;
@@ -78,7 +81,7 @@ BEGIN
     ON CONFLICT DO NOTHING;
   END LOOP;
 
-  RAISE NOTICE 'contrato/seed OK: 60 pares de organização';
+  RAISE NOTICE 'contrato/seed OK: 80 pares de organização (0-59 repositório, 60-79 fachada)';
 END
 $seed$;
 
