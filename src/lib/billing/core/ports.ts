@@ -42,7 +42,18 @@ export interface IdGenerator {
 export interface BillingAuthContext {
   readonly userId: string;
   readonly organizationId: string;
-  readonly role: "owner";
+  /**
+   * O papel REAL do ator na organização, resolvido pelo servidor.
+   *
+   * `"member"` cobre todo papel que não é proprietário. O billing não precisa
+   * distinguir colaborador de auditor: para ele existem exatamente duas
+   * perguntas — "pertence a este tenant?" e "administra a assinatura?".
+   *
+   * Este campo NÃO amplia nada sozinho. Quem decide é `assertTenantOwner` ou
+   * `assertTenantMember` no começo de cada caso de uso, e todo comando de
+   * escrita chama o primeiro.
+   */
+  readonly role: "owner" | "member";
 }
 
 /**

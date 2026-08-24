@@ -46,6 +46,23 @@ export type MockScenario =
   | "pix_pending"
   /** `createCharge` estoura por tempo — nada é persistido do lado do provider. */
   | "timeout"
+  /**
+   * `createCharge` RECUSA de forma determinística, sem criar nada.
+   *
+   * ── POR QUE ESTE CENÁRIO PRECISOU EXISTIR ─────────────────────────────────
+   *
+   * `payments.ts` divide as falhas do provider em duas classes e trata cada uma
+   * de um jeito: as AMBÍGUAS (`provider_unavailable`, `provider_timeout`) não
+   * podem virar `failed`, porque uma conexão que cai depois do commit do
+   * provider é indistinguível de uma que cai antes; as DETERMINÍSTICAS podem,
+   * porque o provider disse "não" sem criar nada.
+   *
+   * Só que nenhum cenário do roteiro produzia um código determinístico: os três
+   * de falha devolviam `provider_timeout` ou `provider_unavailable`. O ramo
+   * `failed` de `talvezMarcarFalha` estava, portanto, INALCANÇÁVEL por teste —
+   * a política estava escrita e não estava provada.
+   */
+  | "rejected"
   /** `createCharge` falha ANTES de qualquer efeito. */
   | "unavailable_before_persist"
   /** `createCharge` cria a cobrança e SÓ ENTÃO falha em responder. */
@@ -178,6 +195,13 @@ export class BillingProviderMock implements BillingProviderPort {
     }
     if (cenario === "unavailable_before_persist") {
       return fail("provider_unavailable", "provider indisponível antes de criar a cobrança");
+    }
+    if (cenario === "rejected") {
+      // DETERMINÍSTICO: o provider recusou o pedido e nada existe do lado de
+      // fora. Diferente dos dois acima justamente por não haver ambiguidade —
+      // e é essa diferença que libera a reserva para uma repetição imediata do
+      // MESMO pedido.
+      return fail("invalid_input", "provider recusou o pedido");
     }
 
     const externalChargeId = this.#ids.next("chg");

@@ -21,11 +21,19 @@
  * `termsVersion` também é aceita, e também não decide: é a versão que a tela
  * EXIBIU, comparada com `TERMS_VERSION` antes de qualquer efeito. O que se
  * persiste é a constante do servidor.
+ *
+ * `checkoutIntentId` é a terceira exceção, e a mais recente. Ele foi CUNHADO
+ * pelo servidor em `prepararIntencaoDeCheckout` e devolvido ao chamador, que o
+ * repete nos retries técnicos. Também não autoriza: só particiona o espaço de
+ * idempotência DENTRO da organização já resolvida. `intencao.ts` explica por
+ * que ele não é a chave, e por que não há tabela de intenções.
  */
 
 import "server-only";
 
 import { z } from "zod";
+
+import { FORMATO_DE_INTENCAO } from "./intencao";
 
 /** Slug de organização vindo do cliente. Nunca autoriza; só é comparado. */
 const organizacaoPedida = z
@@ -155,11 +163,36 @@ export const CancelarSchema = z
 export const CriarCheckoutSchema = z
   .object({
     organizationId: organizacaoPedida,
+    /**
+     * A intenção, OBRIGATÓRIA e no formato que o servidor cunha.
+     *
+     * Não é opcional de propósito: um campo opcional convidaria o ramo "se não
+     * veio, invente" — e inventar em silêncio transformaria cada retry técnico
+     * numa cobrança nova, que é o defeito oposto ao que a versão anterior tinha
+     * e igualmente grave. Ausente é ERRO, e o chamador precisa ter passado por
+     * `prepararIntencaoDeCheckout`.
+     *
+     * Ela também não autoriza: ver `intencao.ts`.
+     */
+    checkoutIntentId: z.string().trim().regex(FORMATO_DE_INTENCAO, "intenção inválida"),
     method: meio,
     customerName: z.string().trim().min(1).max(120),
     customerEmail: emailFinanceiro.refine((v) => v !== "", {
       message: "e-mail do pagador é obrigatório",
     }),
+  })
+  .strict();
+
+/**
+ * Preparar intenção.
+ *
+ * Só o tenant afirmado. Nada do pedido comercial entra aqui: a intenção é
+ * anterior à escolha de meio, de valor e de pagador, e amarrá-la a qualquer um
+ * deles reintroduziria a rigidez que ela existe para desfazer.
+ */
+export const PrepararIntencaoSchema = z
+  .object({
+    organizationId: organizacaoPedida,
   })
   .strict();
 
@@ -178,6 +211,7 @@ export type Upgrade = z.infer<typeof UpgradeSchema>;
 export type AgendarDowngrade = z.infer<typeof AgendarDowngradeSchema>;
 export type Cancelar = z.infer<typeof CancelarSchema>;
 export type CriarCheckout = z.infer<typeof CriarCheckoutSchema>;
+export type PrepararIntencao = z.infer<typeof PrepararIntencaoSchema>;
 export type Consulta = z.infer<typeof ConsultaSchema>;
 
 /**

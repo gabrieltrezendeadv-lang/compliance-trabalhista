@@ -1,8 +1,24 @@
 /**
- * AUTORIZAÇÃO DE BILLING — somente o proprietário, verificado no servidor
+ * AUTORIZAÇÃO DE BILLING — dois papéis, ambos verificados no servidor
  *
  * Regra do modelo aprovado: **somente o proprietário contrata, altera ou
  * cancela**. Aqui é onde isso é decidido — nunca na interface.
+ *
+ * ── O QUE A REGRA APROVADA NÃO DIZ ──────────────────────────────────────────
+ *
+ * Ela não diz que somente o proprietário pode CONSULTAR o que a organização
+ * tem direito de usar. Confundir as duas coisas barraria o colaborador de
+ * módulos que a organização pagou — e o enforcement de entitlements, que a
+ * 12C.3 vai aplicar, precisa de uma resposta para todo usuário do tenant.
+ *
+ * Por isso há duas famílias aqui, e elas são nominalmente distintas:
+ *
+ *   `requireBillingOwner*`   contratar, alterar, cancelar, ver o dossiê
+ *                            comercial (CNPJ, contato financeiro, preço).
+ *   `requireBillingMember*`  catálogo de preços e decisão de acesso. Nada que
+ *                            devolvam identifica o contrato da organização.
+ *
+ * Nenhuma das duas afrouxa a comparação de tenant: membro de A não alcança B.
  *
  * ── TRÊS CAMADAS, E ELAS NÃO SÃO REDUNDANTES ────────────────────────────────
  *
@@ -34,7 +50,14 @@ export type BillingAuthDenial =
 export interface BillingPrincipal {
   readonly userId: string;
   readonly organizationId: string;
-  readonly role: "owner";
+  /**
+   * O papel REAL, colapsado nas duas categorias que o billing distingue.
+   *
+   * Quem resolveu por `requireBillingOwner*` sempre traz `"owner"`; quem
+   * resolveu por `requireBillingMember*` traz o papel que o banco devolveu,
+   * que pode ser `"owner"` (o proprietário também é membro) ou `"member"`.
+   */
+  readonly role: "owner" | "member";
 }
 
 export type BillingAuthResult =
@@ -146,6 +169,110 @@ export async function requireBillingOwnerFor(
   if (requestedOrganizationId !== resultado.principal.organizationId) {
     // Deliberadamente `not_owner`, e não "organização não encontrada": a
     // mensagem não deve confirmar a existência da organização alheia.
+    return negar("not_owner");
+  }
+
+  return resultado;
+}
+
+// ─── Membro do tenant ───────────────────────────────────────────────────────
+
+/**
+ * Exige que o chamador seja MEMBRO ativo de alguma organização.
+ *
+ * ── O QUE MUDA EM RELAÇÃO A `requireBillingOwner` ───────────────────────────
+ *
+ * Só uma coisa: o filtro `.eq("role", "owner")` sai. Todo o resto — o
+ * `try/catch` que faz exceção virar negação, a checagem de sessão, a conferência
+ * do `tenant_id` devolvido, a ordenação determinística — permanece idêntico,
+ * porque nenhuma dessas propriedades tem a ver com papel.
+ *
+ * O papel devolvido é o REAL: `"owner"` quando o membership é de proprietário,
+ * `"member"` em qualquer outro caso. Quem recebe este principal ainda não pode
+ * escrever nada — `assertTenantOwner` é quem decide isso, e ele olha este campo.
+ *
+ * FAIL-CLOSED igual: ausência de sessão, ausência de membership, erro de
+ * consulta e resposta malformada NEGAM.
+ *
+ * ── ATENÇÃO PARA A 12C.3: SEMPRE INFORME A ORGANIZAÇÃO ──────────────────────
+ *
+ * Esta variante SEM argumento escolhe a PRIMEIRA membership do usuário, e
+ * `requireBillingOwner` escolhe a primeira em que ele é proprietário. Para
+ * quem pertence a uma organização só, dá no mesmo. Para quem é proprietário de
+ * A e colaborador de B, as duas podem resolver organizações DIFERENTES — e
+ * `lerAcesso` responderia sobre B enquanto `lerAssinatura` responde sobre A.
+ *
+ * Nenhuma das duas é insegura: ambas resolvem no servidor e ambas comparam o
+ * identificador afirmado quando ele vem. O risco é de COERÊNCIA, não de
+ * autorização. Os wrappers da 12C.3 devem passar o `organizationId` do tenant
+ * ativo, o que roteia para as variantes `…For` e elimina a ambiguidade.
+ *
+ * Unificar a resolução de tenant do produto inteiro é decisão maior do que esta
+ * etapa — `src/lib/tenant-guard.ts` é onde ela terá de acontecer.
+ */
+export async function requireBillingMember(): Promise<BillingAuthResult> {
+  try {
+    const supabase = await createClient();
+
+    const { data: auth, error: authError } = await supabase.auth.getUser();
+    if (authError) return negar("verification_failed");
+
+    const user = auth?.user;
+    if (!user) return negar("not_authenticated");
+
+    const { data: membership, error } = await supabase
+      .from("organization_members")
+      .select("tenant_id, role")
+      .eq("user_id", user.id)
+      .is("deleted_at", null)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) return negar("verification_failed");
+    if (!membership) return negar("no_organization");
+
+    if (typeof membership.tenant_id !== "string" || membership.tenant_id === "") {
+      return negar("verification_failed");
+    }
+
+    // Papel ausente ou de tipo inesperado NÃO vira `owner`. O padrão seguro é
+    // o menor privilégio, e aqui ele é `member`.
+    const role = membership.role === "owner" ? ("owner" as const) : ("member" as const);
+
+    return {
+      ok: true,
+      principal: { userId: user.id, organizationId: membership.tenant_id, role },
+    };
+  } catch {
+    return negar("verification_failed");
+  }
+}
+
+/**
+ * Exige que o chamador seja membro DA ORGANIZAÇÃO INFORMADA.
+ *
+ * Mesma regra anti-IDOR de `requireBillingOwnerFor`: o identificador do cliente
+ * nunca autoriza, apenas é comparado. E a recusa é `not_owner` também aqui —
+ * não porque falte papel, mas porque `not_owner` é o texto único com que esta
+ * camada responde "não é seu", e usar outro para tenant alheio diria a quem
+ * varre identificadores que a organização existe.
+ */
+export async function requireBillingMemberFor(
+  requestedOrganizationId: string
+): Promise<BillingAuthResult> {
+  const resultado = await requireBillingMember();
+  if (!resultado.ok) return resultado;
+
+  if (
+    typeof requestedOrganizationId !== "string" ||
+    requestedOrganizationId.trim() === ""
+  ) {
+    return negar("no_organization");
+  }
+
+  if (requestedOrganizationId !== resultado.principal.organizationId) {
     return negar("not_owner");
   }
 

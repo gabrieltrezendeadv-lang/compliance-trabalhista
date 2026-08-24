@@ -30,10 +30,22 @@ import type { BillingRepository } from "../core/repository";
 import { resolveBillingProvider } from "../registry";
 import { SupabaseBillingRepository } from "../repositories/supabase";
 import {
+  requireBillingMember,
+  requireBillingMemberFor,
   requireBillingOwner,
   requireBillingOwnerFor,
   type BillingAuthResult,
 } from "../authorization";
+import { cunharIntencao } from "./intencao";
+
+/**
+ * Papel mínimo de um comando.
+ *
+ * Duas categorias, e só duas: o billing não precisa saber a diferença entre
+ * colaborador e auditor — precisa saber se o ator pertence ao tenant e se
+ * administra a assinatura.
+ */
+export type PapelMinimo = "member" | "owner";
 
 export interface DependenciasDaFachada {
   /** A feature flag. Consultada ANTES de tudo, inclusive da sessão. */
@@ -41,10 +53,26 @@ export interface DependenciasDaFachada {
   /**
    * Resolve sessão, organização e papel NO SERVIDOR.
    *
-   * Recebe o identificador que o cliente afirmou — e ele nunca autoriza: é
-   * comparado com o que o servidor resolveu, e divergência é recusa.
+   * Recebe o PAPEL MÍNIMO exigido pelo comando e o identificador que o cliente
+   * afirmou. O identificador nunca autoriza: é comparado com o que o servidor
+   * resolveu, e divergência é recusa.
+   *
+   * O papel mínimo é do COMANDO, não do chamador: quem decide se `lerAcesso`
+   * aceita membro é a matriz da fachada, e ela chega aqui como argumento em vez
+   * de ficar implícita na escolha de qual função de autorização importar.
    */
-  readonly autorizar: (organizationIdPedido?: string) => Promise<BillingAuthResult>;
+  readonly autorizar: (
+    papelMinimo: PapelMinimo,
+    organizationIdPedido?: string
+  ) => Promise<BillingAuthResult>;
+  /**
+   * Cunha uma intenção de checkout.
+   *
+   * Fábrica injetada para que o teste controle a sequência e possa provar que
+   * um retry NÃO cunha nada — a diferença entre "reusou a intenção" e "sorteou
+   * outra igual por acaso" precisa ser observável.
+   */
+  readonly novaIntencao: () => string;
   /** Construído só quando a operação vai mesmo falar com o banco. */
   readonly repositorio: () => BillingRepository;
   /** Construído só quando a operação vai mesmo falar com o provider. */
@@ -99,10 +127,21 @@ const CONTA_DO_PROVIDER = "conta-unica";
 export function dependenciasDeProducao(): DependenciasDaFachada {
   return {
     flagLigada: isBillingEnabled,
-    autorizar: (organizationIdPedido) =>
-      organizationIdPedido === undefined
-        ? requireBillingOwner()
-        : requireBillingOwnerFor(organizationIdPedido),
+    autorizar: (papelMinimo, organizationIdPedido) => {
+      // Quatro combinações, escritas por extenso. Um seletor esperto aqui
+      // — objeto indexado, ternário aninhado — economizaria linhas e tornaria
+      // a matriz de autorização difícil de LER, que é a única coisa que ela
+      // precisa ser.
+      if (papelMinimo === "owner") {
+        return organizationIdPedido === undefined
+          ? requireBillingOwner()
+          : requireBillingOwnerFor(organizationIdPedido);
+      }
+      return organizationIdPedido === undefined
+        ? requireBillingMember()
+        : requireBillingMemberFor(organizationIdPedido);
+    },
+    novaIntencao: cunharIntencao,
     repositorio: () => new SupabaseBillingRepository(),
     provider: () => resolveBillingProvider(),
     clock: relogioDoSistema(),

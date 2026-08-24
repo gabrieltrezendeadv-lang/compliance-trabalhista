@@ -27,7 +27,7 @@ import type { BillingPeriod, PlanSlug, SubscriptionState, TierSlug } from "../pl
 import { addMonths, priceCents, prorationCents, selectTier } from "../plans/pricing";
 import { exigirVersaoVigente, TermsVersionMismatchError } from "../terms";
 import {
-  assertTenant,
+  assertTenantOwner,
   contexto,
   exigirAssinatura,
   type ComandoBase,
@@ -66,7 +66,7 @@ export async function startTrial(
   env: UseCaseEnv,
   input: StartTrialInput
 ): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredSubscription>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   if (input.cnpj.trim() === "") {
@@ -145,7 +145,7 @@ export async function updateBillingEmail(
   env: UseCaseEnv,
   input: UpdateBillingEmailInput
 ): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredSubscription>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const bruto = (input.billingEmail ?? "").trim();
@@ -175,7 +175,7 @@ export async function acceptTerms(
   env: UseCaseEnv,
   input: AcceptTermsInput
 ): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredSubscription>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const versao = conferirVersaoDosTermos(input.termsVersion);
@@ -196,7 +196,7 @@ export async function choosePlan(
   env: UseCaseEnv,
   input: ChoosePlanInput
 ): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredSubscription>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const atual = await exigirAssinatura(env);
@@ -240,7 +240,7 @@ export async function expireTrial(
   env: UseCaseEnv,
   input: ComandoBase = {}
 ): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredSubscription>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const atual = await exigirAssinatura(env);
@@ -286,7 +286,7 @@ export async function upgradeSubscription(
   env: UseCaseEnv,
   input: UpgradeInput
 ): Promise<Result<UpgradeResult>> {
-  const negado = assertTenant<UpgradeResult>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<UpgradeResult>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const atual = await exigirAssinatura(env);
@@ -357,7 +357,7 @@ export async function scheduleDowngradeUseCase(
   env: UseCaseEnv,
   input: DowngradeInput
 ): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredSubscription>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const atual = await exigirAssinatura(env);
@@ -387,7 +387,7 @@ export async function cancelAtPeriodEnd(
   env: UseCaseEnv,
   input: ComandoBase = {}
 ): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredSubscription>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const atual = await exigirAssinatura(env);
@@ -419,7 +419,7 @@ export async function renewSubscription(
   env: UseCaseEnv,
   input: ComandoBase = {}
 ): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredSubscription>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const atual = await exigirAssinatura(env);
@@ -474,7 +474,7 @@ export async function recordWorkerCount(
   env: UseCaseEnv,
   input: WorkerCountInput
 ): Promise<Result<StoredSubscription>> {
-  const negado = assertTenant<StoredSubscription>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredSubscription>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   if (!Number.isInteger(input.workerCount) || input.workerCount < 1) {
