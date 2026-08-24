@@ -75,6 +75,24 @@ const PRIMEIRO_PAR = 60;
 const ULTIMO_PAR = 99;
 let proximoPar = PRIMEIRO_PAR;
 
+/**
+ * Sequência GLOBAL dos identificadores externos do mock.
+ *
+ * ── POR QUE GLOBAL, E NÃO POR AMBIENTE ──────────────────────────────────────
+ *
+ * `billing.charges` tem `UNIQUE (provider, provider_account_id,
+ * external_charge_id)` — unicidade GLOBAL, não por tenant. A 12B a alargou de
+ * propósito: com escopo por organização, o mesmo identificador do mesmo
+ * provider podia existir em dois tenants, e um evento seria aplicado ao tenant
+ * errado.
+ *
+ * Um contador por ambiente fazia a organização A e a B receberem `chg_..._0001`
+ * as duas, e o `finalize` da segunda batia na restrição. Não era defeito do
+ * produto: era a restrição funcionando, e a fixture mentindo — um provider real
+ * cunha identificadores únicos no mundo, não por cliente.
+ */
+let sequenciaExterna = 0;
+
 const T0 = "2026-08-01T00:00:00.000Z";
 /** A mesma política que o SQL declara: `interval '5 minutes'`. */
 const LEASE_MS = 5 * 60_000;
@@ -207,7 +225,11 @@ if (!ATIVO) {
 
     const provider = new BillingProviderMock({
       ids: {
-        next: (p) => `${p}_${i}_${String(nProvider).padStart(4, "0")}`,
+        // Único no mundo, como o de um provider de verdade.
+        next: (p) => {
+          sequenciaExterna += 1;
+          return `${p}_${String(sequenciaExterna).padStart(6, "0")}`;
+        },
       },
       scenarios: opcoes.scenarios,
       env: { NODE_ENV: "test", VERCEL_ENV: "development" },
@@ -685,6 +707,11 @@ if (!ATIVO) {
       if (rA.ok && rB.ok) {
         expect(rB.value.replay).toBe(false);
         expect(rB.value.charge.id).not.toBe(rA.value.charge.id);
+        // E o identificador EXTERNO também difere. `charges_externo_unico` é
+        // global (`provider, provider_account_id, external_charge_id`), e é
+        // essa unicidade que impede um evento do provider de ser aplicado ao
+        // tenant errado.
+        expect(rB.value.charge.externalChargeId).not.toBe(rA.value.charge.externalChargeId);
       }
 
       expect(chaveDeIdempotencia("checkout", a.orgA, i1)).not.toBe(
