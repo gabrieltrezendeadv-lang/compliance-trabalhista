@@ -20,12 +20,22 @@ import {
   lerAcesso,
   lerAssinatura,
   lerCatalogo,
+  prepararIntencaoDeCheckout,
   registrarTrabalhadores,
 } from "@/lib/billing/facade";
 import { resolveBillingProvider } from "@/lib/billing/registry";
 import { TERMS_VERSION } from "@/lib/billing/terms";
 
-import { comTrial, montarBancada, ORG_B, ORG_FANTASMA } from "./harness";
+import { comIntencao, comTrial, montarBancada, ORG_B, ORG_FANTASMA } from "./harness";
+
+/**
+ * Intenção literal, no formato REAL que o servidor cunha.
+ *
+ * Usada onde o teste não exercita a preparação — a validação de forma é
+ * `.strict()` + regex, e um valor de fantasia faria o teste passar aqui e o
+ * caminho real reprovar.
+ */
+const INTENCAO_LITERAL = `ci_${"0".repeat(32)}`;
 
 const TRIAL_VALIDO = {
   plan: "essencial" as const,
@@ -48,10 +58,16 @@ const COMANDOS = [
   ["fazerUpgrade", fazerUpgrade, { plan: "completo" }],
   ["agendarDowngrade", agendarDowngrade, { plan: "essencial" }],
   ["cancelarNoFimDoPeriodo", cancelarNoFimDoPeriodo, {}],
+  ["prepararIntencaoDeCheckout", prepararIntencaoDeCheckout, {}],
   [
     "criarCheckout",
     criarCheckout,
-    { method: "pix", customerName: "Fulano", customerEmail: "f@e.com.br" },
+    {
+      checkoutIntentId: INTENCAO_LITERAL,
+      method: "pix",
+      customerName: "Fulano",
+      customerEmail: "f@e.com.br",
+    },
   ],
 ] as const;
 
@@ -287,22 +303,55 @@ describe("etapa 9 — o provider só é resolvido por quem precisa", () => {
     }
   });
 
-  it("o checkout pede o provider, e ANTES de a PII entrar no fluxo", async () => {
+  it("o checkout resolve UM provider, e nenhuma PII chega a ele antes disso", async () => {
     const b = montarBancada();
     await comTrial(b);
+    const intencao = await comIntencao(b);
     const r = await criarCheckout(
-      { method: "pix", customerName: "Fulano de Tal", customerEmail: "f@e.com.br" },
+      {
+        checkoutIntentId: intencao,
+        method: "pix",
+        customerName: "Fulano de Tal",
+        customerEmail: "f@e.com.br",
+      },
       b.deps
     );
     expect(r.ok).toBe(true);
     expect(b.vezesProvider()).toBe(1);
   });
 
+  it("provider RECUSADO: a PII não chega a ele, porque ele nem existe", async () => {
+    // A propriedade correta, e a que o comentário da fachada agora afirma: a
+    // entrada PODE ser validada antes — validar é o que impede pedido
+    // malformado de circular. O que não pode é PII ser ENVIADA a um provider
+    // ainda não resolvido. Com a fábrica falhando, `chamadasDoProvider` é a
+    // medida disso.
+    const b = montarBancada({ providerFalha: new Error("nao configurado") });
+    await comTrial(b);
+    const intencao = await comIntencao(b);
+    const r = await criarCheckout(
+      {
+        checkoutIntentId: intencao,
+        method: "pix",
+        customerName: "Fulano de Tal",
+        customerEmail: "pii@empresa.com.br",
+      },
+      b.deps
+    );
+    expect(r.ok).toBe(false);
+    expect(b.chamadasDoProvider()).toBe(0);
+  });
+
   it("provider não configurado vira `misconfigured`, sem detalhe", async () => {
     const b = montarBancada({ providerFalha: new Error("BILLING_PROVIDER ausente") });
     await comTrial(b);
     const r = await criarCheckout(
-      { method: "pix", customerName: "Fulano", customerEmail: "f@e.com.br" },
+      {
+        checkoutIntentId: INTENCAO_LITERAL,
+        method: "pix",
+        customerName: "Fulano",
+        customerEmail: "f@e.com.br",
+      },
       b.deps
     );
 
@@ -329,7 +378,12 @@ describe("etapa 9 — o provider só é resolvido por quem precisa", () => {
         }),
     };
     const r = await criarCheckout(
-      { method: "pix", customerName: "Fulano", customerEmail: "f@e.com.br" },
+      {
+        checkoutIntentId: INTENCAO_LITERAL,
+        method: "pix",
+        customerName: "Fulano",
+        customerEmail: "f@e.com.br",
+      },
       deps
     );
     expect(r.ok).toBe(false);
@@ -351,7 +405,12 @@ describe("etapa 9 — o provider só é resolvido por quem precisa", () => {
         }),
     };
     const r = await criarCheckout(
-      { method: "pix", customerName: "Fulano", customerEmail: "f@e.com.br" },
+      {
+        checkoutIntentId: INTENCAO_LITERAL,
+        method: "pix",
+        customerName: "Fulano",
+        customerEmail: "f@e.com.br",
+      },
       deps
     );
     expect(r.ok).toBe(false);

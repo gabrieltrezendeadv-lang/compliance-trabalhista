@@ -585,7 +585,7 @@ export function definirContrato(opcoes: ContratoOptions): void {
 
         const pedido = {
           method: "pix" as const,
-          idempotencyKey: "lease-uc",
+          checkoutIntentId: "lease-uc",
           customerName: "Contrato Lease",
           customerEmail: "lease@contrato.test",
         };

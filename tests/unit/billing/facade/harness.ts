@@ -18,7 +18,10 @@ import type { BillingAuthResult } from "@/lib/billing/authorization";
 import type { Clock, IdGenerator } from "@/lib/billing/core/ports";
 import type { BillingProviderPort } from "@/lib/billing/core/provider";
 import type { BillingRepository, CatalogPrice } from "@/lib/billing/core/repository";
-import type { DependenciasDaFachada } from "@/lib/billing/facade/dependencias";
+import type {
+  DependenciasDaFachada,
+  PapelMinimo,
+} from "@/lib/billing/facade/dependencias";
 import { BillingProviderMock } from "@/lib/billing/providers/mock/deterministic";
 import type { MockScenario } from "@/lib/billing/providers/mock/deterministic";
 
@@ -79,6 +82,13 @@ export interface BancadaOptions {
   readonly flagLigada?: boolean;
   /** Resultado da autorização. Padrão: owner de A. */
   readonly autorizacao?: BillingAuthResult;
+  /**
+   * Autorização como MEMBRO comum de A.
+   *
+   * Atalho declarativo: escrever o principal à mão em cada teste convidaria a
+   * um erro de digitação que passaria como `owner`.
+   */
+  readonly comoMembro?: boolean;
   /** Cenários do provider mock — injetados AQUI, nunca por entrada da fachada. */
   readonly scenarios?: readonly MockScenario[];
   /** Provider que falha ao ser construído (não configurado, proibido). */
@@ -103,7 +113,23 @@ export interface Bancada {
   chamadasDoProvider(): number;
   /** Chaves de idempotência que chegaram ao repositório, em ordem. */
   chavesUsadas(): readonly string[];
+  /** Papéis mínimos que a fachada exigiu, em ordem. */
+  papeisExigidos(): readonly PapelMinimo[];
+  /**
+   * Quantas intenções foram CUNHADAS.
+   *
+   * É o contador que separa "retry reusou a intenção" de "sorteou outra": sem
+   * ele, duas chamadas com a mesma chave seriam indistinguíveis de duas
+   * cunhagens que por acaso colidiram.
+   */
+  intencoesCunhadas(): number;
 }
+
+/** Principal de MEMBRO comum de A. O papel é o real, não `owner`. */
+export const AUTORIZACAO_DE_MEMBRO: BillingAuthResult = {
+  ok: true,
+  principal: { userId: COLAB_A, organizationId: ORG_A, role: "member" },
+};
 
 const AUTORIZACAO_PADRAO: BillingAuthResult = {
   ok: true,
@@ -128,7 +154,9 @@ export function montarBancada(opcoes: BancadaOptions = {}): Bancada {
   let nAuth = 0;
   let nProviderChamado = 0;
   const tenants: (string | undefined)[] = [];
+  const papeis: PapelMinimo[] = [];
   const chaves: string[] = [];
+  let nIntencao = 0;
 
   // O repositório é embrulhado para registrar as chaves de idempotência sem
   // alterar o dublê: a política de chave é da fachada, e é ela que se observa.
@@ -169,10 +197,18 @@ export function montarBancada(opcoes: BancadaOptions = {}): Bancada {
 
   const deps: DependenciasDaFachada = {
     flagLigada: () => opcoes.flagLigada ?? true,
-    autorizar: async (org) => {
+    autorizar: async (papelMinimo, org) => {
       nAuth += 1;
       tenants.push(org);
-      const base = opcoes.autorizacao ?? AUTORIZACAO_PADRAO;
+      papeis.push(papelMinimo);
+      const base =
+        opcoes.autorizacao ?? (opcoes.comoMembro ? AUTORIZACAO_DE_MEMBRO : AUTORIZACAO_PADRAO);
+      // Um resolvedor real que só sabe achar proprietário NÃO devolve membro:
+      // `requireBillingOwner` filtra por papel no banco. A bancada reproduz
+      // isso para que exigir `owner` de um membro recuse ANTES do repositório.
+      if (base.ok && papelMinimo === "owner" && base.principal.role !== "owner") {
+        return { ok: false, reason: "not_owner", message: "recusado" };
+      }
       // A bancada reproduz a comparação de tenant que
       // `requireBillingOwnerFor` faz no servidor: identificador divergente é
       // recusa, e nunca "usa o do servidor".
@@ -193,6 +229,13 @@ export function montarBancada(opcoes: BancadaOptions = {}): Bancada {
     clock: relogio,
     ids: idsDeTeste(),
     providerAccountId: "conta-de-teste",
+    novaIntencao: () => {
+      nIntencao += 1;
+      // Formato REAL (`ci_` + 32 hex): o schema do checkout valida a forma, e
+      // uma bancada que devolvesse "int-1" faria o teste passar aqui e o
+      // caminho de produção reprovar.
+      return `ci_${String(nIntencao).padStart(32, "0")}`;
+    },
   };
 
   return {
@@ -205,6 +248,8 @@ export function montarBancada(opcoes: BancadaOptions = {}): Bancada {
     tenantsAfirmados: () => tenants,
     chamadasDoProvider: () => nProviderChamado,
     chavesUsadas: () => chaves,
+    papeisExigidos: () => papeis,
+    intencoesCunhadas: () => nIntencao,
   };
 }
 
@@ -222,4 +267,17 @@ export async function comTrial(b: Bancada): Promise<void> {
     b.deps
   );
   if (!r.ok) throw new Error(`comTrial falhou: ${r.error.code} ${r.error.message}`);
+}
+
+/**
+ * Prepara uma intenção pelo caminho REAL da fachada.
+ *
+ * Deliberadamente NÃO devolve `deps.novaIntencao()` direto: o que os testes
+ * precisam exercitar é o comando, com flag, autorização e validação na frente.
+ */
+export async function comIntencao(b: Bancada): Promise<string> {
+  const { prepararIntencaoDeCheckout } = await import("@/lib/billing/facade");
+  const r = await prepararIntencaoDeCheckout({}, b.deps);
+  if (!r.ok) throw new Error(`intenção não preparada: ${r.error.code}`);
+  return r.value.checkoutIntentId;
 }

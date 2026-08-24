@@ -172,7 +172,7 @@ describe("upgrade", () => {
 
     const r = await createCheckout(b.env, {
       method: "pix",
-      idempotencyKey: "ck-ent",
+      checkoutIntentId: "ck-ent",
       customerName: "n",
       customerEmail: "e@t.local",
     });
@@ -312,7 +312,7 @@ describe("inadimplência", () => {
     await choosePlan(b.env, { plan: "essencial", period: "monthly" });
     const c = await createCheckout(b.env, {
       method: "pix",
-      idempotencyKey: "ck-1",
+      checkoutIntentId: "ck-1",
       customerName: "n",
       customerEmail: "e@t.local",
     });

@@ -294,7 +294,13 @@ jobs:
           # própria, chega ao banco — e foi esse o buraco que deixou passar, na
           # 12B, um repositório que nunca havia executado.
           #
-          # Faixa de fixtures DISJUNTA (60–79) da do contrato (0–59).
+          # Faixa de fixtures DISJUNTA (60–99) da do contrato (0–59).
+          #
+          # Desde a correção da 12C.2 esta suíte exercita o CHECKOUT COMPLETO —
+          # `claimIdempotency` e `finalizeCheckout` contra o banco real, com o
+          # `BillingProviderMock` no lugar do Asaas. Antes ela parava nas
+          # leituras, e as duas RPCs de maior consequência financeira nunca
+          # haviam executado por este caminho.
           echo "===== FACHADA CONTRA POSTGREST REAL ====="
           npx --no-install vitest run --project contract \
             --no-file-parallelism --reporter=verbose \
