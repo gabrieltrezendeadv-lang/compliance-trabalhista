@@ -2,23 +2,25 @@
 
 > **Nada foi publicado.** Não há página, rota, server action, webhook ou item de
 > menu que alcance esta camada — e `FC-10`/`FC-11` reprovam se aparecer.
-> Billing continua **desligado**; o Asaas continua **não implementado**.
+> Billing continua **desligado**; o Asaas continua **não implementado** e
+> reservado à 12D.
 >
-> **Zero migration nova.** As 18 RPCs da 12B/12C.1 bastaram, e a §6 abaixo
-> demonstra nominalmente por quê.
+> **Zero migration nova.** As 18 RPCs da 12B/12C.1 bastaram, e a §7 abaixo
+> demonstra nominalmente por quê — inclusive para a troca do formato de digest.
 >
-> **Estado de produção:** ledger remoto em **41**, sem pendência.
+> **Estado de produção:** ledger remoto em **41**, produção em **41/41**, sem
+> migration pendente. A 12C.3 não foi iniciada.
 
 ## 1. O que esta etapa entrega
 
 Uma camada `src/lib/billing/facade/` entre o futuro frontend e os casos de uso,
-com doze comandos:
+com treze comandos e uma matriz de papéis explícita:
 
-| Comando | Autorização | Provider? | Caso de uso |
+| Comando | Papel mínimo | Provider? | Caso de uso |
 | --- | --- | --- | --- |
-| `lerCatalogo` | owner | não | `repo.readCatalog` |
-| `lerAssinatura` | owner | não | `repo.readState` |
-| `lerAcesso` | owner | não | `resolveBillingAccess` |
+| `lerCatalogo` | **membro** | não | `readCatalogUseCase` |
+| `lerAcesso` | **membro** | não | `resolveBillingAccess` |
+| `lerAssinatura` | owner | não | `readSubscriptionState` |
 | `iniciarTrial` | owner | não | `startTrial` |
 | `atualizarEmailFinanceiro` | owner | não | `updateBillingEmail` |
 | `aceitarTermos` | owner | não | `acceptTerms` |
@@ -27,6 +29,7 @@ com doze comandos:
 | `fazerUpgrade` | owner | não | `upgradeSubscription` |
 | `agendarDowngrade` | owner | não | `scheduleDowngradeUseCase` |
 | `cancelarNoFimDoPeriodo` | owner | não | `cancelAtPeriodEnd` |
+| `prepararIntencaoDeCheckout` | owner | não | — (comando puro) |
 | `criarCheckout` | owner | **sim** | `createCheckout` |
 
 Cortesia, grandfathering e webhook **não** entram: são operações
@@ -38,7 +41,7 @@ convidaria a 12C.3 a criar tela para elas. `FC-18` reprova se aparecerem.
 Os casos de uso recebem `UseCaseEnv` já montado. Alguém precisa montá-lo, e esse
 alguém decide tudo o que importa: se a flag foi consultada, se a sessão foi
 resolvida no servidor, se o `organizationId` do cliente foi comparado ou
-obedecido, se o provider foi construído antes ou depois de a PII entrar em jogo.
+obedecido, qual papel cada comando exige, se o provider foi construído.
 
 Sem esta camada, cada server action da 12C.3 montaria o ambiente por conta
 própria e a ordem de segurança viraria convenção — repetida em N lugares,
@@ -51,19 +54,58 @@ linhas de `executarComando`.
 | --- | --- | --- |
 | 1–2 | flag, e `billing_disabled` | billing desligado **não faz I/O**: nem banco, nem provider, nem sessão |
 | 3–4 | sessão, organização e papel | do servidor, nunca recebidos |
-| 5 | owner | comandos comerciais exigem proprietário |
+| 5 | papel mínimo | declarado **por comando**; ver §4 |
 | 6 | comparação de tenant | o identificador do cliente é **comparado**, jamais obedecido |
 | 7 | validação | **depois** da autorização: quem não está autorizado não aprende quais campos existem |
-| 8 | contexto confiável | ator, organização, origem, relógio e correlação, do servidor |
+| 8 | contexto confiável | ator, organização, **papel real**, origem, relógio e correlação, do servidor |
 | 9 | provider | só quando a operação precisa — só o checkout precisa |
-| 10 | um caso de uso | exatamente um; a fachada não orquestra dois efeitos |
+| 10 | um caso de uso | exatamente um, **sem exceção**; ver §6 |
 | 11 | tradução | `Result` vira `FacadeResult`, com mensagem escrita à mão |
 
 As três primeiras propriedades não são afirmadas: são **medidas**.
 `repositorio` e `provider` são fábricas instrumentadas na bancada, e cada teste
 verifica que a contagem é zero quando deve ser.
 
-## 4. Campos que nunca vêm do chamador
+**Sobre a etapa 9 e a PII.** A validação (etapa 7) processa a entrada antes,
+inclusive nome e e-mail do pagador — e isso é correto, porque validar é o que
+impede um pedido malformado de circular. A propriedade que vale, e que
+`ordem-de-seguranca.spec.ts` mede, é outra: **nenhuma PII é enviada ao provider
+antes de ele ser resolvido e validado**, e **nenhum provider é resolvido fora do
+checkout**.
+
+## 4. Membro e proprietário — o critério, e por que não é "leitura × escrita"
+
+A decisão comercial aprovada diz que **somente o proprietário contrata, altera
+ou cancela**. Ela não diz que somente o proprietário pode consultar o que a
+organização tem direito de usar — e tratar as duas coisas como uma só barraria
+o colaborador de módulos que a organização pagou.
+
+O critério é **o que a resposta carrega**:
+
+* `lerCatalogo` devolve a tabela de preços publicada — a mesma que estará na
+  página pública de planos. Nada diz sobre o contrato desta organização.
+* `lerAcesso` devolve direitos e o motivo deles. Não devolve CNPJ, contato
+  financeiro, preço praticado nem identificador externo.
+* `lerAssinatura` devolve o **dossiê comercial inteiro**. É de proprietário, e
+  continua sendo.
+
+O banco nunca impôs a restrição antiga: `fn_billing_read_state` e
+`fn_billing_read_catalog` chamam `fn_require_member(..., false)`. A porta estava
+fechada só na aplicação.
+
+**A ampliação é medida nos dois sentidos.** `tests/unit/billing/facade/autorizacao.spec.ts`
+prova, comando a comando, o que membro **faz** e o que membro **não faz** — e a
+segunda metade sem a primeira aprovaria a fachada travada que estamos
+corrigindo, enquanto a primeira sem a segunda aprovaria uma que liberou tudo.
+`FC-19` fixa a matriz por extenso e reprova qualquer rebaixamento; `MUT-FC-33`
+a `MUT-FC-34g` provam que a guarda morde nas duas direções.
+
+Duas propriedades **não** foram afrouxadas junto: membro de A continua sem
+alcançar B, e tenant alheio continua indistinguível de tenant inexistente.
+`requireBillingMemberFor` compara o identificador afirmado exatamente como
+`requireBillingOwnerFor`, e `BF-27` cobra as duas.
+
+## 5. Campos que nunca vêm do chamador
 
 Todo schema é `.strict()`: campo a mais é **erro**, não campo ignorado. É a
 diferença entre "o servidor ignorou `actorId`" e "o servidor recusou o pedido
@@ -72,75 +114,204 @@ que trazia `actorId`" — e só a segunda aparece quando alguém tenta.
 `CAMPOS_PROIBIDOS` lista os 24 nomes; `FC-08` lê a lista do próprio arquivo e
 confere que nenhum schema os declara.
 
-Duas exceções, ambas declaradas:
+Três exceções, todas declaradas, e nenhuma delas decide:
 
 * `organizationId` — aceito e **comparado**; nunca autoriza;
 * `termsVersion` — a versão que a tela exibiu, comparada com `TERMS_VERSION`
-  antes de qualquer efeito. O que se persiste é a constante.
+  antes de qualquer efeito. O que se persiste é a constante;
+* `checkoutIntentId` — cunhado pelo servidor e devolvido ao chamador, que o
+  repete nos retries. Ver §6.
 
 O instante do aceite não é aceito em forma alguma: vem do `Clock` injetado.
 
-## 5. Política de idempotência do checkout
+## 6. A intenção de checkout — retry técnico × nova tentativa comercial
 
-A chave é **derivada no servidor**, nunca recebida:
+### O defeito que isto corrige
 
-```
-chave = idem_checkout_ + FNV1a(op=checkout & org=<resolvida> & inicio=<período> & fim=<período>)
-```
+A primeira versão derivava a chave de idempotência de
+`(operação, organização, PERÍODO)`. Os três são invariantes dentro de um ciclo,
+então **a chave era a mesma para todas as tentativas do período**. Medido contra
+o banco real:
 
-| Requisito | Como é cumprido |
+* PIX recusado, ou expirado sem pagamento? Tentar cartão devolvia
+  `fingerprint_conflict`. **Para sempre** — `fn_billing_claim_idempotency`
+  compara o fingerprint *antes* de olhar o status
+  (`20260802093000_billing_orchestration.sql:1048`), então nem o estado `failed`
+  liberava a segunda tentativa.
+* Cobrança concluída e não paga? Toda nova tentativa era `replay` da cobrança
+  morta.
+
+A organização ficava presa a **uma cobrança por ciclo**, sem caminho de saída. E
+havia um teste afirmando que o travamento era o comportamento correto. Ele foi
+**removido**, e `FC-17` reprova se voltar.
+
+### O conceito que faltava
+
+A chave respondia "que período é este?". A pergunta certa é "que **tentativa
+comercial** é esta?" — e um mesmo período comporta várias tentativas legítimas.
+
+| | |
 | --- | --- |
-| opaca, não autoriza | é um hash; toda RPC revalida ator e organização no banco |
-| ligada a organização, operação e fingerprint | a chave cobre organização + operação + período; o **fingerprint**, calculado por `createCheckout`, cobre o pedido inteiro |
-| retry reutiliza a mesma chave | nada é sorteado, nada depende de relógio, nada mora em memória |
-| payload diferente = conflito | mesma chave, fingerprint diferente → `fingerprint_conflict` |
-| cliente não escolhe nada | o schema é `.strict()` e não declara `idempotencyKey` |
-| nenhuma ausência gera chave nova | não há ramo "se não veio, invente"; sem assinatura, não há checkout |
+| **Retry técnico** | mesma intenção. Refresh, timeout, reenvio. Devolve o **mesmo** resultado — nunca uma segunda cobrança. |
+| **Nova tentativa comercial** | intenção nova, pedida deliberadamente. Trocar de meio, recomeçar após recusa. Chave nova, cobrança nova. |
 
-**A divisão entre chave e fingerprint é o ponto.** Se a chave também cobrisse o
-meio de pagamento, trocar de PIX para cartão geraria uma cobrança nova em vez de
-conflito — e o conflito é justamente o que a idempotência existe para produzir.
+A diferença é uma **decisão de quem chama**, e por isso é explícita no protocolo
+em vez de inferida de relógio ou de estado.
 
-**A corrida que sobra falha fechada:** se o período mudar entre a leitura que
-deriva a chave e a que `createCheckout` faz, a chave é a do período antigo e o
-fingerprint é o do novo → `fingerprint_conflict`. Uma recusa, não uma cobrança
-errada.
+### O identificador
 
-## 6. Persistência: por que zero migration
+`ci_` + 32 hex, **128 bits** de `crypto.getRandomValues`, cunhado por
+`prepararIntencaoDeCheckout` (owner, sem I/O algum) e injetado como dependência
+para que os testes contem as cunhagens.
 
-Cada comando mapeia para uma RPC existente, e nenhum precisou de operação nova:
+Ele **não autoriza nada**: ator, tenant, papel, preço, período e fingerprint
+continuam resolvidos pelo servidor a cada chamada, e toda RPC revalida o membro
+no banco antes de olhar a chave. Não é a chave, tampouco — quem deriva é
+`chaveDeIdempotencia(operação, organização RESOLVIDA, intenção)`, dentro do caso
+de uso. Nem o cliente nem a fachada calculam a chave.
+
+É **obrigatório** no `criarCheckout`, e não opcional: um campo opcional
+convidaria o ramo "se não veio, invente", e inventar em silêncio faria cada
+retry técnico virar cobrança nova — o defeito oposto ao antigo e igualmente
+grave. `FC-14` e `MUT-FC-25b` cobram isso.
+
+### O que a 12C.3 terá de honrar
+
+1. chamar `prepararIntencaoDeCheckout` e guardar o identificador com o
+   formulário;
+2. repetir o **mesmo** identificador em todo reenvio técnico;
+3. pedir uma intenção **nova** apenas por ação deliberada do usuário.
+
+O passo 2 é o único que a fachada não impõe sozinha — preservar o identificador
+entre refresh e timeout é de quem tem estado de tela. O contrato existe para que
+isso seja obrigação **nomeada** da 12C.3, e não descoberta tardia.
+
+### Por que não há tabela de intenções
+
+Persistir não compraria nada: a intenção não autoriza, então não há o que
+revogar; quem pode inventar um identificador **já é proprietário do tenant** e já
+pode pedir quantas intenções quiser — inventar uma equivale a clicar "tentar de
+novo", faculdade que ele tem; e o efeito é governado por
+`billing.idempotency_records`, que já é persistida, atômica e escopada por
+`UNIQUE (organization_id, scope, provider, key)`. O formato é validado para que
+a entrada continue fechada.
+
+## 7. Persistência: por que zero migration, inclusive para o digest
+
+Cada comando mapeia para uma RPC existente:
 
 * as leituras usam `fn_billing_read_state` / `fn_billing_read_catalog`;
 * o ciclo de vida usa `start_trial`, `change_plan`, `schedule_downgrade`,
   `cancel_at_period_end`, `record_worker_count`;
-* os metadados contratuais usam `update_billing_email` e `accept_terms`, criadas
-  na 12C.1 exatamente para isto;
-* o checkout usa `claim_idempotency` + `finalize_checkout`, que já são uma
-  transação cada.
+* os metadados contratuais usam `update_billing_email` e `accept_terms`;
+* o checkout usa `claim_idempotency` + `finalize_checkout`.
 
-A única operação que a fachada acrescenta é a **derivação da chave**, e ela é
-puro cálculo — não persiste nada. `FC-13` reprova migration nova, acesso direto
-a tabela, `.schema("billing")`, `check_plan_limit` e qualquer menção às cinco
-tabelas legadas.
+`prepararIntencaoDeCheckout` não persiste nada, e a derivação da chave é puro
+cálculo.
 
-## 7. Limites declarados, e não exercitados
+### O diagnóstico da troca de formato do digest
 
-* **Leitura por membro comum não é oferecida.** `BillingAuthContext.role` é o
-  literal `"owner"` e `assertTenant` recusa qualquer outro papel. O banco
-  permite que um membro leia o próprio estado (`fn_billing_read_state` não exige
-  owner), mas ampliar isso é decisão de domínio, não de fachada.
-* **Sessão real não é exercitada nos testes.** `requireBillingOwner` lê a sessão
-  do Supabase e já tem cobertura própria; na fachada ela entra por injeção. O
-  que se prova aqui é tudo o que vem depois.
-* **O checkout não é exercitado contra o PostgREST.** A suíte de contrato da
-  fachada cobre leitura, trial, IDOR e metadados; o checkout depende do provider
-  e é coberto pela suíte de unidade com o mock. Fechar isso exigiria semear
-  cobrança na stack descartável — trabalho da 12D, com o Asaas.
+Trocar FNV-1a de 32 bits por SHA-256 **muda o valor** de todo fingerprint e de
+toda chave. Se houvesse operação persistida, um replay legítimo passaria a
+calcular um fingerprint diferente e receberia `fingerprint_conflict` — e a
+correção exigiria migração de dados.
+
+Não há. A demonstração, sem tocar em produção:
+
+* a feature flag `BILLING_ENABLED` **nunca foi definida** em ambiente algum, e
+  `isBillingEnabled()` só liga com a string exata `"true"`;
+* nenhuma página, rota, server action ou webhook alcança as RPCs — a 12C.0
+  aposentou o runtime legado e `/api/webhooks/billing` deixou de ter handler
+  próprio; `FC-10`/`FC-11` reprovam qualquer consumidor novo;
+* portanto `billing.idempotency_records` e `billing.charges` estão **vazias** em
+  produção, e nenhum fingerprint foi persistido por caminho algum.
+
+As únicas linhas que já existiram sob o formato antigo são fixtures da stack
+descartável, semeadas e derrubadas a cada execução do CI.
+
+**Conclusão: nenhuma migração de dados é necessária, e nenhum SQL foi criado.**
+O prefixo de geração (`fp1_`, `idem1_`) existe justamente para que uma troca
+futura — se um dia houver dado persistido — seja legível na linha do banco em
+vez de virar um conflito inexplicado.
+
+## 8. O digest, e por que 32 bits não serviam
+
+`fingerprintDe` e `chaveDeIdempotencia` decidem se dois pedidos de **cobrança**
+são o mesmo. FNV-1a de 32 bits dá 4.294.967.296 valores; pelo paradoxo do
+aniversário, algumas dezenas de milhares de identidades já colidem com
+probabilidade apreciável, e a consequência aqui não é cache errado — é checkout
+legítimo recusado, ou dois pedidos distintos tomados por um.
+
+`core/digest.ts` traz SHA-256 com prefixo de tipo e geração. E traz também uma
+canonicalização **injetiva**: a antiga unia `chave=valor` por `&`, e
+`{a: "x&b=y"}` produzia a mesma string que `{a: "x", b: "y"}`. Nenhum campo do
+billing contém `&` hoje — mas "hoje" não é uma propriedade, e um nome de pagador
+bastaria. Agora nome e valor vão prefixados pelo próprio comprimento.
+
+## 9. Uma leitura, um caso de uso
+
+A primeira versão lia `readState` **na fachada** para descobrir o período,
+derivava a chave dele, decidia `not_found` por conta própria e só então chamava
+`createCheckout` — que lia o estado de novo. Duas leituras independentes, TOCTOU
+entre derivar a chave e reservá-la, e a regra "sem assinatura não há checkout"
+escrita em duas camadas.
+
+Agora a fachada não lê nada: `FC-20` reprova qualquer `env.repo.*` nela, qualquer
+`fail(` e qualquer `"not_found"`. A chave deriva da intenção, que não vem do
+banco — então **a janela de corrida desaparece em vez de ser mitigada**. E as
+consultas que acessavam o repositório direto ganharam casos de uso próprios em
+`usecases/queries.ts`, de modo que "um comando → um caso de uso" passou a valer
+para os treze, e não para nove.
+
+## 10. O checkout contra o PostgREST real
+
+A versão anterior pulava o checkout no contrato da fachada, alegando que ele
+"depende do provider e fica para a 12D". A alegação não se sustentava: o checkout
+depende do `BillingProviderMock`, que é código local sem rede. O que ficava sem
+prova eram `claimIdempotency` e `finalizeCheckout` — as RPCs com lease, takeover
+e conflito de fingerprint, isto é, as de maior consequência financeira.
+
+`tests/contract/facade-postgrest.spec.ts` agora roda a fachada com
+`SupabaseBillingRepository` real, PostgREST local, `BillingProviderMock`, stack
+descartável e zero rede externa, cobrindo:
+
+checkout aprovado (uma cobrança, um snapshot, auditoria com a chave derivada) ·
+replay · provider não retocado depois da conclusão · payload diferente sob a
+mesma intenção · nova intenção · PIX recusado seguido de cartão · recusa
+determinística liberando repetição · indisponibilidade ambígua preservando
+`in_progress` · retomada após lease com o mesmo recurso externo · falha de
+`finalize` sem duplicar · plano trocado no meio · isolamento entre organizações ·
+IDOR no checkout · leitura por membro e seu limite.
+
+`FC-17b` exige cada um desses casos **nominalmente** e reprova qualquer `skip`
+ou `only`; o passo do CI reprova se a suíte for pulada lá; e `MUT-FC-36` a
+`MUT-FC-37b` provam que essas guardas mordem.
+
+A faixa de fixtures foi de 60–79 para **60–99**, disjunta da do contrato do
+repositório (0–59), e a suíte aborta nominalmente ao esgotá-la em vez de
+reciclar organização.
+
+**Um cenário novo teve de ser criado no mock.** `payments.ts` divide as falhas do
+provider em ambíguas e determinísticas e trata cada uma de um jeito — mas nenhum
+cenário do roteiro produzia um código determinístico, e o ramo `failed` de
+`talvezMarcarFalha` estava **inalcançável por teste**. O cenário `rejected`
+fecha isso.
+
+A 12D permanece reservada ao **adaptador Asaas** e ao sandbox externo.
+
+## 11. Limites ainda não exercitados
+
+* **Sessão real não é exercitada nos testes.** `requireBillingOwner` e
+  `requireBillingMember` leem a sessão do Supabase e têm cobertura própria; na
+  fachada elas entram por injeção. O que se prova aqui é tudo o que vem depois.
 * **Nenhuma medição de concorrência real na fachada.** Duas requisições
-  simultâneas derivando a mesma chave são resolvidas pelo `claim`, cuja corrida
-  já é provada por `scripts/ci/assert-billing-concurrency.sh` com duas conexões.
+  simultâneas sob a mesma intenção são resolvidas pelo `claim`, cuja corrida já
+  é provada por `scripts/ci/assert-billing-concurrency.sh` com duas conexões.
+* **O pagamento efetivo não é exercitado ponta a ponta.** `simulatePayment` e o
+  webhook têm cobertura própria, mas nenhum teste da fachada leva uma cobrança
+  de criada a paga: a fachada não expõe webhook, por decisão da §1.
 
-## 8. O que esta etapa deliberadamente NÃO faz
+## 12. O que esta etapa deliberadamente NÃO faz
 
 Não cria página, rota, server action, webhook, middleware ou item de menu. Não
 altera `/dashboard/billing`, que continua sendo o `redirect` da 12C.0. Não
@@ -148,4 +319,6 @@ publica preço, não cria checkout acessível, não habilita a feature flag, nã
 cria variável na Vercel e não chama o Asaas.
 
 A 12C.3 criará os wrappers públicos e a interface — e encontrará a ordem de
-segurança já escrita, medida e vigiada.
+segurança já escrita, medida e vigiada, a matriz de papéis pronta para o
+enforcement de entitlements, e o contrato da intenção esperando para ser
+honrado.
