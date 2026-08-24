@@ -82,6 +82,11 @@ import type {
 } from "../core/repository";
 import { TERMS_VERSION } from "../terms";
 import { resolveBillingAccess, type AccessDecision } from "../usecases/access";
+import {
+  prepareCheckoutIntent,
+  type CheckoutIntentEnv,
+  type PreparedCheckoutIntent,
+} from "../usecases/checkout-intent";
 import { createCheckout, type CheckoutResult } from "../usecases/payments";
 import { readCatalogUseCase, readSubscriptionState } from "../usecases/queries";
 import type { UseCaseEnv } from "../usecases/shared";
@@ -114,7 +119,12 @@ import {
   RegistrarTrabalhadoresSchema,
   UpgradeSchema,
 } from "./entrada";
-import { recusaPadrao, sucesso, traduzir, type FacadeResult } from "./resultado";
+import {
+  recusaPadrao,
+  traduzir,
+  type FacadeErrorCode,
+  type FacadeResult,
+} from "./resultado";
 
 /** Origem de tudo o que a fachada faz: pedido do proprietário. */
 const ORIGEM: Extract<BillingActionOrigin, "owner"> = "owner";
@@ -185,21 +195,68 @@ const PROVIDER_NAO_USADO = new Proxy({} as UseCaseEnv["provider"], {
 });
 
 /** Erro de autorização traduzido para o vocabulário da fachada. */
-function traduzirNegacao<T>(r: Extract<BillingAuthResult, { ok: false }>): FacadeResult<T> {
+function codigoDaNegacao(r: Extract<BillingAuthResult, { ok: false }>): FacadeErrorCode {
   switch (r.reason) {
     case "not_authenticated":
-      return recusaPadrao("unauthenticated");
+      return "unauthenticated";
     case "verification_failed":
-      return recusaPadrao("repository_unavailable");
+      return "repository_unavailable";
     // `no_organization` e `not_owner` convergem: distingui-los diria a quem
     // varre identificadores que a organização existe.
     default:
-      return recusaPadrao("not_owner");
+      return "not_owner";
   }
 }
 
 /**
- * As onze etapas, uma vez só.
+ * AS ETAPAS 1 A 7, UMA VEZ SÓ E PARA OS DOIS EXECUTORES.
+ *
+ * ── POR QUE ISTO FOI EXTRAÍDO ───────────────────────────────────────────────
+ *
+ * Existem dois executores: um para comandos que precisam de repositório e/ou
+ * provider, outro para comandos PUROS. A tentação é escrever a ordem de
+ * segurança duas vezes e proteger a coerência com um comentário.
+ *
+ * Comentário não é imposição. Com a ordem aqui, "flag antes de sessão, sessão
+ * antes de validação" é uma propriedade de UMA função — e mudar a ordem para um
+ * executor muda para os dois, que é exatamente o que se quer.
+ */
+type Preflight<TEntrada> =
+  | { readonly ok: false; readonly code: FacadeErrorCode }
+  | {
+      readonly ok: true;
+      readonly principal: { userId: string; organizationId: string; role: "owner" | "member" };
+      readonly entrada: TEntrada;
+    };
+
+async function preflight<TEntrada>(
+  deps: DependenciasDaFachada,
+  papelMinimo: PapelMinimo,
+  schema: ComEntrada,
+  bruto: unknown
+): Promise<Preflight<TEntrada>> {
+  // 1–2. A FLAG, ANTES DE TUDO. Nenhum I/O de billing acontece com billing
+  //      desligado — e nem a sessão é resolvida.
+  if (!deps.flagLigada()) return { ok: false, code: "billing_disabled" };
+
+  // 3–6. Sessão, organização, papel e comparação de tenant, no servidor.
+  const autorizacao = await deps.autorizar(papelMinimo, tenantAfirmado(bruto));
+  if (!autorizacao.ok) return { ok: false, code: codigoDaNegacao(autorizacao) };
+
+  // 7. Validação, só depois de autorizado: quem não está autorizado não
+  //    aprende quais campos existem nem quais formatos passam.
+  const parsed = schema.safeParse(bruto);
+  if (!parsed.success) return { ok: false, code: "invalid_input" };
+
+  return {
+    ok: true,
+    principal: autorizacao.principal,
+    entrada: parsed.data as TEntrada,
+  };
+}
+
+/**
+ * Comandos que falam com repositório e, quando preciso, com o provider.
  *
  * `papelMinimo` e `precisaDeProvider` são explícitos e não inferidos: inferir
  * levaria a "exige owner sempre, por garantia" e a "resolve provider sempre,
@@ -214,16 +271,8 @@ async function executarComando<TEntrada, TSaida>(
   executar: (env: UseCaseEnv, entrada: TEntrada) => Promise<Result<TSaida>>,
   precisaDeProvider = false
 ): Promise<FacadeResult<TSaida>> {
-  // 1–2. A FLAG, ANTES DE TUDO. Nenhum I/O acontece com billing desligado.
-  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
-
-  // 3–6. Sessão, organização, papel e comparação de tenant, no servidor.
-  const autorizacao = await deps.autorizar(papelMinimo, tenantAfirmado(bruto));
-  if (!autorizacao.ok) return traduzirNegacao<TSaida>(autorizacao);
-
-  // 7. Validação, só depois de autorizado.
-  const parsed = schema.safeParse(bruto);
-  if (!parsed.success) return recusaPadrao("invalid_input");
+  const antes = await preflight<TEntrada>(deps, papelMinimo, schema, bruto);
+  if (!antes.ok) return recusaPadrao(antes.code);
 
   // 9. Provider só para quem precisa.
   //
@@ -244,12 +293,54 @@ async function executarComando<TEntrada, TSaida>(
   }
 
   // 8. Contexto confiável.
-  const env = montarEnv(deps, autorizacao.principal, provider);
+  const env = montarEnv(deps, antes.principal, provider);
 
   // 10–11. Exatamente um caso de uso, e a tradução do `Result`.
-  const r = await executar(env, parsed.data as TEntrada);
+  const r = await executar(env, antes.entrada);
   return traduzir(r);
 }
+
+/**
+ * Comandos PUROS — mesma ordem de segurança, sem repositório e sem provider.
+ *
+ * ── O QUE "PURO" QUER DIZER AQUI, COM PRECISÃO ──────────────────────────────
+ *
+ * Zero I/O de BILLING: nenhum `BillingRepository` e nenhum provider são
+ * construídos. Permanece o I/O necessário à AUTENTICAÇÃO e à AUTORIZAÇÃO — a
+ * sessão e a membership são consultadas na etapa 3–6, como em todo comando.
+ *
+ * Dizer "zero I/O" sem qualificar seria falso, e falso de um jeito perigoso:
+ * sugeriria que este caminho não toca o banco, quando ele toca
+ * `organization_members` para saber quem está chamando.
+ *
+ * O ambiente entregue ao caso de uso NÃO tem `repo` nem `provider` — não por
+ * disciplina, mas porque o tipo não os declara.
+ */
+async function executarComandoPuro<TEntrada, TSaida>(
+  deps: DependenciasDaFachada,
+  papelMinimo: PapelMinimo,
+  schema: ComEntrada,
+  bruto: unknown,
+  executar: (env: CheckoutIntentEnv, entrada: TEntrada) => Promise<Result<TSaida>>
+): Promise<FacadeResult<TSaida>> {
+  const antes = await preflight<TEntrada>(deps, papelMinimo, schema, bruto);
+  if (!antes.ok) return recusaPadrao(antes.code);
+
+  // 8. Contexto confiável — o mínimo, e nada além.
+  const env: CheckoutIntentEnv = {
+    auth: {
+      userId: antes.principal.userId,
+      organizationId: antes.principal.organizationId,
+      role: antes.principal.role,
+    },
+    novaIntencao: deps.novaIntencao,
+  };
+
+  // 10–11.
+  const r = await executar(env, antes.entrada);
+  return traduzir(r);
+}
+
 
 // ─── Consultas ──────────────────────────────────────────────────────────────
 
@@ -468,11 +559,6 @@ export function cancelarNoFimDoPeriodo(
 
 // ─── Checkout ───────────────────────────────────────────────────────────────
 
-/** O que `prepararIntencaoDeCheckout` devolve. Nada além do identificador. */
-export interface IntencaoPreparada {
-  readonly checkoutIntentId: string;
-}
-
 /**
  * Prepara uma INTENÇÃO de checkout e devolve o identificador opaco.
  *
@@ -484,30 +570,24 @@ export interface IntencaoPreparada {
  * que permite ao retry técnico repetir o identificador e à nova tentativa
  * comercial pedir outro.
  *
- * Exige proprietário: preparar-se para cobrar é ato de quem contrata.
+ * Exige proprietário, e a exigência mora no caso de uso `prepareCheckoutIntent`
+ * — como a de todos os outros comandos.
  *
- * Nenhum efeito e nenhum I/O de billing além da autorização — nem repositório,
- * nem provider. É um comando puro que devolve entropia com autorização na
- * frente, e por isso não passa por `executarComando`: não há caso de uso, não
- * há env a montar, e forçá-lo a existir só para caber no molde criaria um
- * repositório que ninguém usaria.
+ * **Zero I/O de billing:** nenhum `BillingRepository` e nenhum provider são
+ * construídos. Permanece apenas o I/O necessário à autenticação e à
+ * autorização, que é o mesmo de qualquer comando.
  */
-export async function prepararIntencaoDeCheckout(
+export function prepararIntencaoDeCheckout(
   bruto: unknown,
   deps: DependenciasDaFachada = dependenciasDeProducao()
-): Promise<FacadeResult<IntencaoPreparada>> {
-  // 1–2. A flag, antes de tudo — mesma primeira etapa dos demais comandos.
-  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
-
-  // 3–6. Sessão, organização, papel e comparação de tenant, no servidor.
-  const autorizacao = await deps.autorizar("owner", tenantAfirmado(bruto));
-  if (!autorizacao.ok) return traduzirNegacao<IntencaoPreparada>(autorizacao);
-
-  // 7. Validação, depois da autorização.
-  const parsed = PrepararIntencaoSchema.safeParse(bruto);
-  if (!parsed.success) return recusaPadrao("invalid_input");
-
-  return sucesso({ checkoutIntentId: deps.novaIntencao() });
+): Promise<FacadeResult<PreparedCheckoutIntent>> {
+  return executarComandoPuro<{ organizationId?: string }, PreparedCheckoutIntent>(
+    deps,
+    "owner",
+    PrepararIntencaoSchema,
+    bruto,
+    (env, e) => prepareCheckoutIntent(env, { requestedOrganizationId: e.organizationId })
+  );
 }
 
 /**

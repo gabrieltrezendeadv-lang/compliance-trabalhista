@@ -48,6 +48,9 @@ import {
   contexto,
   exigirAssinatura,
   fingerprintDe,
+  normalizarCnpj,
+  normalizarEmail,
+  normalizarNome,
   type ComandoBase,
   type UseCaseEnv,
 } from "./shared";
@@ -110,8 +113,28 @@ export async function createCheckout(
     return fail("invalid_state", "faixa Enterprise não tem checkout automático");
   }
 
-  // 2. FINGERPRINT — fixado ANTES do claim, a partir do pedido inteiro. Mudar
-  //    qualquer campo muda o fingerprint, e a mesma chave passa a conflitar.
+  // ── 2. O PEDIDO, NORMALIZADO UMA VEZ ────────────────────────────────────
+  //
+  // Estes três valores vão ao PROVIDER e, por isso, ao fingerprint. A versão
+  // anterior mandava-os ao provider e NÃO os incluía na identidade do pedido:
+  // um retry com a mesma intenção e outro nome de pagador mantinha o
+  // fingerprint, o banco entendia "mesmo pedido" e devolvia replay — enquanto
+  // o conteúdo que iria ao provider havia mudado.
+  //
+  // O valor normalizado é o mesmo nos dois lugares. Normalizar só para o
+  // fingerprint faria a identidade dizer "igual" com bytes diferentes a
+  // caminho do provider.
+  const cnpj = normalizarCnpj(sub.cnpj);
+  const nomeDoPagador = normalizarNome(input.customerName);
+  const emailDoPagador = normalizarEmail(input.customerEmail);
+
+  // 3. FINGERPRINT — fixado ANTES do claim, a partir do pedido inteiro: tudo o
+  //    que define CLIENTE, COBRANÇA, DESCRIÇÃO ou VENCIMENTO. Mudar qualquer
+  //    campo muda o fingerprint, e a mesma chave passa a conflitar.
+  //
+  //    `description` e `dueAt` não entram nominalmente porque são DERIVADOS de
+  //    campos que já estão aqui — plano e periodicidade a primeira, fim do
+  //    período o segundo. Acrescentá-los seria contar a mesma coisa duas vezes.
   const fingerprint = fingerprintDe({
     intent: "checkout",
     plan: sub.plan,
@@ -121,6 +144,9 @@ export async function createCheckout(
     method: input.method,
     periodStart: sub.currentPeriodStart,
     periodEnd: sub.currentPeriodEnd,
+    cnpj,
+    customerName: nomeDoPagador,
+    customerEmail: emailDoPagador,
   });
 
   const agora = env.clock.now();
@@ -133,7 +159,7 @@ export async function createCheckout(
     now: agora,
   };
 
-  // 3. CLAIM.
+  // 4. CLAIM.
   const claim = await env.repo.claimIdempotency(reserva);
   if (!claim.ok) return claim;
 
@@ -161,14 +187,15 @@ export async function createCheckout(
       break;
   }
 
-  // 4. PROVIDER — fora de transação, com a MESMA chave de idempotência. Numa
+  // 5. PROVIDER — fora de transação, com a MESMA chave de idempotência. Numa
   //    retomada, o provider devolve o mesmo recurso externo em vez de criar
   //    outro; é essa propriedade que impede a segunda cobrança.
   const cliente = await env.provider.createCustomer({
     organizationId: env.auth.organizationId,
-    cnpj: sub.cnpj,
-    name: input.customerName,
-    email: input.customerEmail,
+    // Os MESMOS valores que entraram no fingerprint. Ver a normalização acima.
+    cnpj,
+    name: nomeDoPagador,
+    email: emailDoPagador,
   });
   if (!cliente.ok) {
     await talvezMarcarFalha(env, reserva, cliente.error.code);
@@ -191,7 +218,7 @@ export async function createCheckout(
     return cobranca;
   }
 
-  // 5. FINALIZE — cobrança, auditoria e conclusão da chave, em UMA transação.
+  // 6. FINALIZE — cobrança, auditoria e conclusão da chave, em UMA transação.
   const finalizado = await env.repo.finalizeCheckout({
     ...contexto(env),
     provider: env.provider.name,

@@ -106,6 +106,7 @@ export class BillingProviderMock implements BillingProviderPort {
   readonly #cobrancas = new Map<string, EstadoCobranca>();
   readonly #clientes = new Map<string, string>();
   readonly #chamadas: ProviderChargeInput[] = [];
+  readonly #chamadasDeCliente: ProviderCustomerInput[] = [];
   /** `chave → recurso externo`, com o fingerprint que o produziu. */
   readonly #porChave = new Map<
     string,
@@ -139,6 +140,19 @@ export class BillingProviderMock implements BillingProviderPort {
    * do outro lado.
    */
   async createCustomer(input: ProviderCustomerInput): Promise<Result<ProviderCustomer>> {
+    // Registrado ANTES de qualquer memoização.
+    //
+    // ── POR QUE ISTO É NECESSÁRIO ─────────────────────────────────────────
+    //
+    // O mock memoiza o cliente POR ORGANIZAÇÃO e devolve o existente sem olhar
+    // nome, e-mail ou CNPJ. Um teste que quisesse provar "o pagador mudou"
+    // olhando o resultado não veria diferença alguma — passaria porque o mock
+    // DESCARTA o campo, e não porque o produto protege.
+    //
+    // Com o registro, o teste afirma a coisa certa: o provider NÃO recebeu a
+    // segunda versão, porque o conflito de fingerprint aconteceu antes.
+    this.#chamadasDeCliente.push(input);
+
     if (input.cnpj.trim() === "") {
       return fail("invalid_input", "CNPJ é obrigatório para criar cliente");
     }
@@ -153,6 +167,11 @@ export class BillingProviderMock implements BillingProviderPort {
   /** Toda tentativa de cobrança, na ordem. É o que os testes contam. */
   get chamadasDeCobranca(): readonly ProviderChargeInput[] {
     return this.#chamadas;
+  }
+
+  /** Todo pedido de cliente, na ordem — com o pagador que chegou de fato. */
+  get chamadasDeCliente(): readonly ProviderCustomerInput[] {
+    return this.#chamadasDeCliente;
   }
 
   /** Quantas vezes esta chave foi apresentada ao provider. */

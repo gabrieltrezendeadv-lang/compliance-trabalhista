@@ -148,6 +148,49 @@ export async function exigirAssinatura(
 }
 
 /**
+ * NORMALIZAÇÃO DO PEDIDO — definida aqui, e em um lugar só
+ *
+ * ── POR QUE ISTO PRECISA SER NOMINAL ────────────────────────────────────────
+ *
+ * O fingerprint decide se dois pedidos de cobrança são o MESMO. Sem uma regra
+ * escrita, `"  Fulano "` e `"Fulano"` seriam pedidos diferentes e um reenvio
+ * trivial viraria conflito falso; e `"F@X.COM"` e `"f@x.com"` também.
+ *
+ * A política, por extenso:
+ *
+ *   CNPJ    só os dígitos. Máscara é apresentação, não identidade.
+ *   NOME    `trim`. Espaço interno é preservado — "Maria  Silva" e
+ *           "Maria Silva" SÃO pedidos diferentes, porque é isso que vai
+ *           impresso na cobrança e não cabe ao billing decidir que são iguais.
+ *   E-MAIL  `trim` e caixa baixa. O domínio é insensível a caixa por RFC, e a
+ *           parte local é sensível na letra da norma mas insensível em todo
+ *           provedor real — tratar `F@x.com` como outro pedido produziria
+ *           conflito onde o usuário não vê diferença alguma.
+ *
+ * O valor NORMALIZADO é o que vai ao fingerprint E ao provider. Normalizar só
+ * para o fingerprint faria a identidade dizer "mesmo pedido" enquanto o
+ * provider recebe bytes diferentes — que é a divergência que isto existe para
+ * impedir.
+ *
+ * Nada disto é persistido: só o SHA-256 entra em `billing.idempotency_records`.
+ */
+
+/** Só os dígitos. Máscara é apresentação. */
+export function normalizarCnpj(v: string): string {
+  return v.replace(/\D/g, "");
+}
+
+/** `trim`. Espaço interno é significativo: vai impresso na cobrança. */
+export function normalizarNome(v: string): string {
+  return v.trim();
+}
+
+/** `trim` e caixa baixa. */
+export function normalizarEmail(v: string): string {
+  return v.trim().toLowerCase();
+}
+
+/**
  * Fingerprint canônico do pedido.
  *
  * ── POR QUE ISTO EXISTE ─────────────────────────────────────────────────────
