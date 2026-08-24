@@ -194,7 +194,7 @@ test("MUT-04: remover a verificação de owner é DETECTADO", () => {
 test("MUT-05: confiar só no filtro do banco é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/authorization.ts",
-    '    .eq("role", "owner")\n',
+    '      .eq("role", "owner")\n',
     "",
     FOUNDATION
   );
@@ -466,73 +466,96 @@ test("MUT-25: remover uma migration HISTÓRICA é DETECTADO", () => {
 // MUTAÇÕES ACRESCENTADAS NA REVISÃO FINAL
 // ═════════════════════════════════════════════════════════════════════════
 
-test("MUT-26: remover a comparação de organização (IDOR) é DETECTADO", () => {
-  // Sem a comparação, o servidor autoriza "é owner de alguma coisa" e opera
-  // sobre o identificador que o cliente mandou.
-  //
-  // A âncora carrega o comentário porque a 12C.2 criou a função gêmea de
-  // MEMBRO, e as duas comparam na mesma linha: sem o comentário, a mutação
-  // casaria duas vezes e mutaria o lugar errado.
+test("MUT-26: remover a conferência do tenant devolvido é DETECTADO", () => {
+  // O filtro foi enviado ao banco; ainda assim o tenant devolvido é conferido.
+  // Sem a conferência, o filtro vira a ÚNICA defesa — e um filtro que deixe de
+  // ser aplicado (RLS ausente, refatoração, cliente falso) passaria despercebido.
   const r = mutar(
     "src/lib/billing/authorization.ts",
-    `  if (requestedOrganizationId !== resultado.principal.organizationId) {
-    // Deliberadamente \`not_owner\`, e não "organização não encontrada": a`,
-    `  if (false) {
-    // Deliberadamente \`not_owner\`, e não "organização não encontrada": a`,
+    '    if (membership.tenant_id !== requestedOrganizationId) return negar("not_owner");',
+    "    // conferência removida",
     FOUNDATION
   );
-  assert.equal(r.code, 1, `o IDOR passou:\n${r.out}`);
+  assert.equal(r.code, 1, `o tenant devolvido deixou de ser conferido:\n${r.out}`);
   assert.match(r.out, /BF-27/);
 });
 
-test("MUT-26b: remover a comparação no caminho de MEMBRO é DETECTADO", () => {
-  // A ampliação da 12C.2 duplicou o resolvedor. Copiar uma função e esquecer a
-  // comparação é o erro mais provável ao duplicar — e sem esta mutação a
-  // guarda aprovaria justamente isso.
+test("MUT-26b: resolver a PRIMEIRA membership e comparar depois é DETECTADO", () => {
+  // O defeito histórico, restaurado: não pergunta "pertence ao tenant pedido?",
+  // e sim "o tenant pedido é o primeiro?". Recusa quem é legítimo.
   const r = mutar(
     "src/lib/billing/authorization.ts",
-    `  if (requestedOrganizationId !== resultado.principal.organizationId) {
+    `export async function requireBillingOwnerFor(
+  requestedOrganizationId: string
+): Promise<BillingAuthResult> {
+  return membershipNoTenant(requestedOrganizationId, true);
+}`,
+    `export async function requireBillingOwnerFor(
+  requestedOrganizationId: string
+): Promise<BillingAuthResult> {
+  const resultado = await requireBillingOwner();
+  if (!resultado.ok) return resultado;
+  if (requestedOrganizationId !== resultado.principal.organizationId) {
     return negar("not_owner");
   }
-
   return resultado;
-}`,
-    `  return resultado;
 }`,
     FOUNDATION
   );
-  assert.equal(r.code, 1, `o IDOR do caminho de membro passou:\n${r.out}`);
+  assert.equal(r.code, 1, `a resolução por padrão voltou:\n${r.out}`);
+  assert.match(r.out, /BF-27/);
+});
+
+test("MUT-26c: remover o filtro de tenant da consulta é DETECTADO", () => {
+  const r = mutar(
+    "src/lib/billing/authorization.ts",
+    '      .eq("tenant_id", requestedOrganizationId)\n',
+    "",
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `a consulta deixou de filtrar pelo tenant pedido:\n${r.out}`);
   assert.match(r.out, /BF-27/);
 });
 
 test("MUT-27: aceitar organização vazia usando a do servidor é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/authorization.ts",
-    `  // Entrada vazia ou de tipo inesperado é recusa, não "usa o do servidor".
-  if (
-    typeof requestedOrganizationId !== "string" ||
-    requestedOrganizationId.trim() === ""
-  ) {`,
     `  if (
     typeof requestedOrganizationId !== "string" ||
-    false
-  ) {`,
+    requestedOrganizationId.trim() === ""
+  ) {
+    return negar("no_organization");
+  }`,
+    "  // entrada vazia aceita",
     FOUNDATION
   );
   assert.equal(r.code, 1, `a entrada vazia passou:\n${r.out}`);
   assert.match(r.out, /BF-27/);
 });
 
-test("MUT-27b: papel desconhecido virar `owner` é DETECTADO", () => {
-  // O padrão do resolvedor de membro tem de ser o MENOR privilégio: um papel
-  // ausente, nulo ou inesperado não pode ser lido como proprietário.
+test("MUT-27b: papel desconhecido virar `owner` no resolvedor é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/authorization.ts",
-    '    const role = membership.role === "owner" ? ("owner" as const) : ("member" as const);',
-    '    const role = membership.role === "member" ? ("member" as const) : ("owner" as const);',
+    `    // Papel ausente ou de tipo inesperado NÃO vira \`owner\`. O padrão seguro é
+    // o menor privilégio, e aqui ele é \`member\`.
+    const role = membership.role === "owner" ? ("owner" as const) : ("member" as const);`,
+    '    const role = "owner" as const;',
     FOUNDATION
   );
   assert.equal(r.code, 1, `o papel desconhecido virou owner:\n${r.out}`);
+  assert.match(r.out, /BF-27/);
+});
+
+test("MUT-27c: papel desconhecido virar `owner` na consulta por tenant é DETECTADO", () => {
+  const r = mutar(
+    "src/lib/billing/authorization.ts",
+    `    // Papel ausente ou inesperado NÃO vira \`owner\`: o padrão é o menor
+    // privilégio.
+    const role = membership.role === "owner" ? ("owner" as const) : ("member" as const);`,
+    '    const role = "owner" as const;',
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `o papel desconhecido virou owner na consulta:\n${r.out}`);
   assert.match(r.out, /BF-27/);
 });
 

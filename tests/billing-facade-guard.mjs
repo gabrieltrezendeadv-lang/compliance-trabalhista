@@ -107,32 +107,52 @@ test("FC-01: a fachada existe e é inteiramente server-only", () => {
 
 test("FC-02: a flag é a PRIMEIRA coisa, antes de sessão, banco e provider", () => {
   const src = executavel(INDEX);
-  const corpo = /async function executarComando[\s\S]*?\n}/.exec(src)?.[0] ?? "";
-  assert.ok(corpo.length > 0, "executarComando sumiu");
+  // A ordem 1–7 vive em `preflight`, e os DOIS executores a reusam. Medir
+  // `executarComando` sozinho deixaria o executor puro sem cobertura.
+  const corpo = /async function preflight<[\s\S]*?\n}/.exec(src)?.[0] ?? "";
+  assert.ok(corpo.length > 0, "preflight sumiu");
 
   const iFlag = corpo.indexOf("deps.flagLigada()");
   const iAuth = corpo.indexOf("deps.autorizar(papelMinimo,");
   const iParse = corpo.indexOf("schema.safeParse(");
-  const iRepo = corpo.indexOf("montarEnv(");
-  const iProvider = corpo.indexOf("deps.provider()");
-
   assert.ok(iFlag > 0, "a flag não é consultada");
   assert.ok(iAuth > 0, "a sessão não é resolvida");
   assert.ok(iParse > 0, "a entrada não é validada");
-  assert.ok(iProvider > 0, "o provider nunca é resolvido");
 
-  // 1–2 antes de 3–6; 3–6 antes de 7; 7 antes de 8–9.
+  // 1–2 antes de 3–6; 3–6 antes de 7.
   assert.ok(iFlag < iAuth, "a sessão é resolvida ANTES da flag — billing desligado faria I/O");
   assert.ok(iAuth < iParse, "a validação vem ANTES da autorização");
-  assert.ok(iParse < iProvider, "o provider é resolvido ANTES da validação");
-  assert.ok(iParse < iRepo, "o ambiente é montado ANTES da validação");
 
   // E a recusa da flag é a primeira instrução com efeito.
   assert.match(
     corpo,
-    /if \(!deps\.flagLigada\(\)\) return recusaPadrao\("billing_disabled"\);/,
+    /if \(!deps\.flagLigada\(\)\) return \{ ok: false, code: "billing_disabled" \};/,
     "a flag desligada não para com resultado tipado"
   );
+
+  // ── UMA implementação da ordem, e não duas ────────────────────────────────
+  //
+  // Há dois executores: um para comandos com repositório/provider, outro para
+  // comandos puros. Se cada um trouxesse a própria sequência, a coerência entre
+  // eles ficaria por conta de comentário — e comentário não impõe nada.
+  for (const executor of ["executarComando", "executarComandoPuro"]) {
+    const c = new RegExp(`async function ${executor}<[\\s\\S]*?\\n}`).exec(src)?.[0] ?? "";
+    assert.ok(c.length > 0, `${executor} sumiu`);
+    assert.match(c, /await preflight</, `${executor} não reusa o preflight`);
+    assert.ok(
+      !/deps\.flagLigada\(\)|deps\.autorizar\(/.test(c),
+      `${executor} tem a própria cópia da ordem de segurança`
+    );
+  }
+
+  // O provider continua sendo resolvido depois da validação, no executor que o
+  // usa — e o executor PURO não o resolve nunca.
+  const comEnv = /async function executarComando<[\s\S]*?\n}/.exec(src)?.[0] ?? "";
+  const iPre = comEnv.indexOf("await preflight<");
+  const iProvider = comEnv.indexOf("deps.provider()");
+  const iRepo = comEnv.indexOf("montarEnv(");
+  assert.ok(iProvider > iPre, "o provider é resolvido ANTES do preflight");
+  assert.ok(iRepo > iPre, "o ambiente é montado ANTES do preflight");
 });
 
 test("FC-03: o repositório e o provider são FÁBRICAS, e por isso observáveis", () => {
@@ -430,24 +450,54 @@ test("FC-14: a chave deriva da INTENÇÃO, e o chamador não escolhe nada", () =
     "o checkout cunha intenção — retry técnico viraria cobrança nova"
   );
 
-  // Cunhar é ato deliberado de UM comando, e ele exige proprietário.
+  // Cunhar é ato deliberado de UM comando, e ele delega ao caso de uso puro.
   const preparar =
-    /export async function prepararIntencaoDeCheckout\([\s\S]*?\n}/.exec(index)?.[0] ?? "";
+    /export function prepararIntencaoDeCheckout\([\s\S]*?\n}/.exec(index)?.[0] ?? "";
   assert.ok(preparar.length > 0, "prepararIntencaoDeCheckout sumiu");
-  // Ele NÃO passa por `executarComando`, então a ordem de segurança precisa ser
-  // cobrada aqui: sem isto, remover a flag deste comando escaparia de `FC-02`.
-  const iFlagPrep = preparar.indexOf("deps.flagLigada()");
-  const iAuthPrep = preparar.indexOf("deps.autorizar(");
-  const iParsePrep = preparar.indexOf("PrepararIntencaoSchema.safeParse(");
-  const iCunhaPrep = preparar.indexOf("deps.novaIntencao()");
-  assert.ok(iFlagPrep > 0, "preparar intenção não consulta a flag");
-  assert.ok(iFlagPrep < iAuthPrep, "preparar intenção resolve a sessão antes da flag");
-  assert.ok(iAuthPrep < iParsePrep, "preparar intenção valida antes de autorizar");
-  assert.ok(iParsePrep < iCunhaPrep, "preparar intenção cunha antes de validar");
-  assert.match(preparar, /deps\.autorizar\("owner"/, "preparar intenção não exige proprietário");
-  assert.match(preparar, /deps\.novaIntencao\(\)/, "preparar intenção não usa a fábrica injetada");
-  const cunhagens = [...index.matchAll(/deps\.novaIntencao\(\)/g)].length;
-  assert.equal(cunhagens, 1, `${cunhagens} pontos cunham intenção; só o preparo deveria`);
+  assert.match(
+    preparar,
+    /executarComandoPuro</,
+    "preparar intenção não usa o executor puro — a ordem de segurança seria uma segunda cópia"
+  );
+  assert.match(preparar, /"owner"/, "preparar intenção não exige proprietário");
+  assert.match(
+    preparar,
+    /prepareCheckoutIntent\(env, \{ requestedOrganizationId: e\.organizationId \}\)/,
+    "preparar intenção não chama o caso de uso puro"
+  );
+
+  // A FACHADA não cunha. Quem cunha é o caso de uso, com a fábrica injetada.
+  assert.ok(
+    !/deps\.novaIntencao\(\)/.test(preparar),
+    "a fachada cunha a intenção diretamente — a etapa 10 não admite exceção"
+  );
+  const cunhagens = [...index.matchAll(/novaIntencao\(\)/g)].length;
+  assert.equal(cunhagens, 0, `a fachada cunha intenção em ${cunhagens} ponto(s); deveria delegar`);
+
+  // O caso de uso puro existe, exige proprietário e NÃO alcança repositório
+  // nem provider — e isso é uma propriedade do TIPO, não de disciplina.
+  const puro = executavel("src/lib/billing/usecases/checkout-intent.ts");
+  assert.match(puro, /export async function prepareCheckoutIntent\(/, "o caso de uso puro sumiu");
+  assert.match(puro, /assertTenantOwner</, "o caso de uso puro não exige proprietário");
+  assert.match(puro, /env\.novaIntencao\(\)/, "o caso de uso puro não usa a fábrica injetada");
+  const ambiente = /export interface CheckoutIntentEnv \{[\s\S]*?\n\}/.exec(puro)?.[0] ?? "";
+  assert.ok(ambiente.length > 0, "CheckoutIntentEnv sumiu");
+  for (const proibido of ["repo", "provider", "BillingRepository", "BillingProviderPort"]) {
+    assert.ok(
+      !ambiente.includes(proibido),
+      `CheckoutIntentEnv declara \`${proibido}\` — o caso de uso puro alcançaria I/O de billing`
+    );
+  }
+
+  // E o executor puro não constrói nem repositório nem provider.
+  const executorPuro = /async function executarComandoPuro<[\s\S]*?\n}/.exec(index)?.[0] ?? "";
+  assert.ok(executorPuro.length > 0, "executarComandoPuro sumiu");
+  for (const proibido of ["deps.repositorio(", "deps.provider(", "montarEnv("]) {
+    assert.ok(
+      !executorPuro.includes(proibido),
+      `o executor puro chama ${proibido} — deixaria de ser puro`
+    );
+  }
 });
 
 test("FC-14b: o digest de identidade financeira é resistente a colisão", () => {
@@ -776,11 +826,65 @@ test("FC-19b: os casos de uso declaram o papel, e só duas consultas são de mem
   // privilégio: papel ausente ou inesperado não pode virar `owner`.
   const autorizacao = executavel("src/lib/billing/authorization.ts");
   assert.match(autorizacao, /export async function requireBillingMember\(/, "não há resolvedor de membro");
+  // O recorte é o CORPO de cada resolvedor, e não o arquivo. São DOIS que
+  // decidem papel — `requireBillingMember` e `membershipNoTenant` —, e procurar
+  // no arquivo inteiro deixaria um responder pelo outro. Foi exatamente esse o
+  // buraco que `BF-27` já tivera de fechar.
+  for (const fn of ["requireBillingMember", "membershipNoTenant"]) {
+    const i = autorizacao.indexOf(`function ${fn}(`);
+    assert.ok(i > 0, `${fn} sumiu`);
+    const corpo = autorizacao.slice(i, i + 1800);
+    assert.match(
+      corpo,
+      /membership\.role === "owner" \? \("owner" as const\) : \("member" as const\)/,
+      `${fn}: o papel resolvido não tem padrão de menor privilégio`
+    );
+  }
+
+  // ── AS VARIANTES `…For` CONSULTAM O TENANT PEDIDO ─────────────────────────
+  //
+  // Elas resolviam a PRIMEIRA membership e comparavam depois. Isso não pergunta
+  // "o usuário pertence ao tenant pedido?", e sim "o tenant pedido é justamente
+  // o primeiro?" — e as duas perguntas só coincidem para quem tem uma
+  // organização só. O efeito era recusar acesso LEGÍTIMO.
+  const consultaDireta = /async function membershipNoTenant\([\s\S]*?\n}/.exec(autorizacao)?.[0] ?? "";
+  assert.ok(consultaDireta.length > 0, "membershipNoTenant sumiu");
   assert.match(
-    autorizacao,
-    /membership\.role === "owner" \? \("owner" as const\) : \("member" as const\)/,
-    "o papel resolvido não tem padrão de menor privilégio"
+    consultaDireta,
+    /\.eq\("tenant_id", requestedOrganizationId\)/,
+    "a consulta não filtra pelo tenant PEDIDO"
   );
+  assert.match(consultaDireta, /\.eq\("user_id", user\.id\)/, "a consulta não filtra pelo usuário");
+  assert.match(consultaDireta, /\.is\("deleted_at", null\)/, "membership excluída não é descartada");
+  assert.match(
+    consultaDireta,
+    /membership\.tenant_id !== requestedOrganizationId/,
+    "o tenant devolvido não é CONFERIDO — o filtro passaria a ser a única defesa"
+  );
+  assert.match(
+    consultaDireta,
+    /if \(exigirOwner\) consulta = consulta\.eq\("role", "owner"\);/,
+    "o filtro de papel não é enviado ao banco"
+  );
+
+  for (const [variante, exigeDono] of [
+    ["requireBillingOwnerFor", "true"],
+    ["requireBillingMemberFor", "false"],
+  ]) {
+    const corpo =
+      new RegExp(`export async function ${variante}\\([\\s\\S]*?\\n}`).exec(autorizacao)?.[0] ?? "";
+    assert.ok(corpo.length > 0, `${variante} sumiu`);
+    assert.match(
+      corpo,
+      new RegExp(`membershipNoTenant\\(requestedOrganizationId, ${exigeDono}\\)`),
+      `${variante} não consulta a membership no tenant pedido`
+    );
+    // E não volta a resolver um padrão antes de comparar.
+    assert.ok(
+      !/requireBillingOwner\(\)|requireBillingMember\(\)/.test(corpo),
+      `${variante} resolve a PRIMEIRA membership e compara depois — recusa quem é legítimo`
+    );
+  }
 });
 
 // ── 10. Uma leitura, um caso de uso ─────────────────────────────────────────
@@ -809,7 +913,7 @@ test("FC-20: a fachada não lê o banco nem decide domínio", () => {
 
   // Exatamente UM caso de uso por comando.
   const CASOS_DE_USO =
-    /\b(readCatalogUseCase|readSubscriptionState|resolveBillingAccess|createCheckout|startTrial|acceptTerms|updateBillingEmail|recordWorkerCount|choosePlan|upgradeSubscription|scheduleDowngradeUseCase|cancelAtPeriodEnd)\(/g;
+    /\b(readCatalogUseCase|readSubscriptionState|resolveBillingAccess|createCheckout|prepareCheckoutIntent|startTrial|acceptTerms|updateBillingEmail|recordWorkerCount|choosePlan|upgradeSubscription|scheduleDowngradeUseCase|cancelAtPeriodEnd)\(/g;
   const ESPERADOS = {
     lerCatalogo: "readCatalogUseCase",
     lerAssinatura: "readSubscriptionState",
@@ -823,6 +927,8 @@ test("FC-20: a fachada não lê o banco nem decide domínio", () => {
     fazerUpgrade: "upgradeSubscription",
     agendarDowngrade: "scheduleDowngradeUseCase",
     cancelarNoFimDoPeriodo: "cancelAtPeriodEnd",
+    // A etapa 10 vale para os TREZE: o comando puro também delega.
+    prepararIntencaoDeCheckout: "prepareCheckoutIntent",
   };
   for (const [comando, caso] of Object.entries(ESPERADOS)) {
     const corpo = corpoDoComando(src, comando);
@@ -840,6 +946,113 @@ test("FC-20: a fachada não lê o banco nem decide domínio", () => {
   const criar = /export async function createCheckout\([\s\S]*?\n}/.exec(payments)?.[0] ?? "";
   const lidas = [...criar.matchAll(/exigirAssinatura\(env\)|env\.repo\.readState\(/g)];
   assert.equal(lidas.length, 1, `createCheckout lê o estado ${lidas.length} vezes; uma basta`);
+});
+
+// ── 11. O fingerprint cobre tudo o que vai ao provider ──────────────────────
+
+test("FC-21: o fingerprint cobre todo campo enviado ao provider", () => {
+  const payments = executavel("src/lib/billing/usecases/payments.ts");
+  const criar = /export async function createCheckout\([\s\S]*?\n}/.exec(payments)?.[0] ?? "";
+  assert.ok(criar.length > 0, "createCheckout sumiu");
+
+  const fp = /const fingerprint = fingerprintDe\(\{[\s\S]*?\n  \}\);/.exec(criar)?.[0] ?? "";
+  assert.ok(fp.length > 0, "o fingerprint sumiu");
+
+  // Os campos que definem CLIENTE, COBRANÇA, DESCRIÇÃO ou VENCIMENTO. Os três
+  // últimos entraram na correção: iam ao provider e ficavam de fora da
+  // identidade do pedido, então trocar o pagador não produzia conflito.
+  for (const campo of [
+    "plan:",
+    "tier:",
+    "period:",
+    "amountCents:",
+    "method:",
+    "periodStart:",
+    "periodEnd:",
+    "cnpj,",
+    "customerName: nomeDoPagador,",
+    "customerEmail: emailDoPagador,",
+  ]) {
+    assert.ok(fp.includes(campo), `o fingerprint não cobre ${campo}`);
+  }
+
+  // O provider recebe os MESMOS valores normalizados. Normalizar só para o
+  // fingerprint faria a identidade dizer "igual" com bytes diferentes a
+  // caminho do provider.
+  const cliente = /createCustomer\(\{[\s\S]*?\}\);/.exec(criar)?.[0] ?? "";
+  assert.ok(cliente.length > 0, "createCustomer sumiu");
+  for (const [campo, queixa] of [
+    [/\n    cnpj,/, "CNPJ"],
+    [/name: nomeDoPagador,/, "nome"],
+    [/email: emailDoPagador,/, "e-mail"],
+  ]) {
+    assert.match(cliente, campo, `o provider não recebe o ${queixa} normalizado`);
+  }
+  assert.ok(
+    !/name: input\.customerName|email: input\.customerEmail|cnpj: sub\.cnpj/.test(cliente),
+    "o provider recebe o valor BRUTO enquanto o fingerprint usa o normalizado"
+  );
+
+  // A normalização é nominal, e mora num lugar só.
+  const shared = executavel("src/lib/billing/usecases/shared.ts");
+  for (const fn of ["normalizarCnpj", "normalizarNome", "normalizarEmail"]) {
+    assert.match(shared, new RegExp(`export function ${fn}\\(`), `${fn} não existe`);
+  }
+  assert.match(shared, /v\.replace\(\/\\D\/g, ""\)/, "o CNPJ não é reduzido a dígitos");
+  assert.match(shared, /v\.trim\(\)\.toLowerCase\(\)/, "o e-mail não é normalizado");
+
+  // E nenhuma PII nova é persistida: só o SHA-256 entra na reserva.
+  const reserva = /const reserva = \{[\s\S]*?\n  \};/.exec(criar)?.[0] ?? "";
+  for (const proibido of ["customerName", "customerEmail", "cnpj", "nomeDoPagador", "emailDoPagador"]) {
+    assert.ok(
+      !reserva.includes(proibido),
+      `a reserva de idempotência carrega \`${proibido}\` — PII nova persistida`
+    );
+  }
+});
+
+test("FC-21b: a bateria do pedido existe e mede o que diz medir", () => {
+  assert.ok(existe(`${UNIT}/pedido.spec.ts`), "sem bateria do pedido");
+  const pedido = ler(`${UNIT}/pedido.spec.ts`);
+  for (const [re, queixa] of [
+    [/mudar o NOME conflita/, "não prova o nome"],
+    [/mudar o E-MAIL conflita/, "não prova o e-mail"],
+    [/entra no fingerprint: organizações com CNPJ distinto não colidem/, "não prova o CNPJ"],
+    [/espaço em volta do nome não cria pedido novo/, "não prova a normalização do nome"],
+    [/caixa do e-mail não cria pedido novo/, "não prova a normalização do e-mail"],
+    [/chamadasDeCliente/, "não mede o que chegou ao provider"],
+  ]) {
+    assert.match(pedido, re, `pedido.spec.ts: ${queixa}`);
+  }
+
+  // E o contrato contra o PostgREST cobre o mesmo, contra o banco real.
+  const contrato = ler(CONTRATO);
+  for (const [re, queixa] of [
+    [/mesma intenção com PAGADOR diferente é conflito — nome/, "nome"],
+    [/mesma intenção com PAGADOR diferente é conflito — e-mail/, "e-mail"],
+    [/diferença apenas de NORMALIZAÇÃO devolve replay/, "normalização"],
+    [/o provider recebe o pagador NORMALIZADO/, "valor enviado ao provider"],
+  ]) {
+    assert.match(contrato, re, `o contrato não cobre o pedido: ${queixa}`);
+  }
+});
+
+test("FC-22: a autorização por tenant é medida em usuário multi-organização", () => {
+  const spec = "tests/integration/billing/authorization-multi-org.spec.ts";
+  assert.ok(existe(spec), "sem bateria multi-organização");
+  const src = ler(spec);
+  for (const [re, queixa] of [
+    [/acessa B legitimamente, mesmo com A sendo a PRIMEIRA membership/, "owner de A e membro de B"],
+    [/acessa B legitimamente com a ordem de criação INVERTIDA/, "ordem invertida"],
+    [/administra B, que NÃO é a primeira/, "owner de duas organizações"],
+    [/membro de A não alcança B, onde não tem membership/, "membro sem membership"],
+    [/membership EXCLUÍDA não autoriza/, "membership excluída"],
+    [/erro da consulta NUNCA vira permissão/, "erro de consulta"],
+    [/tenant alheio e tenant INEXISTENTE respondem igual/, "indistinguibilidade"],
+    [/linha de OUTRO tenant devolvida pelo banco é recusada/, "conferência do tenant devolvido"],
+  ]) {
+    assert.match(src, re, `authorization-multi-org.spec.ts: ${queixa}`);
+  }
 });
 
 console.log(`\nBilling facade guard: ${passed} passed, ${failed} failed`);

@@ -725,6 +725,99 @@ if (!ATIVO) {
       if (ledgerB.ok) expect(ledgerB.value.charges).toHaveLength(1);
     });
 
+    it("mesma intenção com PAGADOR diferente é conflito — nome", async () => {
+      const amb = montar({ scenarios: ["pix_pending"] });
+      await comTrial(amb);
+      const i1 = await intencao(amb);
+
+      const primeira = await criarCheckout(
+        { checkoutIntentId: i1, method: "pix", ...PAGADOR },
+        amb.deps
+      );
+      expect(primeira.ok).toBe(true);
+      const clientesAntes = amb.provider.chamadasDeCliente.length;
+
+      const segunda = await criarCheckout(
+        { checkoutIntentId: i1, method: "pix", ...PAGADOR, customerName: "Outro Pagador" },
+        amb.deps
+      );
+      expect(segunda.ok, "o pagador mudou e o banco não acusou").toBe(false);
+      if (!segunda.ok) expect(segunda.error.code).toBe("conflict");
+
+      // O conflito vem do `claim`, contra o banco real, ANTES do provider.
+      expect(amb.provider.chamadasDeCliente).toHaveLength(clientesAntes);
+      expect(amb.provider.chamadasDeCliente.map((c) => c.name)).not.toContain("Outro Pagador");
+      expect((await ledgerDe(amb, amb.donoA, amb.orgA)).charges).toHaveLength(1);
+    });
+
+    it("mesma intenção com PAGADOR diferente é conflito — e-mail", async () => {
+      const amb = montar({ scenarios: ["pix_pending"] });
+      await comTrial(amb);
+      const i1 = await intencao(amb);
+
+      await criarCheckout({ checkoutIntentId: i1, method: "pix", ...PAGADOR }, amb.deps);
+      const antes = amb.provider.chamadasDeCliente.length;
+
+      const segunda = await criarCheckout(
+        { checkoutIntentId: i1, method: "pix", ...PAGADOR, customerEmail: "outro@contrato.test" },
+        amb.deps
+      );
+      expect(segunda.ok).toBe(false);
+      if (!segunda.ok) expect(segunda.error.code).toBe("conflict");
+      expect(amb.provider.chamadasDeCliente).toHaveLength(antes);
+      expect((await ledgerDe(amb, amb.donoA, amb.orgA)).charges).toHaveLength(1);
+    });
+
+    it("diferença apenas de NORMALIZAÇÃO devolve replay, e não conflito", async () => {
+      const amb = montar({ scenarios: ["pix_pending"] });
+      await comTrial(amb);
+      const i1 = await intencao(amb);
+
+      const primeira = await criarCheckout(
+        { checkoutIntentId: i1, method: "pix", ...PAGADOR },
+        amb.deps
+      );
+      const segunda = await criarCheckout(
+        {
+          checkoutIntentId: i1,
+          method: "pix",
+          customerName: `  ${PAGADOR.customerName}  `,
+          customerEmail: PAGADOR.customerEmail.toUpperCase(),
+        },
+        amb.deps
+      );
+
+      expect(primeira.ok).toBe(true);
+      expect(segunda.ok, "espaço e caixa viraram pedido diferente").toBe(true);
+      if (primeira.ok && segunda.ok) {
+        expect(segunda.value.replay).toBe(true);
+        expect(segunda.value.charge.id).toBe(primeira.value.charge.id);
+      }
+      expect(amb.provider.chamadasDeCobranca).toHaveLength(1);
+      expect((await ledgerDe(amb, amb.donoA, amb.orgA)).charges).toHaveLength(1);
+    });
+
+    it("o provider recebe o pagador NORMALIZADO", async () => {
+      const amb = montar({ scenarios: ["pix_pending"] });
+      await comTrial(amb);
+      const i1 = await intencao(amb);
+
+      await criarCheckout(
+        {
+          checkoutIntentId: i1,
+          method: "pix",
+          customerName: "  Contrato Checkout  ",
+          customerEmail: "  PAGADOR@Contrato.TEST  ",
+        },
+        amb.deps
+      );
+
+      const cliente = amb.provider.chamadasDeCliente.at(-1);
+      expect(cliente?.name).toBe("Contrato Checkout");
+      expect(cliente?.email).toBe("pagador@contrato.test");
+      expect(cliente?.cnpj).toBe("00000000000191");
+    });
+
     it("IDOR no checkout: organização alheia recusa antes de provider e banco", async () => {
       const amb = montar({ scenarios: ["pix_pending"] });
       await comTrial(amb);

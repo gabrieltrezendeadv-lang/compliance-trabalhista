@@ -83,12 +83,27 @@ function guarda() {
   }
 }
 
-/** Toda a bateria de unidade de billing, dentro da cópia. */
+/**
+ * Toda a bateria de billing do projeto `unit`, dentro da cópia.
+ *
+ * Inclui `tests/integration/billing` de propósito: é lá que mora a prova da
+ * autorização por tenant, e um runner que parasse em `tests/unit` deixaria as
+ * mutações de `authorization.ts` sem quem as medisse — passando por ausência de
+ * cobertura, que é o pior jeito de uma mutação passar.
+ */
 function unidadeDeBilling() {
   try {
     const out = execFileSync(
       "npx",
-      ["--no-install", "vitest", "run", "--project", "unit", "tests/unit/billing"],
+      [
+        "--no-install",
+        "vitest",
+        "run",
+        "--project",
+        "unit",
+        "tests/unit/billing",
+        "tests/integration/billing",
+      ],
       { cwd: copia, encoding: "utf8", stdio: "pipe", shell: process.platform === "win32" }
     );
     return { code: 0, out };
@@ -185,8 +200,9 @@ test("MUT-FC-00b: sem mutação, a suíte de unidade PASSA na cópia", () => {
 test("MUT-FC-01: remover a verificação da flag é DETECTADO", () => {
   mutar(
     FACADE,
-    `  // 1–2. A FLAG, ANTES DE TUDO. Nenhum I/O acontece com billing desligado.
-  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");`,
+    `  // 1–2. A FLAG, ANTES DE TUDO. Nenhum I/O de billing acontece com billing
+  //      desligado — e nem a sessão é resolvida.
+  if (!deps.flagLigada()) return { ok: false, code: "billing_disabled" };`,
     `  // flag removida`,
     /a flag não é consultada|a flag desligada não para com resultado tipado/
   );
@@ -195,14 +211,12 @@ test("MUT-FC-01: remover a verificação da flag é DETECTADO", () => {
 test("MUT-FC-02: mover a flag para DEPOIS da sessão é DETECTADO", () => {
   mutar(
     FACADE,
-    `  // 1–2. A FLAG, ANTES DE TUDO. Nenhum I/O acontece com billing desligado.
-  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
+    `  if (!deps.flagLigada()) return { ok: false, code: "billing_disabled" };
 
   // 3–6. Sessão, organização, papel e comparação de tenant, no servidor.
   const autorizacao = await deps.autorizar(papelMinimo, tenantAfirmado(bruto));`,
-    `  // 3–6. Sessão, organização, papel e comparação de tenant, no servidor.
-  const autorizacao = await deps.autorizar(papelMinimo, tenantAfirmado(bruto));
-  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");`,
+    `  const autorizacao = await deps.autorizar(papelMinimo, tenantAfirmado(bruto));
+  if (!deps.flagLigada()) return { ok: false, code: "billing_disabled" };`,
     /a sessão é resolvida ANTES da flag/
   );
 });
@@ -212,8 +226,7 @@ test("MUT-FC-03: mover a flag para depois do BANCO é DETECTADO na unidade", () 
   // é a MEDIÇÃO: `vezesRepositorio()` deixa de ser zero com a flag desligada.
   mutar(
     FACADE,
-    `  // 1–2. A FLAG, ANTES DE TUDO. Nenhum I/O acontece com billing desligado.
-  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
+    `  if (!deps.flagLigada()) return { ok: false, code: "billing_disabled" };
 
   // 3–6.`,
     `  // 3–6.`,
@@ -228,9 +241,13 @@ test("MUT-FC-04: autorizar membro comum é DETECTADO", () => {
   mutar(
     FACADE,
     `    default:
-      return recusaPadrao("not_owner");`,
+      return "not_owner";
+  }
+}`,
     `    default:
-      return sucessoIndevido();`,
+      return "unauthenticated";
+  }
+}`,
     /reprovou|not_owner|sucessoIndevido/,
     unidade
   );
@@ -360,11 +377,12 @@ test("MUT-FC-13: a fachada SUBSTITUIR a versão afirmada é DETECTADO na unidade
 test("MUT-FC-14: resolver o provider ANTES da validação é DETECTADO", () => {
   mutar(
     FACADE,
-    `  // 7. Validação, só depois de autorizado.
+    `  // 7. Validação, só depois de autorizado: quem não está autorizado não
+  //    aprende quais campos existem nem quais formatos passam.
   const parsed = schema.safeParse(bruto);
-  if (!parsed.success) return recusaPadrao("invalid_input");`,
-    `  // 7. Validação movida para depois do provider.`,
-    /a entrada não é validada|o provider é resolvido ANTES da validação/
+  if (!parsed.success) return { ok: false, code: "invalid_input" };`,
+    `  const parsed = { success: true, data: bruto };`,
+    /a entrada não é validada|a validação vem ANTES da autorização/
   );
 });
 
@@ -575,7 +593,7 @@ test("MUT-FC-25c: cunhar intenção DENTRO do checkout é DETECTADO", () => {
     FACADE,
     `        checkoutIntentId: e.checkoutIntentId,`,
     `        checkoutIntentId: deps.novaIntencao(),`,
-    /o checkout cunha intenção|o checkout não repassa a intenção recebida|só o preparo deveria/
+    /o checkout cunha intenção|o checkout não repassa a intenção recebida|deveria delegar/
   );
 });
 
@@ -767,12 +785,29 @@ test("MUT-FC-34e: fixar o papel do contexto em `owner` é DETECTADO", () => {
   );
 });
 
-test("MUT-FC-34f: papel desconhecido virar `owner` é DETECTADO", () => {
+test("MUT-FC-34f: papel desconhecido virar `owner` no resolvedor é DETECTADO", () => {
   mutar(
     AUTZ,
-    `    const role = membership.role === "owner" ? ("owner" as const) : ("member" as const);`,
+    `    // Papel ausente ou de tipo inesperado NÃO vira \`owner\`. O padrão seguro é
+    // o menor privilégio, e aqui ele é \`member\`.
+    const role = membership.role === "owner" ? ("owner" as const) : ("member" as const);`,
     `    const role = membership.role === "member" ? ("member" as const) : ("owner" as const);`,
     /o papel resolvido não tem padrão de menor privilégio/
+  );
+});
+
+test("MUT-FC-34h: papel desconhecido virar `owner` na consulta por tenant é DETECTADO", () => {
+  // A mesma decisão existe nos dois resolvedores. Uma mutação só cobriria um
+  // deles, e a gêmea passaria a envelhecer sem vigilância.
+  mutar(
+    AUTZ,
+    `    // Papel ausente ou inesperado NÃO vira \`owner\`: o padrão é o menor
+    // privilégio.
+    const role = membership.role === "owner" ? ("owner" as const) : ("member" as const);
+    if (exigirOwner && role !== "owner") return negar("not_owner");`,
+    `    const role = "owner" as const;`,
+    /papel inesperado no banco vira `member`, nunca `owner`|reprovou/,
+    unidadeDeBilling
   );
 });
 
@@ -815,9 +850,19 @@ test("MUT-FC-35: ler o estado NA FACHADA é DETECTADO", () => {
 test("MUT-FC-35b: decidir domínio na fachada é DETECTADO", () => {
   mutar(
     FACADE,
-    `import { recusaPadrao, sucesso, traduzir, type FacadeResult } from "./resultado";`,
+    `import {
+  recusaPadrao,
+  traduzir,
+  type FacadeErrorCode,
+  type FacadeResult,
+} from "./resultado";`,
     `import { fail } from "../core/errors";
-import { recusaPadrao, sucesso, traduzir, type FacadeResult } from "./resultado";
+import {
+  recusaPadrao,
+  traduzir,
+  type FacadeErrorCode,
+  type FacadeResult,
+} from "./resultado";
 const naoEncontrado = () => fail("not_found", "assinatura inexistente");`,
     /a fachada produz recusa de domínio por conta própria|a fachada decide `not_found`/
   );
@@ -978,35 +1023,222 @@ test("MUT-FC-40: chamar o provider de novo num replay concluído é DETECTADO", 
   );
 });
 
-test("MUT-FC-41: remover a flag do comando de INTENÇÃO é DETECTADO", () => {
-  // `prepararIntencaoDeCheckout` não passa por `executarComando`, então a
-  // ordem de segurança dele precisa de guarda própria — sem ela, este comando
-  // seria o único ponto da fachada onde a flag poderia sumir em silêncio.
+test("MUT-FC-41: a fachada CUNHAR a intenção diretamente é DETECTADO", () => {
+  // A etapa 10 diz "um comando → exatamente um caso de uso, sem exceção". A
+  // versão anterior tinha uma exceção — este comando cunhava sozinho — escrita
+  // logo abaixo da frase que dizia não haver nenhuma.
   mutar(
     FACADE,
-    `  // 1\u20132. A flag, antes de tudo \u2014 mesma primeira etapa dos demais comandos.
-  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
-
-`,
-    "",
-    /preparar intenção não consulta a flag/
+    `    (env, e) => prepareCheckoutIntent(env, { requestedOrganizationId: e.organizationId })`,
+    `    async (env) => ({ ok: true, value: { checkoutIntentId: env.novaIntencao() } })`,
+    /a fachada cunha a intenção diretamente|não chama o caso de uso puro|chama 0 casos de uso/
   );
 });
 
-test("MUT-FC-41b: cunhar intenção ANTES de validar é DETECTADO", () => {
+test("MUT-FC-41b: dar ao comando puro a PRÓPRIA ordem de segurança é DETECTADO", () => {
+  // Duas cópias da sequência, coerentes só por comentário. É o defeito que o
+  // preflight compartilhado existe para tornar impossível.
   mutar(
     FACADE,
-    `  // 7. Valida\u00e7\u00e3o, depois da autoriza\u00e7\u00e3o.
-  const parsed = PrepararIntencaoSchema.safeParse(bruto);
-  if (!parsed.success) return recusaPadrao("invalid_input");
+    `  const antes = await preflight<TEntrada>(deps, papelMinimo, schema, bruto);
+  if (!antes.ok) return recusaPadrao(antes.code);
 
-  return sucesso({ checkoutIntentId: deps.novaIntencao() });`,
-    `  const cunhada = deps.novaIntencao();
-  const parsed = PrepararIntencaoSchema.safeParse(bruto);
+  // 8. Contexto confiável — o mínimo, e nada além.`,
+    `  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
+  const autz = await deps.autorizar(papelMinimo, tenantAfirmado(bruto));
+  if (!autz.ok) return recusaPadrao("not_owner");
+  const parsed = schema.safeParse(bruto);
   if (!parsed.success) return recusaPadrao("invalid_input");
+  const antes = { ok: true as const, principal: autz.principal, entrada: parsed.data as TEntrada };
 
-  return sucesso({ checkoutIntentId: cunhada });`,
-    /preparar intenção cunha antes de validar/
+  // 8. Contexto confiável — o mínimo, e nada além.`,
+    /executarComandoPuro não reusa o preflight|tem a própria cópia da ordem de segurança/
+  );
+});
+
+test("MUT-FC-41c: o executor puro construir repositório é DETECTADO", () => {
+  mutar(
+    FACADE,
+    `  // 8. Contexto confiável — o mínimo, e nada além.
+  const env: CheckoutIntentEnv = {`,
+    `  deps.repositorio();
+  // 8. Contexto confiável — o mínimo, e nada além.
+  const env: CheckoutIntentEnv = {`,
+    /o executor puro chama deps\.repositorio\(/
+  );
+});
+
+test("MUT-FC-41d: dar repositório ao caso de uso puro é DETECTADO", () => {
+  mutar(
+    "src/lib/billing/usecases/checkout-intent.ts",
+    `export interface CheckoutIntentEnv {
+  readonly auth: BillingAuthContext;`,
+    `export interface CheckoutIntentEnv {
+  readonly repo: unknown;
+  readonly auth: BillingAuthContext;`,
+    /CheckoutIntentEnv declara `repo`/
+  );
+});
+
+test("MUT-FC-41e: o caso de uso puro aceitar membro é DETECTADO", () => {
+  mutar(
+    "src/lib/billing/usecases/checkout-intent.ts",
+    `  const negado = assertTenantOwner<PreparedCheckoutIntent>(`,
+    `  const negado = assertTenantMember<PreparedCheckoutIntent>(`,
+    /o caso de uso puro não exige proprietário|assertTenantMember aparece em/
+  );
+});
+
+// ── 13. A autorização por tenant, em usuário multi-organização ──────────────
+
+test("MUT-FC-42: resolver a PRIMEIRA membership e comparar depois é DETECTADO", () => {
+  // O defeito exato: não pergunta "pertence ao tenant pedido?", e sim "o tenant
+  // pedido é justamente o primeiro?". Recusa quem é legítimo.
+  mutar(
+    AUTZ,
+    `export async function requireBillingMemberFor(
+  requestedOrganizationId: string
+): Promise<BillingAuthResult> {
+  return membershipNoTenant(requestedOrganizationId, false);
+}`,
+    `export async function requireBillingMemberFor(
+  requestedOrganizationId: string
+): Promise<BillingAuthResult> {
+  const resultado = await requireBillingMember();
+  if (!resultado.ok) return resultado;
+  if (requestedOrganizationId !== resultado.principal.organizationId) {
+    return negar("not_owner");
+  }
+  return resultado;
+}`,
+    /resolve a PRIMEIRA membership e compara depois|não consulta a membership no tenant pedido/
+  );
+});
+
+test("MUT-FC-42b: o mesmo defeito na variante de PROPRIETÁRIO é DETECTADO", () => {
+  mutar(
+    AUTZ,
+    `export async function requireBillingOwnerFor(
+  requestedOrganizationId: string
+): Promise<BillingAuthResult> {
+  return membershipNoTenant(requestedOrganizationId, true);
+}`,
+    `export async function requireBillingOwnerFor(
+  requestedOrganizationId: string
+): Promise<BillingAuthResult> {
+  const resultado = await requireBillingOwner();
+  if (!resultado.ok) return resultado;
+  if (requestedOrganizationId !== resultado.principal.organizationId) {
+    return negar("not_owner");
+  }
+  return resultado;
+}`,
+    /resolve a PRIMEIRA membership e compara depois|não consulta a membership no tenant pedido/
+  );
+});
+
+test("MUT-FC-42c: remover o filtro de tenant da consulta é DETECTADO", () => {
+  mutar(
+    AUTZ,
+    `      .eq("tenant_id", requestedOrganizationId)\n`,
+    "",
+    /a consulta não filtra pelo tenant PEDIDO/
+  );
+});
+
+test("MUT-FC-42d: confiar no filtro sem CONFERIR o tenant devolvido é DETECTADO", () => {
+  mutar(
+    AUTZ,
+    `    if (membership.tenant_id !== requestedOrganizationId) return negar("not_owner");`,
+    `    // conferência removida`,
+    /o tenant devolvido não é CONFERIDO/
+  );
+});
+
+test("MUT-FC-42e: aceitar membership EXCLUÍDA é DETECTADO", () => {
+  mutar(
+    AUTZ,
+    `      .is("deleted_at", null);`,
+    `      .limit(1);`,
+    /membership excluída não é descartada/
+  );
+});
+
+test("MUT-FC-42f: não enviar o filtro de papel ao banco é DETECTADO", () => {
+  mutar(
+    AUTZ,
+    `    if (exigirOwner) consulta = consulta.eq("role", "owner");`,
+    `    // filtro de papel removido`,
+    /o filtro de papel não é enviado ao banco/
+  );
+});
+
+// ── 14. O fingerprint cobre o pedido inteiro ────────────────────────────────
+
+test("MUT-FC-43: tirar o NOME do fingerprint é DETECTADO", () => {
+  mutar(
+    PAYMENTS,
+    `    customerName: nomeDoPagador,\n`,
+    "",
+    /o fingerprint não cobre customerName/
+  );
+});
+
+test("MUT-FC-43b: tirar o E-MAIL do fingerprint é DETECTADO", () => {
+  mutar(
+    PAYMENTS,
+    `    customerEmail: emailDoPagador,
+  });`,
+    `  });`,
+    /o fingerprint não cobre customerEmail/
+  );
+});
+
+test("MUT-FC-43c: tirar o NOME do fingerprint quebra o COMPORTAMENTO", () => {
+  mutar(
+    PAYMENTS,
+    `    customerName: nomeDoPagador,\n    customerEmail`,
+    `    customerEmail`,
+    /mudar o NOME conflita/,
+    unidade
+  );
+});
+
+test("MUT-FC-43d: mandar o valor BRUTO ao provider é DETECTADO", () => {
+  // Normalizar só para o fingerprint faria a identidade dizer "mesmo pedido"
+  // enquanto o provider recebe bytes diferentes.
+  mutar(
+    PAYMENTS,
+    `    name: nomeDoPagador,
+    email: emailDoPagador,`,
+    `    name: input.customerName,
+    email: input.customerEmail,`,
+    /o provider recebe o valor BRUTO|o provider não recebe o nome normalizado/
+  );
+});
+
+test("MUT-FC-43e: normalização do e-mail sem caixa baixa é DETECTADA", () => {
+  mutar(
+    SHARED,
+    `  return v.trim().toLowerCase();`,
+    `  return v.trim();`,
+    /o e-mail não é normalizado|reprovou/
+  );
+});
+
+test("MUT-FC-43f: persistir PII na reserva de idempotência é DETECTADO", () => {
+  mutar(
+    PAYMENTS,
+    `    key: idempotencyKey,
+    fingerprint,
+    now: agora,
+  };`,
+    `    key: idempotencyKey,
+    fingerprint,
+    customerEmail: emailDoPagador,
+    now: agora,
+  };`,
+    /a reserva de idempotência carrega/
   );
 });
 

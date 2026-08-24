@@ -588,12 +588,36 @@ test("BF-18: a autorização confere o papel em código, não só no filtro", ()
   // primeira versão desta asserção casava com a prosa, aprovando um arquivo do
   // qual o filtro tinha sido removido. É o mesmo defeito de TG12-08 e AP-16.
   const auth = tsExecutavel("src/lib/billing/authorization.ts");
-  assert.match(auth, /\.eq\("role", "owner"\)/, "o filtro de papel não é enviado");
-  assert.match(
-    auth,
-    /membership\.role !== "owner"/,
-    "o papel precisa ser conferido no objeto devolvido, e não só filtrado"
-  );
+
+  // ── O RECORTE É POR FUNÇÃO ────────────────────────────────────────────────
+  //
+  // Desde a 12C.2 há DOIS caminhos que exigem proprietário: `requireBillingOwner`
+  // e `membershipNoTenant`. Procurar no arquivo inteiro deixaria o filtro de um
+  // responder pelo outro, e remover o filtro de um deles passaria — que é
+  // exatamente o defeito que esta asserção existe para pegar.
+  const CAMINHOS = [
+    {
+      fn: "requireBillingOwner(",
+      filtro: /\.eq\("role", "owner"\)/,
+      confere: /membership\.role !== "owner"/,
+    },
+    {
+      fn: "membershipNoTenant(",
+      filtro: /consulta = consulta\.eq\("role", "owner"\)/,
+      confere: /exigirOwner && role !== "owner"/,
+    },
+  ];
+  for (const { fn, filtro, confere } of CAMINHOS) {
+    const i = auth.indexOf(`function ${fn}`);
+    assert.ok(i > 0, `${fn} sumiu`);
+    const corpo = auth.slice(i, auth.indexOf("\n}", i));
+    assert.match(corpo, filtro, `${fn}: o filtro de papel não é enviado`);
+    assert.match(
+      corpo,
+      confere,
+      `${fn}: o papel precisa ser conferido no objeto devolvido, e não só filtrado`
+    );
+  }
   // Ordenação determinística: sem ela, um usuário com mais de uma organização
   // recairia num tenant arbitrário — e billing é onde isso custa dinheiro.
   assert.match(auth, /\.order\("created_at", \{ ascending: true \}\)/);
@@ -879,72 +903,83 @@ test("BF-26: exceção e timeout NEGAM, em vez de escapar do guard", () => {
 test("BF-27: identificador vindo do cliente não autoriza (IDOR)", () => {
   const auth = tsExecutavel("src/lib/billing/authorization.ts");
 
+  // ── COMO A PERGUNTA É FEITA, E POR QUE A FORMA IMPORTA ────────────────────
+  //
+  // A versão anterior resolvia a PRIMEIRA membership do usuário e comparava o
+  // tenant depois. Isso não pergunta "ele pertence ao tenant pedido?", e sim "o
+  // tenant pedido é justamente o primeiro?" — e as duas perguntas só coincidem
+  // para quem tem uma organização só. O efeito era RECUSAR acesso legítimo de
+  // quem é owner de A e membro de B.
+  //
+  // Agora o tenant pedido entra como FILTRO da consulta, junto do usuário. Ele
+  // continua sem autorizar: ele RESTRINGE, e quem autoriza é a linha devolvida
+  // — conferida de novo aqui.
   assert.match(
     auth,
-    /export async function requireBillingOwnerFor/,
-    "falta a autorização por organização solicitada"
-  );
-  // A comparação é o controle. Sem ela, o owner do tenant A administraria a
-  // assinatura do tenant B sem sair da própria sessão.
-  //
-  // O recorte é o CORPO da função, e não o arquivo: desde que a 12C.2 criou a
-  // gêmea de membro, procurar no arquivo inteiro deixaria a comparação da
-  // outra função responder por esta.
-  const i = auth.indexOf("requireBillingOwnerFor");
-  const corpo = auth.slice(i, i + 1200);
-  assert.match(
-    corpo,
-    /requestedOrganizationId !== resultado\.principal\.organizationId/,
-    "o identificador do cliente não é comparado com o resolvido no servidor"
-  );
-  // E o servidor tem de resolver por conta própria ANTES de comparar.
-  assert.match(
-    corpo,
-    /await requireBillingOwner\(\)/,
-    "a variante por organização precisa reusar a resolução server-side"
-  );
-  // Entrada vazia não pode cair no caminho do servidor.
-  assert.match(corpo, /trim\(\) === ""/, "entrada vazia precisa ser recusada");
-
-  // ── A MESMA EXIGÊNCIA PARA A FAMÍLIA DE MEMBRO ────────────────────────────
-  //
-  // A 12C.2 abriu duas leituras ao membro comum (catálogo e decisão de acesso).
-  // Ampliar QUEM pode ler não pode ter afrouxado o anti-IDOR: um membro de A
-  // continua sem alcançar B, e a checagem é a mesma, no mesmo lugar.
-  //
-  // Sem esta metade, a guarda aprovaria uma ampliação que copiou a função e
-  // esqueceu a comparação — que é exatamente o erro mais provável ao duplicar
-  // um resolvedor.
-  assert.match(
-    auth,
-    /export async function requireBillingMemberFor/,
-    "falta a autorização de MEMBRO por organização solicitada"
-  );
-  const j = auth.indexOf("requireBillingMemberFor");
-  const corpoMembro = auth.slice(j, j + 1200);
-  assert.match(
-    corpoMembro,
-    /await requireBillingMember\(\)/,
-    "a variante de membro por organização precisa reusar a resolução server-side"
-  );
-  assert.match(
-    corpoMembro,
-    /requestedOrganizationId !== resultado\.principal\.organizationId/,
-    "o caminho de membro não compara o identificador do cliente"
-  );
-  assert.match(corpoMembro, /trim\(\) === ""/, "entrada vazia precisa ser recusada no caminho de membro");
-  assert.match(
-    corpoMembro,
-    /negar\("not_owner"\)/,
-    "o caminho de membro distingue tenant alheio de inexistente"
+    /async function membershipNoTenant\(/,
+    "sumiu a consulta de membership no tenant pedido"
   );
 
-  // O papel resolvido é o REAL, com padrão de menor privilégio.
-  assert.match(
-    auth,
-    /membership\.role === "owner" \? \("owner" as const\) : \("member" as const\)/,
-    "o resolvedor de membro não tem padrão de menor privilégio"
-  );
+  const i = auth.indexOf("async function membershipNoTenant(");
+  const consulta = auth.slice(i, auth.indexOf("\n}", i));
+
+  for (const [re, queixa] of [
+    [/\.eq\("user_id", user\.id\)/, "a consulta não filtra pelo usuário autenticado"],
+    [/\.eq\("tenant_id", requestedOrganizationId\)/, "a consulta não filtra pelo tenant PEDIDO"],
+    [/\.is\("deleted_at", null\)/, "membership excluída não é descartada"],
+    [
+      /membership\.tenant_id !== requestedOrganizationId/,
+      "o tenant devolvido não é CONFERIDO — o filtro passaria a ser a única defesa",
+    ],
+    [/if \(exigirOwner\) consulta = consulta\.eq\("role", "owner"\);/, "o filtro de papel não é enviado"],
+    [/if \(exigirOwner && role !== "owner"\)/, "o papel devolvido não é conferido"],
+    [/trim\(\) === ""/, "entrada vazia precisa ser recusada"],
+    [/catch \{/, "exceção não é convertida em negação"],
+  ]) {
+    assert.match(consulta, re, queixa);
+  }
+
+  // Erro de consulta e resposta malformada NEGAM.
+  assert.match(consulta, /if \(error\) return negar\("verification_failed"\)/, "erro vira permissão");
+  assert.match(consulta, /if \(!membership\) return negar\("not_owner"\)/, "ausência não é recusa");
+
+  // ── AS DUAS VARIANTES DELEGAM, E NENHUMA RESOLVE PADRÃO ANTES ─────────────
+  //
+  // A 12C.2 abriu duas leituras ao membro comum. Ampliar QUEM pode ler não pode
+  // ter afrouxado o isolamento — e a exigência vale para as duas famílias.
+  for (const [variante, exigeDono] of [
+    ["requireBillingOwnerFor", "true"],
+    ["requireBillingMemberFor", "false"],
+  ]) {
+    assert.match(
+      auth,
+      new RegExp(`export async function ${variante}`),
+      `falta a autorização por organização solicitada: ${variante}`
+    );
+    const k = auth.indexOf(`export async function ${variante}`);
+    const corpo = auth.slice(k, auth.indexOf("\n}", k));
+    assert.match(
+      corpo,
+      new RegExp(`membershipNoTenant\\(requestedOrganizationId, ${exigeDono}\\)`),
+      `${variante} não consulta a membership no tenant pedido`
+    );
+    // E não volta a resolver a primeira membership para comparar depois.
+    assert.ok(
+      !/requireBillingOwner\(\)|requireBillingMember\(\)/.test(corpo),
+      `${variante} resolve a PRIMEIRA membership e compara depois — recusa quem é legítimo`
+    );
+  }
+
+  // O papel resolvido tem padrão de MENOR privilégio, nos dois resolvedores.
+  for (const fn of ["requireBillingMember", "membershipNoTenant"]) {
+    const k = auth.indexOf(`function ${fn}(`);
+    assert.ok(k > 0, `${fn} sumiu`);
+    assert.match(
+      auth.slice(k, k + 1800),
+      /membership\.role === "owner" \? \("owner" as const\) : \("member" as const\)/,
+      `${fn}: papel ausente ou inesperado poderia virar owner`
+    );
+  }
 });
 
 test("BF-28: a feature flag é inalcançável pelo browser", () => {

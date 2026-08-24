@@ -100,6 +100,15 @@ export interface BancadaOptions {
 export interface Bancada {
   readonly deps: DependenciasDaFachada;
   readonly repo: InMemoryBillingRepository;
+  /**
+   * O provider mock, para as asserções sobre o que ELE recebeu.
+   *
+   * `chamadasDeCliente` importa tanto quanto `chamadasDeCobranca`: o mock
+   * memoiza o cliente por organização e descarta nome, e-mail e CNPJ
+   * posteriores. Um teste que olhasse só o resultado passaria porque o mock
+   * descarta o campo, e não porque o produto protege.
+   */
+  readonly provider: BillingProviderMock;
   readonly relogio: RelogioDeTeste;
   /** Quantas vezes a fábrica de repositório foi chamada. */
   vezesRepositorio(): number;
@@ -241,6 +250,7 @@ export function montarBancada(opcoes: BancadaOptions = {}): Bancada {
   return {
     deps,
     repo,
+    provider: providerReal,
     relogio,
     vezesRepositorio: () => nRepo,
     vezesProvider: () => nProvider,
@@ -254,14 +264,17 @@ export function montarBancada(opcoes: BancadaOptions = {}): Bancada {
 }
 
 /** Trial pronto, para os comandos que exigem assinatura existente. */
-export async function comTrial(b: Bancada): Promise<void> {
+export async function comTrial(
+  b: Bancada,
+  opcoes: { readonly cnpj?: string } = {}
+): Promise<void> {
   const { iniciarTrial } = await import("@/lib/billing/facade");
   const r = await iniciarTrial(
     {
       plan: "essencial",
       period: "monthly",
       workerCount: 10,
-      cnpj: "00000000000191",
+      cnpj: opcoes.cnpj ?? "00000000000191",
       termsVersion: "2026-08-10",
     },
     b.deps
