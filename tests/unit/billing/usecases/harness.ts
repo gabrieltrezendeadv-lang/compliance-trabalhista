@@ -94,6 +94,20 @@ export const MEMBROS: readonly MembroFixture[] = Object.freeze([
   { actorId: COLAB_A, organizationId: ORG_A, role: "collaborator" },
 ]);
 
+/**
+ * O papel que o servidor resolveria para este ator nesta organização.
+ *
+ * Colapsado nas duas categorias que o billing distingue: `owner` e `member`.
+ * Ator sem membership recebe `member`, que é o menor privilégio — e a recusa
+ * vem da comparação de tenant, não daqui.
+ */
+function papelDe(actorId: string, organizationId: string): "owner" | "member" {
+  const m = MEMBROS.find(
+    (x) => x.actorId === actorId && x.organizationId === organizationId
+  );
+  return m?.role === "owner" ? "owner" : "member";
+}
+
 export interface BancadaOptions {
   readonly inicio?: string;
   readonly actorId?: string;
@@ -162,7 +176,13 @@ export function montarBancada(opcoes: BancadaOptions = {}): Bancada {
     auth: {
       userId: opcoes.actorId ?? DONO_A,
       organizationId: opcoes.organizationId ?? ORG_A,
-      role: "owner",
+      // O papel vem da MESMA tabela de membros que o dublê usa, e não de um
+      // literal. Fixá-lo em "owner" — como esta bancada fazia — significava que
+      // um colaborador chegava ao caso de uso disfarçado de proprietário: a
+      // recusa vinha do repositório, e a checagem de papel da APLICAÇÃO
+      // (`assertTenantOwner`) nunca era exercitada. A mutação `MUT-FC-34g`
+      // encontrou isso removendo a checagem sem que nada reprovasse.
+      role: papelDe(opcoes.actorId ?? DONO_A, opcoes.organizationId ?? ORG_A),
     },
     providerAccountId: "acct-teste",
     correlationId: "corr-teste",

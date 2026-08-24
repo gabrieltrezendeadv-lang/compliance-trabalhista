@@ -99,7 +99,7 @@ describe("somente o proprietário administra", () => {
     ["cancelAtPeriodEnd", (b) => cancelAtPeriodEnd(b.env)],
     ["grantCourtesy", (b) => grantCourtesy(b.env, { plan: "completo", days: 30, reason: "piloto" })],
     ["revokeCourtesy", (b) => revokeCourtesy(b.env, { courtesyId: "crt_000001", reason: "fim" })],
-    ["createCheckout", (b) => createCheckout(b.env, { method: "pix", idempotencyKey: "ck", customerName: "n", customerEmail: "e@t.local" })],
+    ["createCheckout", (b) => createCheckout(b.env, { method: "pix", checkoutIntentId: "ck", customerName: "n", customerEmail: "e@t.local" })],
   ];
 
   for (const [nome, executar] of comandos) {
@@ -125,12 +125,105 @@ describe("somente o proprietário administra", () => {
   });
 });
 
+describe("a checagem de papel é da APLICAÇÃO, e vem antes do repositório", () => {
+  /**
+   * Ambiente cujo repositório EXPLODE ao primeiro toque.
+   *
+   * ── POR QUE ESTE TESTE PRECISOU EXISTIR ───────────────────────────────────
+   *
+   * Havia duas camadas recusando o colaborador: `assertTenantOwner`, na
+   * aplicação, e `fn_require_member(..., true)` no banco (reproduzido pelo
+   * dublê). Como as duas recusam, remover a PRIMEIRA não fazia nenhum teste
+   * falhar — a recusa continuava chegando, só que de mais longe e depois de
+   * uma ida ao banco.
+   *
+   * Defesa em profundidade é boa; camada que ninguém mede é decoração. Aqui o
+   * repositório é uma armadilha: se a autorização não recusar por conta
+   * própria, o teste estoura em vez de passar.
+   */
+  function envSemRepositorio(role: "owner" | "member") {
+    const b = montarBancada();
+    const armadilha = new Proxy(
+      {},
+      {
+        get(_alvo, prop) {
+          throw new Error(
+            `a autorização deixou passar: o repositório foi tocado em "${String(prop)}"`
+          );
+        },
+      }
+    );
+    return {
+      ...b.env,
+      repo: armadilha as typeof b.env.repo,
+      auth: { userId: COLAB_A, organizationId: ORG_A, role },
+    };
+  }
+
+  const ESCRITAS = [
+    ["startTrial", (env: ReturnType<typeof envSemRepositorio>) =>
+      startTrial(env, {
+        plan: "essencial" as const,
+        period: "monthly" as const,
+        workerCount: 10,
+        cnpj: "00000000000191",
+        termsVersion: TERMS_VERSION,
+      })],
+    ["choosePlan", (env: ReturnType<typeof envSemRepositorio>) =>
+      choosePlan(env, { plan: "completo" as const, period: "monthly" as const })],
+    ["upgradeSubscription", (env: ReturnType<typeof envSemRepositorio>) =>
+      upgradeSubscription(env, { plan: "completo" as const })],
+    ["scheduleDowngradeUseCase", (env: ReturnType<typeof envSemRepositorio>) =>
+      scheduleDowngradeUseCase(env, { plan: "essencial" as const })],
+    ["cancelAtPeriodEnd", (env: ReturnType<typeof envSemRepositorio>) => cancelAtPeriodEnd(env, {})],
+    ["acceptTerms", (env: ReturnType<typeof envSemRepositorio>) =>
+      acceptTerms(env, { termsVersion: TERMS_VERSION })],
+    ["updateBillingEmail", (env: ReturnType<typeof envSemRepositorio>) =>
+      updateBillingEmail(env, { billingEmail: "f@e.com.br" })],
+    ["createCheckout", (env: ReturnType<typeof envSemRepositorio>) =>
+      createCheckout(env, {
+        method: "pix" as const,
+        checkoutIntentId: "ck-1",
+        customerName: "n",
+        customerEmail: "e@t.local",
+      })],
+  ] as const;
+
+  for (const [nome, executar] of ESCRITAS) {
+    it(`${nome}: membro é recusado SEM que o repositório seja tocado`, async () => {
+      const r = await executar(envSemRepositorio("member"));
+
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe("not_owner");
+    });
+  }
+
+  it("a decisão de ACESSO, ao contrário, deixa o membro passar", async () => {
+    // O contraponto necessário: se a checagem de papel valesse para tudo, o
+    // teste acima passaria com uma fachada que barra o colaborador de tudo — e
+    // é justamente isso que estamos corrigindo. Aqui a armadilha DEVE ser
+    // tocada, porque a decisão de acesso precisa ler o estado.
+    const b = montarBancada();
+    const env = { ...b.env, auth: { userId: COLAB_A, organizationId: ORG_A, role: "member" as const } };
+    const r = await resolveBillingAccess(env, { billingEnabled: true });
+
+    expect(r.ok).toBe(true);
+  });
+
+  it("o proprietário passa da checagem de papel e chega ao repositório", async () => {
+    // Prova de que a armadilha mede o que diz medir: com `owner`, o caso de uso
+    // NÃO para na autorização, e o repositório é alcançado.
+    const env = { ...envSemRepositorio("owner"), auth: { userId: DONO_A, organizationId: ORG_A, role: "owner" as const } };
+    await expect(cancelAtPeriodEnd(env, {})).rejects.toThrow(/o repositório foi tocado/);
+  });
+});
+
 describe("evento do provider não aceita tenant de fora", () => {
   it("a entrada do webhook não tem organização nem ator", async () => {
     const b = await comTrial();
     const checkout = await createCheckout(b.env, {
       method: "pix",
-      idempotencyKey: "ck-1",
+      checkoutIntentId: "ck-1",
       customerName: "n",
       customerEmail: "e@t.local",
     });
@@ -218,7 +311,7 @@ describe("nenhum detalhe interno vaza", () => {
 
     const r = await createCheckout(b.env, {
       method: "pix",
-      idempotencyKey: "ck-1",
+      checkoutIntentId: "ck-1",
       customerName: "n",
       customerEmail: "e@t.local",
     });

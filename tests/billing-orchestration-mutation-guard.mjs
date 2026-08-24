@@ -164,8 +164,8 @@ test("MUT-B05: fromThrown aceitando código de sucesso é DETECTADO", () => {
 test("MUT-B06: aceitar papel diferente de owner é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/usecases/shared.ts",
-    '  if (auth.role !== "owner") {',
-    '  if (auth.role === "nunca") {',
+    '  if (auth.role !== "owner") return recusarTenant<T>();',
+    '  if (auth.role === "nunca") return recusarTenant<T>();',
     GUARDA
   );
   assert.equal(r.code, 1, `admin como owner passou:\n${r.out}`);
@@ -177,8 +177,8 @@ test("MUT-B06: aceitar papel diferente de owner é DETECTADO", () => {
 test("MUT-B07: remover a comparação de tenant (IDOR) é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/usecases/shared.ts",
-    "  if (requestedOrganizationId !== auth.organizationId) {",
-    "  if (false) {",
+    "  if (requestedOrganizationId !== auth.organizationId) return recusarTenant<T>();",
+    "  if (false) return recusarTenant<T>();",
     GUARDA
   );
   assert.equal(r.code, 1, `o IDOR passou:\n${r.out}`);
@@ -190,11 +190,36 @@ test("MUT-B08: recusa por tenant virando not_found é DETECTADA", () => {
   // enumeração de organizações.
   const r = mutar(
     "src/lib/billing/usecases/shared.ts",
-    '    return fail("not_owner", "somente o proprietário administra a assinatura");\n  }\n  return null;',
-    '    return fail("not_found", "organização não encontrada");\n  }\n  return null;',
+    '  return fail("not_owner", "somente o proprietário administra a assinatura");',
+    '  return fail("not_found", "organização não encontrada");',
     GUARDA
   );
   assert.equal(r.code, 1, `o oráculo de enumeração passou:\n${r.out}`);
+  assert.match(r.out, /BO-06/);
+});
+
+test("MUT-B06b: `assertTenantMember` exigir proprietário é DETECTADO", () => {
+  // O sentido INVERSO da ampliação: se a autorização de membro voltar a exigir
+  // proprietário, a leitura por colaborador fecha de novo em silêncio — e o
+  // enforcement de entitlements da 12C.3 fica sem resposta para quem não paga.
+  const r = mutar(
+    "src/lib/billing/usecases/shared.ts",
+    `export function assertTenantMember<T>(
+  auth: BillingAuthContext,
+  requestedOrganizationId: string | undefined
+): Result<T> | null {
+  return conferirTenant<T>(auth, requestedOrganizationId);
+}`,
+    `export function assertTenantMember<T>(
+  auth: BillingAuthContext,
+  requestedOrganizationId: string | undefined
+): Result<T> | null {
+  if (auth.role !== "owner") return recusarTenant<T>();
+  return conferirTenant<T>(auth, requestedOrganizationId);
+}`,
+    GUARDA
+  );
+  assert.equal(r.code, 1, `a leitura por membro fechou sem que nada acusasse:\n${r.out}`);
   assert.match(r.out, /BO-06/);
 });
 

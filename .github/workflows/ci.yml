@@ -287,6 +287,30 @@ jobs:
           grep -q "PostgREST real" /tmp/contrato-real.log || {
             echo "FALHA: a suíte do PostgREST real não apareceu no relatório"; exit 1; }
 
+          # ── A FACHADA CONTRA O MESMO POSTGREST (12C.2) ───────────────────
+          #
+          # O contrato acima prova que o repositório real e o dublê respondem
+          # igual. Ele NÃO prova que a fachada, montando o ambiente por conta
+          # própria, chega ao banco — e foi esse o buraco que deixou passar, na
+          # 12B, um repositório que nunca havia executado.
+          #
+          # Faixa de fixtures DISJUNTA (60–99) da do contrato (0–59).
+          #
+          # Desde a correção da 12C.2 esta suíte exercita o CHECKOUT COMPLETO —
+          # `claimIdempotency` e `finalizeCheckout` contra o banco real, com o
+          # `BillingProviderMock` no lugar do Asaas. Antes ela parava nas
+          # leituras, e as duas RPCs de maior consequência financeira nunca
+          # haviam executado por este caminho.
+          echo "===== FACHADA CONTRA POSTGREST REAL ====="
+          npx --no-install vitest run --project contract \
+            --no-file-parallelism --reporter=verbose \
+            tests/contract/facade-postgrest.spec.ts 2>&1 | tee /tmp/contrato-fachada.log
+
+          if grep -q "PULADO" /tmp/contrato-fachada.log; then
+            echo "FALHA: a fachada foi pulada — o caminho real dela não foi exercitado"
+            exit 1
+          fi
+
       # `if: always()` para que a limpeza aconteça mesmo quando um passo
       # anterior falha — fixture órfã contamina a execução seguinte.
       #

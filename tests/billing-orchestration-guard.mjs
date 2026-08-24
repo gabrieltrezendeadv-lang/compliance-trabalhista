@@ -194,25 +194,63 @@ test("BO-05: nenhum erro vira autorização", () => {
 
 test("BO-06: todo comando confere o tenant informado pelo cliente", () => {
   const shared = tsExecutavel("src/lib/billing/usecases/shared.ts");
+
+  // ── DUAS AUTORIZAÇÕES DESDE A 12C.2, E CADA UMA COM SEU DEVER ─────────────
+  //
+  // `assertTenantOwner` compara o tenant E exige proprietário.
+  // `assertTenantMember` compara o tenant e NÃO olha papel — é o que permite
+  // ao colaborador consultar o catálogo e a decisão de acesso.
+  //
+  // A comparação de tenant é obrigação das DUAS: ampliar quem pode ler não
+  // pode ter afrouxado o isolamento entre organizações.
   assert.match(
     shared,
     /requestedOrganizationId !== auth\.organizationId/,
-    "assertTenant deixou de comparar a organização"
+    "a comparação de organização sumiu"
   );
-  assert.match(shared, /auth\.role !== "owner"/, "assertTenant deixou de exigir owner");
+  assert.match(
+    shared,
+    /auth\.role !== "owner"/,
+    "assertTenantOwner deixou de exigir owner"
+  );
+
+  for (const [nome, exigePapel] of [
+    ["assertTenantOwner", true],
+    ["assertTenantMember", false],
+  ]) {
+    const i = shared.indexOf(`export function ${nome}`);
+    assert.ok(i > 0, `${nome} sumiu`);
+    const corpo = shared.slice(i, shared.indexOf("export ", i + 10));
+    assert.equal(
+      /auth\.role !== "owner"/.test(corpo),
+      exigePapel,
+      exigePapel
+        ? `${nome} deixou de exigir proprietário`
+        : `${nome} passou a exigir proprietário — a leitura por membro fecharia de novo`
+    );
+    // Comparar o tenant é dever das duas, direta ou indiretamente.
+    assert.match(corpo, /conferirTenant</, `${nome} não compara o tenant afirmado`);
+  }
 
   // Recusa indistinguível: `not_owner` para alheia E para inexistente. A
-  // asserção é amarrada ao CORPO de `assertTenant` — medir o arquivo inteiro
+  // asserção é amarrada ao CORPO das autorizações — medir o arquivo inteiro
   // reprovaria o `not_found` legítimo de `exigirAssinatura`, que significa
   // "esta organização não tem assinatura" e só é alcançável por quem já foi
   // autorizado nela.
-  const iAssert = shared.indexOf("export function assertTenant");
-  assert.ok(iAssert > 0, "assertTenant sumiu");
-  const corpoAssert = shared.slice(iAssert, shared.indexOf("export ", iAssert + 10));
+  const iRecusa = shared.indexOf("function recusarTenant");
+  assert.ok(iRecusa > 0, "recusarTenant sumiu");
+  const corpoRecusa = shared.slice(iRecusa, shared.indexOf("\n}", iRecusa));
   assert.doesNotMatch(
-    corpoAssert,
-    /return fail\("not_found"/,
+    corpoRecusa,
+    /not_found/,
     "a recusa por tenant virou 'not_found' — vira oráculo de enumeração"
+  );
+  const iConferir = shared.indexOf("function conferirTenant");
+  const corpoConferir = shared.slice(iConferir, shared.indexOf("\n}", iConferir));
+  assert.doesNotMatch(
+    corpoConferir,
+    /return fail\("not_found"/,
+    "a comparação de tenant devolve 'not_found' — vira oráculo de enumeração"
   );
 
   // Cada caso de uso exportado precisa passar por assertTenant. `assertTenant`
@@ -221,6 +259,7 @@ test("BO-06: todo comando confere o tenant informado pelo cliente", () => {
     "src/lib/billing/usecases/subscription.ts",
     "src/lib/billing/usecases/payments.ts",
     "src/lib/billing/usecases/access.ts",
+    "src/lib/billing/usecases/queries.ts",
   ]) {
     const src = tsExecutavel(arquivo);
     const exportados = [...src.matchAll(/export async function (\w+)/g)].map((m) => m[1]);

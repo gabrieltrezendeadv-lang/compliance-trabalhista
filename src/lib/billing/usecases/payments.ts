@@ -43,10 +43,14 @@ import { fail, ok, type Result } from "../core/errors";
 import type { Charge, ChargeMethod, StoredSubscription } from "../core/repository";
 import { priceCents } from "../plans/pricing";
 import {
-  assertTenant,
+  assertTenantOwner,
+  chaveDeIdempotencia,
   contexto,
   exigirAssinatura,
   fingerprintDe,
+  normalizarCnpj,
+  normalizarEmail,
+  normalizarNome,
   type ComandoBase,
   type UseCaseEnv,
 } from "./shared";
@@ -55,7 +59,15 @@ import {
 
 export interface CheckoutInput extends ComandoBase {
   readonly method: ChargeMethod;
-  readonly idempotencyKey: string;
+  /**
+   * A INTENÇÃO de checkout, cunhada pelo servidor.
+   *
+   * Não é a chave de idempotência: a chave é DERIVADA dela aqui dentro, junto
+   * com organização e operação. O caso de uso nunca recebe chave pronta, e a
+   * fachada nunca a calcula — assim não existe caminho em que o chamador
+   * escolha, direta ou indiretamente, o que o banco vai reservar.
+   */
+  readonly checkoutIntentId: string;
   readonly customerName: string;
   readonly customerEmail: string;
 }
@@ -72,13 +84,26 @@ export async function createCheckout(
   input: CheckoutInput
 ): Promise<Result<CheckoutResult>> {
   // 1. AUTORIZAÇÃO — antes de qualquer efeito, e antes do provider.
-  const negado = assertTenant<CheckoutResult>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<CheckoutResult>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
-  if (input.idempotencyKey.trim() === "") {
-    return fail("invalid_input", "chave de idempotência é obrigatória no checkout");
+  if (input.checkoutIntentId.trim() === "") {
+    return fail("invalid_input", "intenção de checkout é obrigatória");
   }
 
+  // A CHAVE, derivada aqui e só aqui, de (operação, organização, intenção).
+  //
+  // Nenhum dos três vem de leitura do banco, e é isso que elimina o TOCTOU que
+  // existia enquanto a chave dependia do período: não há mais janela entre
+  // "descobrir de que período é a chave" e "reservá-la".
+  const idempotencyKey = chaveDeIdempotencia(
+    "checkout",
+    env.auth.organizationId,
+    input.checkoutIntentId
+  );
+
+  // LEITURA ÚNICA do estado. A fachada não lê antes; toda decisão comercial
+  // sobre a assinatura — inclusive "não existe" — acontece a partir daqui.
   const assinatura = await exigirAssinatura(env);
   if (!assinatura.ok) return assinatura;
   const sub = assinatura.value;
@@ -88,8 +113,28 @@ export async function createCheckout(
     return fail("invalid_state", "faixa Enterprise não tem checkout automático");
   }
 
-  // 2. FINGERPRINT — fixado ANTES do claim, a partir do pedido inteiro. Mudar
-  //    qualquer campo muda o fingerprint, e a mesma chave passa a conflitar.
+  // ── 2. O PEDIDO, NORMALIZADO UMA VEZ ────────────────────────────────────
+  //
+  // Estes três valores vão ao PROVIDER e, por isso, ao fingerprint. A versão
+  // anterior mandava-os ao provider e NÃO os incluía na identidade do pedido:
+  // um retry com a mesma intenção e outro nome de pagador mantinha o
+  // fingerprint, o banco entendia "mesmo pedido" e devolvia replay — enquanto
+  // o conteúdo que iria ao provider havia mudado.
+  //
+  // O valor normalizado é o mesmo nos dois lugares. Normalizar só para o
+  // fingerprint faria a identidade dizer "igual" com bytes diferentes a
+  // caminho do provider.
+  const cnpj = normalizarCnpj(sub.cnpj);
+  const nomeDoPagador = normalizarNome(input.customerName);
+  const emailDoPagador = normalizarEmail(input.customerEmail);
+
+  // 3. FINGERPRINT — fixado ANTES do claim, a partir do pedido inteiro: tudo o
+  //    que define CLIENTE, COBRANÇA, DESCRIÇÃO ou VENCIMENTO. Mudar qualquer
+  //    campo muda o fingerprint, e a mesma chave passa a conflitar.
+  //
+  //    `description` e `dueAt` não entram nominalmente porque são DERIVADOS de
+  //    campos que já estão aqui — plano e periodicidade a primeira, fim do
+  //    período o segundo. Acrescentá-los seria contar a mesma coisa duas vezes.
   const fingerprint = fingerprintDe({
     intent: "checkout",
     plan: sub.plan,
@@ -99,6 +144,9 @@ export async function createCheckout(
     method: input.method,
     periodStart: sub.currentPeriodStart,
     periodEnd: sub.currentPeriodEnd,
+    cnpj,
+    customerName: nomeDoPagador,
+    customerEmail: emailDoPagador,
   });
 
   const agora = env.clock.now();
@@ -106,12 +154,12 @@ export async function createCheckout(
     ...contexto(env),
     scope: "command" as const,
     provider: env.provider.name,
-    key: input.idempotencyKey,
+    key: idempotencyKey,
     fingerprint,
     now: agora,
   };
 
-  // 3. CLAIM.
+  // 4. CLAIM.
   const claim = await env.repo.claimIdempotency(reserva);
   if (!claim.ok) return claim;
 
@@ -139,14 +187,15 @@ export async function createCheckout(
       break;
   }
 
-  // 4. PROVIDER — fora de transação, com a MESMA chave de idempotência. Numa
+  // 5. PROVIDER — fora de transação, com a MESMA chave de idempotência. Numa
   //    retomada, o provider devolve o mesmo recurso externo em vez de criar
   //    outro; é essa propriedade que impede a segunda cobrança.
   const cliente = await env.provider.createCustomer({
     organizationId: env.auth.organizationId,
-    cnpj: sub.cnpj,
-    name: input.customerName,
-    email: input.customerEmail,
+    // Os MESMOS valores que entraram no fingerprint. Ver a normalização acima.
+    cnpj,
+    name: nomeDoPagador,
+    email: emailDoPagador,
   });
   if (!cliente.ok) {
     await talvezMarcarFalha(env, reserva, cliente.error.code);
@@ -161,7 +210,7 @@ export async function createCheckout(
     dueAt: sub.currentPeriodEnd,
     // A MESMA chave e o MESMO fingerprint que foram ao banco. É esta
     // igualdade que faz a retomada recuperar o recurso externo já criado.
-    idempotencyKey: input.idempotencyKey,
+    idempotencyKey: idempotencyKey,
     fingerprint,
   });
   if (!cobranca.ok) {
@@ -169,7 +218,7 @@ export async function createCheckout(
     return cobranca;
   }
 
-  // 5. FINALIZE — cobrança, auditoria e conclusão da chave, em UMA transação.
+  // 6. FINALIZE — cobrança, auditoria e conclusão da chave, em UMA transação.
   const finalizado = await env.repo.finalizeCheckout({
     ...contexto(env),
     provider: env.provider.name,
@@ -180,7 +229,7 @@ export async function createCheckout(
     amountCents: valor,
     periodStart: sub.currentPeriodStart,
     periodEnd: sub.currentPeriodEnd,
-    idempotencyKey: input.idempotencyKey,
+    idempotencyKey: idempotencyKey,
     fingerprint,
     now: agora,
   });

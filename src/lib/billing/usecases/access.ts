@@ -30,7 +30,8 @@ import {
 import { resolveState } from "../plans/lifecycle";
 import type { FeatureKey, Grandfathering, PlanSlug } from "../plans/model";
 import {
-  assertTenant,
+  assertTenantMember,
+  assertTenantOwner,
   contexto,
   type ComandoBase,
   type UseCaseEnv,
@@ -103,7 +104,16 @@ export async function resolveBillingAccess(
   env: UseCaseEnv,
   input: ComandoBase & { readonly billingEnabled: boolean }
 ): Promise<Result<AccessDecision>> {
-  const negado = assertTenant<AccessDecision>(env.auth, input.requestedOrganizationId);
+  // MEMBRO, não proprietário. O enforcement de entitlements precisa desta
+  // decisão para TODO usuário do tenant — inclusive quem não pode contratar.
+  // Exigir `owner` aqui barraria o colaborador de módulos que a organização
+  // pagou, ou obrigaria a 12C.3 a resolver acesso POR FORA da fachada, que é
+  // exatamente o que esta camada existe para impedir.
+  //
+  // A ampliação é segura porque `AccessDecision` não carrega CNPJ, contato
+  // financeiro, preço praticado nem identificador externo: ela diz o que o
+  // tenant pode fazer, e nada sobre o contrato que lhe deu esse direito.
+  const negado = assertTenantMember<AccessDecision>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   // Com a bandeira desligada, billing não governa nada — e é assim que a 12B
@@ -282,7 +292,7 @@ export async function resolveGrandfatheredAccess(
   env: UseCaseEnv,
   input: ComandoBase & { readonly organizationCreatedAt: string }
 ): Promise<Result<GrandfatheredDecision>> {
-  const negado = assertTenant<GrandfatheredDecision>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<GrandfatheredDecision>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const estado = await env.repo.readState(env.auth.userId, env.auth.organizationId);
@@ -308,7 +318,7 @@ export async function saveGrandfathering(
   env: UseCaseEnv,
   input: ComandoBase & { readonly cutoffAt: string }
 ): Promise<Result<Grandfathering>> {
-  const negado = assertTenant<Grandfathering>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<Grandfathering>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   const gravado = await env.repo.saveGrandfathering(
@@ -348,7 +358,7 @@ export async function grantCourtesy(
   env: UseCaseEnv,
   input: GrantCourtesyInput
 ): Promise<Result<StoredCourtesy>> {
-  const negado = assertTenant<StoredCourtesy>(env.auth, input.requestedOrganizationId);
+  const negado = assertTenantOwner<StoredCourtesy>(env.auth, input.requestedOrganizationId);
   if (negado) return negado;
 
   if (!Number.isInteger(input.days) || input.days < 1) {
@@ -377,7 +387,7 @@ export async function revokeCourtesy(
   env: UseCaseEnv,
   input: RevokeCourtesyInput
 ): Promise<Result<{ readonly revoked: boolean }>> {
-  const negado = assertTenant<{ readonly revoked: boolean }>(
+  const negado = assertTenantOwner<{ readonly revoked: boolean }>(
     env.auth,
     input.requestedOrganizationId
   );

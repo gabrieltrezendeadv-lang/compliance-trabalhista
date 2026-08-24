@@ -22,9 +22,17 @@ import {
   COLAB_A,
   type Bancada,
 } from "./harness";
+import { chaveDeIdempotencia } from "@/lib/billing/usecases/shared";
 import { TERMS_VERSION } from "@/lib/billing/terms";
 
-const CHAVE = "ck-1";
+/**
+ * A INTENÇÃO é o que o chamador repete; a CHAVE é o que o banco reserva.
+ *
+ * São valores diferentes de propósito, e este arquivo prova as duas pontas: o
+ * chamador nunca escolhe a chave, e o provider nunca vê a intenção.
+ */
+const INTENCAO = "ck-1";
+const CHAVE = chaveDeIdempotencia("checkout", ORG_A, INTENCAO);
 
 async function comAssinatura(opcoes: Parameters<typeof montarBancada>[0] = {}) {
   const b = montarBancada(opcoes);
@@ -39,10 +47,10 @@ async function comAssinatura(opcoes: Parameters<typeof montarBancada>[0] = {}) {
   return b;
 }
 
-function checkout(b: Bancada, chave = CHAVE) {
+function checkout(b: Bancada, intencao = INTENCAO) {
   return createCheckout(b.env, {
     method: "pix",
-    idempotencyKey: chave,
+    checkoutIntentId: intencao,
     customerName: "Fixture",
     customerEmail: "fixture@teste.local",
   });
@@ -80,7 +88,7 @@ describe("tabela de cenários — chamadas ao provider", () => {
     // do primeiro, e nunca chama o provider.
     const segundo = await createCheckout(b.env, {
       method: "credit_card",
-      idempotencyKey: CHAVE,
+      checkoutIntentId: INTENCAO,
       customerName: "Fixture",
       customerEmail: "fixture@teste.local",
     });
@@ -247,7 +255,9 @@ describe("conteúdo do que chega ao provider", () => {
     expect(ultima).not.toBeNull();
     expect(ultima?.idempotencyKey).toBe(CHAVE);
     expect(ultima?.amountCents).toBe(9_990);
-    expect(ultima?.fingerprint).toMatch(/^fp_[0-9a-f]{8}$/);
+    // SHA-256, com a geração no prefixo. Os oito hex de antes eram FNV-1a de
+    // 32 bits — espaço pequeno demais para decidir identidade de COBRANÇA.
+    expect(ultima?.fingerprint).toMatch(/^fp1_[0-9a-f]{64}$/);
   });
 
   it("o fingerprint muda quando o pedido muda", async () => {
@@ -257,7 +267,7 @@ describe("conteúdo do que chega ao provider", () => {
 
     await createCheckout(b.env, {
       method: "credit_card",
-      idempotencyKey: "ck-b",
+      checkoutIntentId: "ck-b",
       customerName: "Fixture",
       customerEmail: "fixture@teste.local",
     });
@@ -347,7 +357,7 @@ describe("estados da reserva", () => {
 
     const outro = await createCheckout(b.env, {
       method: "credit_card",
-      idempotencyKey: CHAVE,
+      checkoutIntentId: INTENCAO,
       customerName: "Fixture",
       customerEmail: "fixture@teste.local",
     });

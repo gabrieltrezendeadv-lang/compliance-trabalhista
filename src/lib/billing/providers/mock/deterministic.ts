@@ -46,6 +46,23 @@ export type MockScenario =
   | "pix_pending"
   /** `createCharge` estoura por tempo — nada é persistido do lado do provider. */
   | "timeout"
+  /**
+   * `createCharge` RECUSA de forma determinística, sem criar nada.
+   *
+   * ── POR QUE ESTE CENÁRIO PRECISOU EXISTIR ─────────────────────────────────
+   *
+   * `payments.ts` divide as falhas do provider em duas classes e trata cada uma
+   * de um jeito: as AMBÍGUAS (`provider_unavailable`, `provider_timeout`) não
+   * podem virar `failed`, porque uma conexão que cai depois do commit do
+   * provider é indistinguível de uma que cai antes; as DETERMINÍSTICAS podem,
+   * porque o provider disse "não" sem criar nada.
+   *
+   * Só que nenhum cenário do roteiro produzia um código determinístico: os três
+   * de falha devolviam `provider_timeout` ou `provider_unavailable`. O ramo
+   * `failed` de `talvezMarcarFalha` estava, portanto, INALCANÇÁVEL por teste —
+   * a política estava escrita e não estava provada.
+   */
+  | "rejected"
   /** `createCharge` falha ANTES de qualquer efeito. */
   | "unavailable_before_persist"
   /** `createCharge` cria a cobrança e SÓ ENTÃO falha em responder. */
@@ -89,6 +106,7 @@ export class BillingProviderMock implements BillingProviderPort {
   readonly #cobrancas = new Map<string, EstadoCobranca>();
   readonly #clientes = new Map<string, string>();
   readonly #chamadas: ProviderChargeInput[] = [];
+  readonly #chamadasDeCliente: ProviderCustomerInput[] = [];
   /** `chave → recurso externo`, com o fingerprint que o produziu. */
   readonly #porChave = new Map<
     string,
@@ -122,6 +140,19 @@ export class BillingProviderMock implements BillingProviderPort {
    * do outro lado.
    */
   async createCustomer(input: ProviderCustomerInput): Promise<Result<ProviderCustomer>> {
+    // Registrado ANTES de qualquer memoização.
+    //
+    // ── POR QUE ISTO É NECESSÁRIO ─────────────────────────────────────────
+    //
+    // O mock memoiza o cliente POR ORGANIZAÇÃO e devolve o existente sem olhar
+    // nome, e-mail ou CNPJ. Um teste que quisesse provar "o pagador mudou"
+    // olhando o resultado não veria diferença alguma — passaria porque o mock
+    // DESCARTA o campo, e não porque o produto protege.
+    //
+    // Com o registro, o teste afirma a coisa certa: o provider NÃO recebeu a
+    // segunda versão, porque o conflito de fingerprint aconteceu antes.
+    this.#chamadasDeCliente.push(input);
+
     if (input.cnpj.trim() === "") {
       return fail("invalid_input", "CNPJ é obrigatório para criar cliente");
     }
@@ -136,6 +167,11 @@ export class BillingProviderMock implements BillingProviderPort {
   /** Toda tentativa de cobrança, na ordem. É o que os testes contam. */
   get chamadasDeCobranca(): readonly ProviderChargeInput[] {
     return this.#chamadas;
+  }
+
+  /** Todo pedido de cliente, na ordem — com o pagador que chegou de fato. */
+  get chamadasDeCliente(): readonly ProviderCustomerInput[] {
+    return this.#chamadasDeCliente;
   }
 
   /** Quantas vezes esta chave foi apresentada ao provider. */
@@ -178,6 +214,13 @@ export class BillingProviderMock implements BillingProviderPort {
     }
     if (cenario === "unavailable_before_persist") {
       return fail("provider_unavailable", "provider indisponível antes de criar a cobrança");
+    }
+    if (cenario === "rejected") {
+      // DETERMINÍSTICO: o provider recusou o pedido e nada existe do lado de
+      // fora. Diferente dos dois acima justamente por não haver ambiguidade —
+      // e é essa diferença que libera a reserva para uma repetição imediata do
+      // MESMO pedido.
+      return fail("invalid_input", "provider recusou o pedido");
     }
 
     const externalChargeId = this.#ids.next("chg");

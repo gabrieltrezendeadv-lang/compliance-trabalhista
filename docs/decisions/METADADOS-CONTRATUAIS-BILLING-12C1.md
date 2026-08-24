@@ -1,8 +1,13 @@
 # Etapa 12C.1 — Metadados contratuais e contato financeiro
 
-> **Estado de produção nesta etapa: 40/40, e assim permanece.**
-> A migration `20260810120000_billing_contract_metadata.sql` fica **pendente**
-> até autorização separada. Nada aqui foi aplicado ao banco remoto.
+> **Estado quando esta etapa foi escrita:** produção em 40/40, com
+> `20260810120000_billing_contract_metadata.sql` **pendente**.
+>
+> **Estado VIGENTE:** a migration **foi aplicada** pela execução
+> `31536103242`, sobre o SHA `ac31445743ec6b92bcf9aa6521ade28475885020`. O
+> ledger remoto está em **41**, produção em **41/41**, e **não há migration
+> pendente**. Aplicar não habilitou billing: a feature flag continua desligada
+> e nenhuma rota alcança as RPCs.
 >
 > Billing continua **desligado**. Nenhuma página, nenhum checkout, nenhum preço
 > exposto. O Asaas continua **não implementado e não chamado**.
@@ -146,13 +151,20 @@ privilégio e não guarda dado, mas fingir reversão total seria mentira.
 | 12A `20260801120000_billing_foundation.sql` | **aplicada** — execução `30870009332` |
 | 12B `20260802093000_billing_orchestration.sql` | **aplicada** — execução `31041386635` |
 | Ledger remoto | **40**, sem pendência |
-| 12C.1 `20260810120000_billing_contract_metadata.sql` | **pendente** |
-| Estado de produção | **40/40** |
+| 12C.1 `20260810120000_billing_contract_metadata.sql` | **aplicada** — execução `31536103242` |
+| Ledger remoto | **41**, sem pendência |
+| Estado de produção | **41/41** |
+| SHA aplicado | `ac31445743ec6b92bcf9aa6521ade28475885020` |
 
-A 12C.1 é a **única** migration pendente, e é a mais antiga pendente — que é o
-que a pré-condição **P8** (`scripts/ci/assert-apply-preconditions.mjs`) exige
-para aceitar uma aplicação. Aplicá-la é decisão separada, e este documento não
-a autoriza.
+Quando este documento foi escrito, a 12C.1 era a única pendente e a mais antiga
+pendente — que é o que a pré-condição **P8**
+(`scripts/ci/assert-apply-preconditions.mjs`) exige. A aplicação aconteceu em
+11/08/2026 e o verificador independente rodou em seguida, somente leitura, com
+`ROLLBACK`: três colunas contratuais, três CHECKs validados, 18 RPCs exatas,
+`billing` fechado e auditoria append-only.
+
+**Não há mais migration pendente.** A aplicação não habilitou billing, não criou
+página, não criou checkout e não chamou o Asaas.
 
 ## 8. O que esta etapa deliberadamente NÃO faz
 

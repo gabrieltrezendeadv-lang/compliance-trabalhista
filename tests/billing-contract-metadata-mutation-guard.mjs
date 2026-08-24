@@ -888,7 +888,7 @@ test("MUT-CM-22: documentação que afirma outro estado de produção é DETECTA
   try {
     const r = guarda();
     assert.equal(r.code, 1, `documentação com estado errado passou:\n${r.out}`);
-    assert.match(r.out, /não registra que produção está em 40\/40/);
+    assert.match(r.out, /não registra o estado 40\/40 desta etapa/);
   } finally {
     escreverCopia(rel, original);
   }
@@ -904,7 +904,7 @@ test("MUT-CM-22b: documentação que omite a pendência da migration é DETECTAD
   try {
     const r = guarda();
     assert.equal(r.code, 1, `documentação sem pendência passou:\n${r.out}`);
-    assert.match(r.out, /não registra que a nova migration fica pendente/);
+    assert.match(r.out, /não registra que a migration esteve pendente/);
   } finally {
     escreverCopia(rel, original);
   }
