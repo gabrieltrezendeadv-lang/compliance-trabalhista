@@ -83,6 +83,20 @@ function guarda() {
   }
 }
 
+/** Toda a bateria de unidade de billing, dentro da cópia. */
+function unidadeDeBilling() {
+  try {
+    const out = execFileSync(
+      "npx",
+      ["--no-install", "vitest", "run", "--project", "unit", "tests/unit/billing"],
+      { cwd: copia, encoding: "utf8", stdio: "pipe", shell: process.platform === "win32" }
+    );
+    return { code: 0, out };
+  } catch (e) {
+    return { code: e.status ?? 1, out: (e.stdout ?? "") + (e.stderr ?? "") };
+  }
+}
+
 /** A suíte de unidade da fachada, dentro da cópia. É ela que MEDE o efeito. */
 function unidade() {
   try {
@@ -143,9 +157,14 @@ function criar(rel, conteudo, esperado, verificador = guarda) {
 }
 
 const FACADE = "src/lib/billing/facade/index.ts";
+const CONTRATO = "tests/contract/facade-postgrest.spec.ts";
+const PAYMENTS = "src/lib/billing/usecases/payments.ts";
 const ENTRADA = "src/lib/billing/facade/entrada.ts";
 const DEPS = "src/lib/billing/facade/dependencias.ts";
-const IDEM = "src/lib/billing/facade/idempotencia.ts";
+const INTENCAO = "src/lib/billing/facade/intencao.ts";
+const SHARED = "src/lib/billing/usecases/shared.ts";
+const QUERIES = "src/lib/billing/usecases/queries.ts";
+const AUTZ = "src/lib/billing/authorization.ts";
 const RESULTADO = "src/lib/billing/facade/resultado.ts";
 
 // ── Controle ────────────────────────────────────────────────────────────────
@@ -166,7 +185,8 @@ test("MUT-FC-00b: sem mutação, a suíte de unidade PASSA na cópia", () => {
 test("MUT-FC-01: remover a verificação da flag é DETECTADO", () => {
   mutar(
     FACADE,
-    `  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");`,
+    `  // 1–2. A FLAG, ANTES DE TUDO. Nenhum I/O acontece com billing desligado.
+  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");`,
     `  // flag removida`,
     /a flag não é consultada|a flag desligada não para com resultado tipado/
   );
@@ -175,12 +195,13 @@ test("MUT-FC-01: remover a verificação da flag é DETECTADO", () => {
 test("MUT-FC-02: mover a flag para DEPOIS da sessão é DETECTADO", () => {
   mutar(
     FACADE,
-    `  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
+    `  // 1–2. A FLAG, ANTES DE TUDO. Nenhum I/O acontece com billing desligado.
+  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
 
   // 3–6. Sessão, organização, papel e comparação de tenant, no servidor.
-  const autorizacao = await deps.autorizar(tenantAfirmado(bruto));`,
+  const autorizacao = await deps.autorizar(papelMinimo, tenantAfirmado(bruto));`,
     `  // 3–6. Sessão, organização, papel e comparação de tenant, no servidor.
-  const autorizacao = await deps.autorizar(tenantAfirmado(bruto));
+  const autorizacao = await deps.autorizar(papelMinimo, tenantAfirmado(bruto));
   if (!deps.flagLigada()) return recusaPadrao("billing_disabled");`,
     /a sessão é resolvida ANTES da flag/
   );
@@ -191,7 +212,8 @@ test("MUT-FC-03: mover a flag para depois do BANCO é DETECTADO na unidade", () 
   // é a MEDIÇÃO: `vezesRepositorio()` deixa de ser zero com a flag desligada.
   mutar(
     FACADE,
-    `  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
+    `  // 1–2. A FLAG, ANTES DE TUDO. Nenhum I/O acontece com billing desligado.
+  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
 
   // 3–6.`,
     `  // 3–6.`,
@@ -226,8 +248,8 @@ test("MUT-FC-05: confiar no organizationId recebido é DETECTADO", () => {
 test("MUT-FC-06: não entregar o tenant afirmado à autorização é DETECTADO", () => {
   mutar(
     FACADE,
-    `  const autorizacao = await deps.autorizar(tenantAfirmado(bruto));`,
-    `  const autorizacao = await deps.autorizar();`,
+    `  const autorizacao = await deps.autorizar(papelMinimo, tenantAfirmado(bruto));`,
+    `  const autorizacao = await deps.autorizar(papelMinimo);`,
     /o tenant afirmado não é entregue à autorização/
   );
 });
@@ -235,10 +257,10 @@ test("MUT-FC-06: não entregar o tenant afirmado à autorização é DETECTADO",
 test("MUT-FC-07: trocar a comparação de tenant por confiança cega é DETECTADO", () => {
   mutar(
     DEPS,
-    `        ? requireBillingOwner()
-        : requireBillingOwnerFor(organizationIdPedido),`,
-    `        ? requireBillingOwner()
-        : requireBillingOwner(),`,
+    `        return organizationIdPedido === undefined
+          ? requireBillingOwner()
+          : requireBillingOwnerFor(organizationIdPedido);`,
+    `        return requireBillingOwner();`,
     /a comparação de tenant não usa requireBillingOwnerFor/
   );
 });
@@ -464,50 +486,133 @@ test("MUT-FC-23: habilitar a flag no arquivo versionado é DETECTADO", () => {
 
 test("MUT-FC-24: gerar chave NOVA a cada tentativa é DETECTADO", () => {
   mutar(
-    IDEM,
-    `  const fp = fingerprintDe({
-    op: operacao,
-    org: organizationId,
-    inicio: periodStart,
-    fim: periodEnd,
-  });`,
-    `  const fp = fingerprintDe({
-    op: operacao,
-    org: organizationId,
-    inicio: periodStart,
-    fim: periodEnd,
-    agora: Date.now(),
-  });`,
-    /a chave depende de tempo ou sorteio/
+    SHARED,
+    `  return digest("idem", { op: operacao, org: organizationId, intent: checkoutIntentId });`,
+    `  return digest("idem", { op: operacao, org: organizationId, intent: checkoutIntentId, agora: Date.now() });`,
+    /a chave depende de tempo ou sorteio|a chave não cobre operação, organização e intenção/
+  );
+});
+
+test("MUT-FC-24b: voltar a derivar a chave do PERÍODO é DETECTADO", () => {
+  // O defeito exato da versão anterior: a chave codifica o ciclo em vez da
+  // tentativa, e a organização fica presa a uma cobrança por período.
+  mutar(
+    SHARED,
+    `export function chaveDeIdempotencia(
+  operacao: string,
+  organizationId: string,
+  checkoutIntentId: string
+): string {
+  return digest("idem", { op: operacao, org: organizationId, intent: checkoutIntentId });
+}`,
+    `export function chaveDeIdempotencia(
+  operacao: string,
+  organizationId: string,
+  periodStart: string
+): string {
+  return digest("idem", { op: operacao, org: organizationId, inicio: periodStart });
+}`,
+    /a chave voltou a depender do período|a chave não cobre operação, organização e intenção/
+  );
+});
+
+test("MUT-FC-24c: trocar SHA-256 por hash de 32 bits é DETECTADO", () => {
+  mutar(
+    "src/lib/billing/core/digest.ts",
+    `  const hex = createHash("sha256")
+    .update(\`\${tipo}|\${GERACAO_DE_DIGEST}|\${canonicalizar(campos)}\`, "utf8")
+    .digest("hex");`,
+    `  const texto = \`\${tipo}|\${GERACAO_DE_DIGEST}|\${canonicalizar(campos)}\`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < texto.length; i += 1) {
+    h ^= texto.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  const hex = h.toString(16).padStart(8, "0");`,
+    /o digest não é SHA-256|FNV-1a de 32 bits voltou/
+  );
+});
+
+test("MUT-FC-24d: canonicalização ambígua é DETECTADA", () => {
+  // A forma antiga: `k=v` unido por `&`. `{a:"x&b=y"}` colidia com
+  // `{a:"x", b:"y"}`, e um nome de pagador com `&` bastava.
+  mutar(
+    "src/lib/billing/core/digest.ts",
+    `      const v = String(campos[k]);
+      return \`\${k.length}:\${k}=\${v.length}:\${v}\`;
+    })
+    .join(";");`,
+    `      return \`\${k}=\${String(campos[k])}\`;
+    })
+    .join("&");`,
+    /a canonicalização deixou de ser injetiva/
   );
 });
 
 test("MUT-FC-25: aceitar a chave do cliente é DETECTADO", () => {
   mutar(
     ENTRADA,
-    `export const CriarCheckoutSchema = z
-  .object({
-    organizationId: organizacaoPedida,
-    method: meio,`,
-    `export const CriarCheckoutSchema = z
-  .object({
-    organizationId: organizacaoPedida,
-    idempotencyKey: z.string(),
-    method: meio,`,
-    /declara `idempotencyKey`|o schema do checkout aceita chave do cliente/
+    `    checkoutIntentId: z.string().trim().regex(FORMATO_DE_INTENCAO, "intenção inválida"),`,
+    `    checkoutIntentId: z.string().trim().regex(FORMATO_DE_INTENCAO, "intenção inválida"),
+    idempotencyKey: z.string(),`,
+    /declara `idempotencyKey`|o schema do checkout aceita idempotencyKey do cliente/
   );
 });
 
-test("MUT-FC-26: derivar a chave do tenant AFIRMADO é DETECTADO", () => {
+test("MUT-FC-25b: tornar a intenção OPCIONAL é DETECTADO", () => {
+  // Opcional convida o ramo "se não veio, invente" — e inventar em silêncio
+  // faria cada retry técnico virar cobrança nova.
+  mutar(
+    ENTRADA,
+    `    checkoutIntentId: z.string().trim().regex(FORMATO_DE_INTENCAO, "intenção inválida"),`,
+    `    checkoutIntentId: z.string().trim().regex(FORMATO_DE_INTENCAO, "intenção inválida").optional(),`,
+    /a intenção virou opcional/
+  );
+});
+
+test("MUT-FC-25c: cunhar intenção DENTRO do checkout é DETECTADO", () => {
   mutar(
     FACADE,
-    `        idempotencyKey: derivarChave(
-          "checkout",
-          env.auth.organizationId,`,
-    `        idempotencyKey: derivarChave(
-          "checkout",
-          e.organizationId ?? env.auth.organizationId,`,
-    /não usa a chave derivada da organização resolvida/
+    `        checkoutIntentId: e.checkoutIntentId,`,
+    `        checkoutIntentId: deps.novaIntencao(),`,
+    /o checkout cunha intenção|o checkout não repassa a intenção recebida|só o preparo deveria/
+  );
+});
+
+test("MUT-FC-25d: intenção sem entropia suficiente é DETECTADA", () => {
+  mutar(
+    INTENCAO,
+    `const BYTES = 16;`,
+    `const BYTES = 4;`,
+    /a intenção não tem 128 bits/
+  );
+});
+
+test("MUT-FC-25e: intenção sorteada por Math.random é DETECTADA", () => {
+  mutar(
+    INTENCAO,
+    `  const bytes = new Uint8Array(BYTES);
+  crypto.getRandomValues(bytes);`,
+    `  const bytes = new Uint8Array(BYTES);
+  for (let i = 0; i < BYTES; i += 1) bytes[i] = Math.floor(Math.random() * 256);`,
+    /a intenção não vem do CSPRNG da plataforma|a intenção usa sorteio previsível/
+  );
+});
+
+test("MUT-FC-26: derivar a chave de campo escolhido pelo CLIENTE é DETECTADO", () => {
+  mutar(
+    PAYMENTS,
+    `  const idempotencyKey = chaveDeIdempotencia(
+    "checkout",
+    env.auth.organizationId,
+    input.checkoutIntentId
+  );`,
+    `  const idempotencyKey = chaveDeIdempotencia(
+    "checkout",
+    env.auth.organizationId,
+    input.checkoutIntentId + input.customerEmail
+  );`,
+    /a chave do checkout não é derivada da organização resolvida e da intenção/
   );
 });
 
@@ -556,7 +661,7 @@ test("MUT-FC-30: acessar tabela de billing direto da fachada é DETECTADO", () =
 }
 
 /** Origem de tudo o que a fachada faz: pedido do proprietário. */`,
-    /acessa tabela diretamente/
+    /endereça tabela diretamente/
   );
 });
 
@@ -571,13 +676,337 @@ test("MUT-FC-31: acrescentar migration nesta etapa é DETECTADO", () => {
 test("MUT-FC-32: expor operação administrativa na fachada é DETECTADO", () => {
   mutar(
     FACADE,
-    `export const COMANDOS_DA_FACHADA = Object.freeze([`,
+    `export const COMANDOS_DA_FACHADA = Object.freeze({`,
     `export function grantCourtesy() {
   return null;
 }
 
-export const COMANDOS_DA_FACHADA = Object.freeze([`,
+export const COMANDOS_DA_FACHADA = Object.freeze({`,
     /expõe a operação administrativa grantCourtesy|divergiram da superfície declarada/
+  );
+});
+
+// ── 9. A matriz de papéis ───────────────────────────────────────────────────
+
+test("MUT-FC-33: exigir OWNER na decisão de acesso é DETECTADO", () => {
+  // O defeito original: `lerAcesso` de proprietário fecha a porta para o
+  // enforcement de entitlements de quem não paga.
+  mutar(
+    FACADE,
+    `  return executarComando<{ organizationId?: string }, AccessDecision>(
+    deps,
+    "member",`,
+    `  return executarComando<{ organizationId?: string }, AccessDecision>(
+    deps,
+    "owner",`,
+    /a matriz de papéis divergiu da acordada|lerAcesso voltou a exigir proprietário|lerAcesso declara "member" na matriz/
+  );
+});
+
+test("MUT-FC-33b: exigir OWNER no catálogo é DETECTADO", () => {
+  mutar(
+    FACADE,
+    `  return executarComando<{ organizationId?: string }, readonly CatalogPrice[]>(
+    deps,
+    "member",`,
+    `  return executarComando<{ organizationId?: string }, readonly CatalogPrice[]>(
+    deps,
+    "owner",`,
+    /a matriz de papéis divergiu da acordada|lerCatalogo declara "member" na matriz/
+  );
+});
+
+test("MUT-FC-34: rebaixar uma ESCRITA para membro é DETECTADO", () => {
+  mutar(
+    FACADE,
+    `  >(deps, "owner", EscolherPlanoSchema, bruto, (env, e) =>`,
+    `  >(deps, "member", EscolherPlanoSchema, bruto, (env, e) =>`,
+    /a matriz de papéis divergiu da acordada|é escrita e aceita membro|escolherPlano declara "owner" na matriz/
+  );
+});
+
+test("MUT-FC-34b: liberar o DOSSIÊ comercial ao membro é DETECTADO", () => {
+  mutar(
+    FACADE,
+    `  return executarComando<{ organizationId?: string }, BillingState>(
+    deps,
+    "owner",`,
+    `  return executarComando<{ organizationId?: string }, BillingState>(
+    deps,
+    "member",`,
+    /a matriz de papéis divergiu da acordada|lerAssinatura aceita membro|lerAssinatura declara "owner" na matriz/
+  );
+});
+
+test("MUT-FC-34c: trocar assertTenantOwner por Member no dossiê é DETECTADO", () => {
+  mutar(
+    QUERIES,
+    `  const negado = assertTenantOwner<BillingState>(env.auth, input.requestedOrganizationId);`,
+    `  const negado = assertTenantMember<BillingState>(env.auth, input.requestedOrganizationId);`,
+    /só a decisão de acesso e o catálogo|o dossiê comercial aceita membro/
+  );
+});
+
+test("MUT-FC-34d: trocar assertTenantOwner por Member numa ESCRITA é DETECTADO", () => {
+  mutar(
+    "src/lib/billing/usecases/payments.ts",
+    `  const negado = assertTenantOwner<CheckoutResult>(env.auth, input.requestedOrganizationId);`,
+    `  const negado = assertTenantMember<CheckoutResult>(env.auth, input.requestedOrganizationId);`,
+    /assertTenantMember aparece em/
+  );
+});
+
+test("MUT-FC-34e: fixar o papel do contexto em `owner` é DETECTADO", () => {
+  // Com o papel literal, um membro resolvido pelo servidor chega ao caso de uso
+  // disfarçado de proprietário — e `assertTenantOwner` para de proteger.
+  mutar(
+    FACADE,
+    `      role: principal.role,`,
+    `      role: "owner",`,
+    /o papel é fixado em vez de vir do principal|o papel é um literal/
+  );
+});
+
+test("MUT-FC-34f: papel desconhecido virar `owner` é DETECTADO", () => {
+  mutar(
+    AUTZ,
+    `    const role = membership.role === "owner" ? ("owner" as const) : ("member" as const);`,
+    `    const role = membership.role === "member" ? ("member" as const) : ("owner" as const);`,
+    /o papel resolvido não tem padrão de menor privilégio/
+  );
+});
+
+test("MUT-FC-34g: membro autorizado em escrita é DETECTADO na unidade", () => {
+  // Comportamental: a forma continua plausível — o que quebra é a MEDIÇÃO de
+  // que o membro é recusado antes do repositório.
+  mutar(
+    SHARED,
+    `export function assertTenantOwner<T>(
+  auth: BillingAuthContext,
+  requestedOrganizationId: string | undefined
+): Result<T> | null {
+  if (auth.role !== "owner") return recusarTenant<T>();`,
+    `export function assertTenantOwner<T>(
+  auth: BillingAuthContext,
+  requestedOrganizationId: string | undefined
+): Result<T> | null {`,
+    /membro é recusado SEM que o repositório seja tocado/,
+    unidadeDeBilling
+  );
+});
+
+// ── 10. Uma leitura, um caso de uso ─────────────────────────────────────────
+
+test("MUT-FC-35: ler o estado NA FACHADA é DETECTADO", () => {
+  // A regressão exata: duas leituras independentes e TOCTOU entre derivar a
+  // chave e reservá-la.
+  mutar(
+    FACADE,
+    `    (env, e) =>
+      createCheckout(env, {`,
+    `    async (env, e) => {
+      const estado = await env.repo.readState(env.auth.userId, env.auth.organizationId);
+      if (!estado.ok) return estado;
+      return createCheckout(env, {`,
+    /a fachada acessa o repositório diretamente|o checkout voltou a ler o estado na fachada/
+  );
+});
+
+test("MUT-FC-35b: decidir domínio na fachada é DETECTADO", () => {
+  mutar(
+    FACADE,
+    `import { recusaPadrao, sucesso, traduzir, type FacadeResult } from "./resultado";`,
+    `import { fail } from "../core/errors";
+import { recusaPadrao, sucesso, traduzir, type FacadeResult } from "./resultado";
+const naoEncontrado = () => fail("not_found", "assinatura inexistente");`,
+    /a fachada produz recusa de domínio por conta própria|a fachada decide `not_found`/
+  );
+});
+
+test("MUT-FC-35c: duas leituras de estado no caso de uso é DETECTADO", () => {
+  mutar(
+    "src/lib/billing/usecases/payments.ts",
+    `  const assinatura = await exigirAssinatura(env);
+  if (!assinatura.ok) return assinatura;`,
+    `  const preliminar = await exigirAssinatura(env);
+  if (!preliminar.ok) return preliminar;
+  const assinatura = await exigirAssinatura(env);
+  if (!assinatura.ok) return assinatura;`,
+    /createCheckout lê o estado 2 vezes/
+  );
+});
+
+test("MUT-FC-35d: a fachada chamar o repositório numa consulta é DETECTADO", () => {
+  mutar(
+    FACADE,
+    `    (env, e) => readCatalogUseCase(env, { requestedOrganizationId: e.organizationId })`,
+    `    (env) => env.repo.readCatalog(env.auth.userId, env.auth.organizationId, "2026-07-30.1")`,
+    /a fachada acessa o repositório diretamente|chama 0 casos de uso/
+  );
+});
+
+// ── 11. O contrato contra o PostgREST ───────────────────────────────────────
+
+test("MUT-FC-36: remover o checkout do contrato PostgREST é DETECTADO", () => {
+  mutar(
+    CONTRATO,
+    `    it("aprovado: exatamente UMA cobrança, UM snapshot e auditoria", async () => {`,
+    `    it("aprovado: removido nesta mutação", async () => {`,
+    /o contrato da fachada não cobre: checkout aprovado/
+  );
+});
+
+test("MUT-FC-36b: pular um caso do contrato PostgREST é DETECTADO", () => {
+  mutar(
+    CONTRATO,
+    `    it("replay: mesma intenção e mesmo payload devolvem o MESMO resultado", async () => {`,
+    `    it.skip("replay: mesma intenção e mesmo payload devolvem o MESMO resultado", async () => {`,
+    /há caso pulado ou isolado no contrato da fachada/
+  );
+});
+
+test("MUT-FC-36c: trocar o repositório real pelo dublê no contrato é DETECTADO", () => {
+  mutar(
+    CONTRATO,
+    `    const repoReal = new SupabaseBillingRepository(cliente);`,
+    `    const repoReal = new InMemoryBillingRepository({ clock: { now: () => T0 } } as never);`,
+    /o contrato não usa o repositório real|caiu para o repositório em memória/
+  );
+});
+
+test("MUT-FC-36d: remover a prova de troca de meio após recusa é DETECTADO", () => {
+  mutar(
+    CONTRATO,
+    `    it("PIX recusado não impede nova intenção com CARTÃO", async () => {`,
+    `    it("PIX recusado — caso removido", async () => {`,
+    /o contrato da fachada não cobre: troca de meio após recusa/
+  );
+});
+
+test("MUT-FC-36e: remover a prova de que o provider não é retocado é DETECTADO", () => {
+  mutar(
+    CONTRATO,
+    `    it("concluída: o provider NÃO é chamado de novo no replay", async () => {`,
+    `    it("concluída: caso removido", async () => {`,
+    /o contrato da fachada não cobre: provider retocado no replay/
+  );
+});
+
+test("MUT-FC-36f: remover a prova de leitura por membro é DETECTADO", () => {
+  mutar(
+    CONTRATO,
+    `    it("MEMBRO comum obtém a decisão de acesso do tenant", async () => {`,
+    `    it("MEMBRO — caso removido", async () => {`,
+    /o contrato da fachada não cobre: leitura por membro/
+  );
+});
+
+test("MUT-FC-37: remover o teardown das fixtures do CI é DETECTADO", () => {
+  mutar(
+    ".github/workflows/ci.yml",
+    `        run: bash scripts/ci/teardown-contract-fixtures.sh`,
+    `        run: echo "teardown removido nesta mutação"`,
+    /o CI deixou de derrubar as fixtures/
+  );
+});
+
+test("MUT-FC-37b: aceitar a fachada PULADA no CI é DETECTADO", () => {
+  mutar(
+    ".github/workflows/ci.yml",
+    `          if grep -q "PULADO" /tmp/contrato-fachada.log; then
+            echo "FALHA: a fachada foi pulada — o caminho real dela não foi exercitado"
+            exit 1
+          fi`,
+    `          echo "fachada: sem conferência de skip"`,
+    /o CI aceita a fachada pulada/
+  );
+});
+
+// ── 12. As três que faltavam: intenção nova, payload e replay ───────────────
+
+test("MUT-FC-38: intenção CONSTANTE — nova tentativa impossível — é DETECTADA", () => {
+  // O defeito da versão anterior, reintroduzido por outro caminho: se toda
+  // preparação devolver o mesmo identificador, a chave volta a ser única por
+  // organização e o proprietário fica sem como recomeçar depois de uma recusa.
+  mutar(
+    INTENCAO,
+    `  const bytes = new Uint8Array(BYTES);
+  crypto.getRandomValues(bytes);
+  return (
+    PREFIXO +
+    Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
+  );`,
+    `  return PREFIXO + "0".repeat(32);`,
+    /mil cunhagens, mil valores distintos|o nibble .* não varia/,
+    unidade
+  );
+});
+
+test("MUT-FC-39: fingerprint que ignora o meio de pagamento é DETECTADO", () => {
+  // Sem `method` no fingerprint, trocar PIX por cartão SOB A MESMA INTENÇÃO
+  // deixaria de conflitar: o segundo pedido sumiria e o cliente receberia a
+  // cobrança do primeiro, no meio que ele acabou de recusar.
+  mutar(
+    PAYMENTS,
+    `    amountCents: valor,
+    method: input.method,
+    periodStart: sub.currentPeriodStart,`,
+    `    amountCents: valor,
+    periodStart: sub.currentPeriodStart,`,
+    /fingerprint conflitante|é conflito|reprovou/,
+    unidadeDeBilling
+  );
+});
+
+test("MUT-FC-40: chamar o provider de novo num replay concluído é DETECTADO", () => {
+  // `completed` significa que a cobrança JÁ existe. Seguir adiante criaria a
+  // segunda no provider — e o banco, ao finalizar, veria fingerprint igual e
+  // não acusaria nada. O defeito só aparece contando as chamadas.
+  mutar(
+    PAYMENTS,
+    `    case "completed": {
+      // Replay: devolve a cobrança já criada, sem tocar no provider.
+      const idAnterior = claim.value.result.chargeId;`,
+    `    case "completed": {
+      break;
+    }
+
+    case "nunca_acontece": {
+      const idAnterior = claim.value.result.chargeId;`,
+    /replay|provider|reprovou/,
+    unidadeDeBilling
+  );
+});
+
+test("MUT-FC-41: remover a flag do comando de INTENÇÃO é DETECTADO", () => {
+  // `prepararIntencaoDeCheckout` não passa por `executarComando`, então a
+  // ordem de segurança dele precisa de guarda própria — sem ela, este comando
+  // seria o único ponto da fachada onde a flag poderia sumir em silêncio.
+  mutar(
+    FACADE,
+    `  // 1\u20132. A flag, antes de tudo \u2014 mesma primeira etapa dos demais comandos.
+  if (!deps.flagLigada()) return recusaPadrao("billing_disabled");
+
+`,
+    "",
+    /preparar intenção não consulta a flag/
+  );
+});
+
+test("MUT-FC-41b: cunhar intenção ANTES de validar é DETECTADO", () => {
+  mutar(
+    FACADE,
+    `  // 7. Valida\u00e7\u00e3o, depois da autoriza\u00e7\u00e3o.
+  const parsed = PrepararIntencaoSchema.safeParse(bruto);
+  if (!parsed.success) return recusaPadrao("invalid_input");
+
+  return sucesso({ checkoutIntentId: deps.novaIntencao() });`,
+    `  const cunhada = deps.novaIntencao();
+  const parsed = PrepararIntencaoSchema.safeParse(bruto);
+  if (!parsed.success) return recusaPadrao("invalid_input");
+
+  return sucesso({ checkoutIntentId: cunhada });`,
+    /preparar intenção cunha antes de validar/
   );
 });
 

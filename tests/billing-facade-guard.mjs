@@ -31,7 +31,7 @@ const DIR = "src/lib/billing/facade";
 const INDEX = `${DIR}/index.ts`;
 const ENTRADA = `${DIR}/entrada.ts`;
 const DEPS = `${DIR}/dependencias.ts`;
-const IDEM = `${DIR}/idempotencia.ts`;
+const INTENCAO = `${DIR}/intencao.ts`;
 const RESULTADO = `${DIR}/resultado.ts`;
 const UNIT = "tests/unit/billing/facade";
 const CONTRATO = "tests/contract/facade-postgrest.spec.ts";
@@ -93,7 +93,7 @@ function fontesDeSrc() {
 // ── 1. Os arquivos existem e são server-only ────────────────────────────────
 
 test("FC-01: a fachada existe e é inteiramente server-only", () => {
-  for (const rel of [INDEX, ENTRADA, DEPS, IDEM, RESULTADO]) {
+  for (const rel of [INDEX, ENTRADA, DEPS, INTENCAO, RESULTADO]) {
     assert.ok(existe(rel), `${rel} ausente`);
     assert.match(
       ler(rel),
@@ -111,7 +111,7 @@ test("FC-02: a flag é a PRIMEIRA coisa, antes de sessão, banco e provider", ()
   assert.ok(corpo.length > 0, "executarComando sumiu");
 
   const iFlag = corpo.indexOf("deps.flagLigada()");
-  const iAuth = corpo.indexOf("deps.autorizar(");
+  const iAuth = corpo.indexOf("deps.autorizar(papelMinimo,");
   const iParse = corpo.indexOf("schema.safeParse(");
   const iRepo = corpo.indexOf("montarEnv(");
   const iProvider = corpo.indexOf("deps.provider()");
@@ -170,7 +170,13 @@ test("FC-05: o contexto confiável é montado do que o SERVIDOR resolveu", () =>
 
   assert.match(montar, /userId: principal\.userId/, "o ator não vem do principal resolvido");
   assert.match(montar, /organizationId: principal\.organizationId/, "a organização não vem do principal");
-  assert.match(montar, /role: "owner"/, "o papel não é fixado");
+  // O papel vem do principal RESOLVIDO. Fixá-lo em "owner" faria um membro
+  // chegar ao caso de uso disfarçado de proprietário, e `assertTenantOwner`
+  // deixaria de proteger o que quer que fosse.
+  assert.match(montar, /role: principal\.role/, "o papel é fixado em vez de vir do principal");
+  // O recorte é a PROPRIEDADE do objeto devolvido (`role: "owner",`), e não a
+  // anotação de tipo do parâmetro — que legitimamente cita os dois papéis.
+  assert.doesNotMatch(montar, /role: "owner",/, "o papel é um literal, e não o resolvido");
   assert.match(montar, /correlationId: deps\.ids\.next\("corr"\)/, "a correlação não é gerada no servidor");
   assert.match(montar, /clock: deps\.clock/, "o relógio não é o injetado");
 
@@ -182,7 +188,7 @@ test("FC-06: o organizationId do cliente é COMPARADO, nunca obedecido", () => {
   const src = executavel(INDEX);
   assert.match(
     src,
-    /const autorizacao = await deps\.autorizar\(tenantAfirmado\(bruto\)\);/,
+    /const autorizacao = await deps\.autorizar\(papelMinimo, tenantAfirmado\(bruto\)\);/,
     "o tenant afirmado não é entregue à autorização"
   );
   // O ambiente usa `principal.organizationId`, e não o afirmado.
@@ -193,10 +199,17 @@ test("FC-06: o organizationId do cliente é COMPARADO, nunca obedecido", () => {
   );
 
   const deps = executavel(DEPS);
+  // As DUAS famílias comparam o tenant afirmado. Ampliar a leitura para membro
+  // não pode ter afrouxado o anti-IDOR num dos dois caminhos.
   assert.match(
     deps,
     /requireBillingOwnerFor\(organizationIdPedido\)/,
     "a comparação de tenant não usa requireBillingOwnerFor"
+  );
+  assert.match(
+    deps,
+    /requireBillingMemberFor\(organizationIdPedido\)/,
+    "o caminho de membro não compara o tenant afirmado"
   );
 });
 
@@ -265,7 +278,7 @@ test("FC-10: a fachada não tem consumidor em src/app, action, rota ou middlewar
   );
 
   // E ela própria não se publica.
-  for (const rel of [INDEX, ENTRADA, DEPS, IDEM, RESULTADO]) {
+  for (const rel of [INDEX, ENTRADA, DEPS, INTENCAO, RESULTADO]) {
     assert.doesNotMatch(ler(rel), /"use server"/, `${rel} virou server action`);
   }
 });
@@ -309,10 +322,14 @@ test("FC-13: zero migration nova e zero acesso direto a billing", () => {
   const sql = fs.readdirSync(dir).filter((f) => f.endsWith(".sql"));
   assert.equal(sql.length, 41, `esperadas 41 migrations, há ${sql.length} — a 12C.2 não cria SQL`);
 
-  for (const rel of [INDEX, ENTRADA, DEPS, IDEM, RESULTADO]) {
+  for (const rel of [INDEX, ENTRADA, DEPS, INTENCAO, RESULTADO]) {
     const src = executavel(rel);
     assert.doesNotMatch(src, /\.schema\(\s*["']billing["']\s*\)/, `${rel}: endereça o schema billing`);
-    assert.doesNotMatch(src, /\.from\(/, `${rel}: acessa tabela diretamente`);
+    assert.doesNotMatch(
+      src,
+      /\.from\(\s*["'`]/,
+      `${rel}: endereça tabela diretamente`
+    );
     assert.doesNotMatch(src, /check_plan_limit/, `${rel}: chama check_plan_limit`);
     for (const legada of ["subscription_plans", "tenant_subscriptions", "invoices", "billing_events"]) {
       assert.ok(!src.includes(legada), `${rel}: toca a tabela legada ${legada}`);
@@ -322,15 +339,45 @@ test("FC-13: zero migration nova e zero acesso direto a billing", () => {
 
 // ── 6. Idempotência ─────────────────────────────────────────────────────────
 
-test("FC-14: a chave é DERIVADA no servidor, e o chamador não a envia", () => {
-  const idem = executavel(IDEM);
-  assert.match(idem, /export function derivarChave\(/, "não há derivação de chave");
-  assert.match(idem, /fingerprintDe\(\{/, "a chave não reusa a canonicalização do domínio");
-  assert.match(idem, /op: operacao[\s\S]{0,120}?org: organizationId/, "a chave não cobre operação e organização");
+test("FC-14: a chave deriva da INTENÇÃO, e o chamador não escolhe nada", () => {
+  const intencao = executavel(INTENCAO);
+  assert.match(intencao, /export function cunharIntencao\(/, "não há cunhagem de intenção");
+  assert.match(
+    intencao,
+    /crypto\.getRandomValues\(bytes\)/,
+    "a intenção não vem do CSPRNG da plataforma"
+  );
+  assert.match(intencao, /const BYTES = 16;/, "a intenção não tem 128 bits");
+  assert.match(
+    intencao,
+    /export const FORMATO_DE_INTENCAO = \/\^ci_\[0-9a-f\]\{32\}\$\//,
+    "o formato da intenção deixou de ser fechado"
+  );
+  assert.doesNotMatch(intencao, /Math\.random/, "a intenção usa sorteio previsível");
 
-  // Nem relógio, nem sorteio, nem estado em memória.
-  assert.doesNotMatch(idem, /Date\.now|new Date|Math\.random|randomUUID/, "a chave depende de tempo ou sorteio");
-  assert.doesNotMatch(idem, /let |Map\(|Set\(/, "a chave depende de estado em memória");
+  // A DERIVAÇÃO mora no domínio, e cobre operação, organização e intenção.
+  const shared = executavel("src/lib/billing/usecases/shared.ts");
+  assert.match(shared, /export function chaveDeIdempotencia\(/, "não há derivação de chave");
+  assert.match(
+    shared,
+    /digest\("idem", \{ op: operacao, org: organizationId, intent: checkoutIntentId \}\)/,
+    "a chave não cobre operação, organização e intenção"
+  );
+
+  // E NÃO cobre período. Era essa dependência que prendia a organização a uma
+  // única cobrança por ciclo: recusado no PIX, não havia como tentar cartão.
+  const corpoDaChave = /export function chaveDeIdempotencia\([\s\S]*?\n}/.exec(shared)?.[0] ?? "";
+  assert.ok(corpoDaChave.length > 0, "chaveDeIdempotencia sumiu");
+  assert.doesNotMatch(
+    corpoDaChave,
+    /period|Period|inicio|fim/,
+    "a chave voltou a depender do período — a organização fica presa a uma tentativa por ciclo"
+  );
+  assert.doesNotMatch(
+    corpoDaChave,
+    /Date\.now|new Date|Math\.random|randomUUID/,
+    "a chave depende de tempo ou sorteio"
+  );
 
   // O recorte para NO schema, e não no fim do arquivo: `CAMPOS_PROIBIDOS` cita
   // `idempotencyKey` de propósito, e varrer até o fim confundiria a proibição
@@ -339,16 +386,92 @@ test("FC-14: a chave é DERIVADA no servidor, e o chamador não a envia", () => 
   const schemaDoCheckout =
     /export const CriarCheckoutSchema = z[\s\S]*?\.strict\(\);/.exec(entrada)?.[0] ?? "";
   assert.ok(schemaDoCheckout.length > 0, "CriarCheckoutSchema sumiu");
+  for (const proibido of ["idempotencyKey", "fingerprint"]) {
+    assert.ok(
+      !new RegExp(proibido).test(schemaDoCheckout),
+      `o schema do checkout aceita ${proibido} do cliente`
+    );
+  }
+
+  // A intenção é OBRIGATÓRIA. Opcional convidaria o ramo "se não veio, invente"
+  // — e inventar em silêncio faria cada retry técnico virar cobrança nova, que
+  // é o defeito oposto ao antigo e igualmente grave.
+  assert.match(
+    schemaDoCheckout,
+    /checkoutIntentId: z\.string\(\)\.trim\(\)\.regex\(FORMATO_DE_INTENCAO/,
+    "a intenção não é exigida com formato fechado no checkout"
+  );
   assert.ok(
-    !/idempotencyKey/.test(schemaDoCheckout),
-    "o schema do checkout aceita chave do cliente"
+    !/checkoutIntentId[\s\S]{0,90}?\.optional\(\)/.test(schemaDoCheckout),
+    "a intenção virou opcional — ausência passaria a gerar tentativa nova em silêncio"
   );
 
-  const index = executavel(INDEX);
+  // O caso de uso deriva da organização RESOLVIDA e da intenção RECEBIDA —
+  // nenhuma das duas vindas do corpo do pedido.
+  const payments = executavel("src/lib/billing/usecases/payments.ts");
   assert.match(
-    index,
-    /idempotencyKey: derivarChave\(\s*"checkout",\s*env\.auth\.organizationId/,
-    "o checkout não usa a chave derivada da organização resolvida"
+    payments,
+    /const idempotencyKey = chaveDeIdempotencia\(\s*"checkout",\s*env\.auth\.organizationId,\s*input\.checkoutIntentId\s*\);/,
+    "a chave do checkout não é derivada da organização resolvida e da intenção"
+  );
+
+  // E a fachada NÃO inventa nem substitui intenção no checkout.
+  const index = executavel(INDEX);
+  const checkout = /export function criarCheckout\([\s\S]*?\n}/.exec(index)?.[0] ?? "";
+  assert.ok(checkout.length > 0, "criarCheckout sumiu");
+  assert.match(
+    checkout,
+    /checkoutIntentId: e\.checkoutIntentId/,
+    "o checkout não repassa a intenção recebida"
+  );
+  assert.doesNotMatch(
+    checkout,
+    /novaIntencao|cunharIntencao/,
+    "o checkout cunha intenção — retry técnico viraria cobrança nova"
+  );
+
+  // Cunhar é ato deliberado de UM comando, e ele exige proprietário.
+  const preparar =
+    /export async function prepararIntencaoDeCheckout\([\s\S]*?\n}/.exec(index)?.[0] ?? "";
+  assert.ok(preparar.length > 0, "prepararIntencaoDeCheckout sumiu");
+  // Ele NÃO passa por `executarComando`, então a ordem de segurança precisa ser
+  // cobrada aqui: sem isto, remover a flag deste comando escaparia de `FC-02`.
+  const iFlagPrep = preparar.indexOf("deps.flagLigada()");
+  const iAuthPrep = preparar.indexOf("deps.autorizar(");
+  const iParsePrep = preparar.indexOf("PrepararIntencaoSchema.safeParse(");
+  const iCunhaPrep = preparar.indexOf("deps.novaIntencao()");
+  assert.ok(iFlagPrep > 0, "preparar intenção não consulta a flag");
+  assert.ok(iFlagPrep < iAuthPrep, "preparar intenção resolve a sessão antes da flag");
+  assert.ok(iAuthPrep < iParsePrep, "preparar intenção valida antes de autorizar");
+  assert.ok(iParsePrep < iCunhaPrep, "preparar intenção cunha antes de validar");
+  assert.match(preparar, /deps\.autorizar\("owner"/, "preparar intenção não exige proprietário");
+  assert.match(preparar, /deps\.novaIntencao\(\)/, "preparar intenção não usa a fábrica injetada");
+  const cunhagens = [...index.matchAll(/deps\.novaIntencao\(\)/g)].length;
+  assert.equal(cunhagens, 1, `${cunhagens} pontos cunham intenção; só o preparo deveria`);
+});
+
+test("FC-14b: o digest de identidade financeira é resistente a colisão", () => {
+  const dig = executavel("src/lib/billing/core/digest.ts");
+  assert.match(dig, /createHash\("sha256"\)/, "o digest não é SHA-256");
+  assert.match(dig, /export const GERACAO_DE_DIGEST/, "o digest não tem geração no prefixo");
+
+  // FNV-1a de 32 bits decidia identidade de COBRANÇA. Trinta e dois bits
+  // colidem, e a consequência aqui não é cache errado: é checkout recusado.
+  const dominio = executavel("src/lib/billing/usecases/shared.ts") + dig + executavel(INTENCAO);
+  for (const marca of ["0x811c9dc5", "0x01000193", "Math.imul"]) {
+    assert.ok(!dominio.includes(marca), `FNV-1a de 32 bits voltou (${marca})`);
+  }
+  assert.ok(
+    !/padStart\(8, "0"\)/.test(dominio),
+    "digest de 8 hex — 32 bits — reapareceu"
+  );
+
+  // A canonicalização é INJETIVA: comprimento à frente de nome e valor. A
+  // antiga unia `k=v` por `&`, e `{a:"x&b=y"}` colidia com `{a:"x",b:"y"}`.
+  assert.match(
+    dig,
+    /\$\{k\.length\}:\$\{k\}=\$\{v\.length\}:\$\{v\}/,
+    "a canonicalização deixou de ser injetiva"
   );
 });
 
@@ -387,13 +510,25 @@ test("FC-16: nenhuma exceção desconhecida vira autorização", () => {
 // ── 8. Os testes existem e medem o que dizem medir ──────────────────────────
 
 test("FC-17: a bateria da fachada existe e mede as fábricas", () => {
-  assert.ok(existe(`${UNIT}/harness.ts`), "sem bancada");
-  assert.ok(existe(`${UNIT}/ordem-de-seguranca.spec.ts`), "sem teste de ordem");
-  assert.ok(existe(`${UNIT}/idempotencia.spec.ts`), "sem teste de idempotência");
+  for (const arquivo of [
+    "harness.ts",
+    "ordem-de-seguranca.spec.ts",
+    "intencao.spec.ts",
+    "autorizacao.spec.ts",
+  ]) {
+    assert.ok(existe(`${UNIT}/${arquivo}`), `sem ${arquivo}`);
+  }
   assert.ok(existe(CONTRATO), "sem contrato da fachada contra PostgREST");
 
   const bancada = ler(`${UNIT}/harness.ts`);
-  for (const contador of ["vezesRepositorio", "vezesProvider", "vezesAutorizacao", "chavesUsadas"]) {
+  for (const contador of [
+    "vezesRepositorio",
+    "vezesProvider",
+    "vezesAutorizacao",
+    "chavesUsadas",
+    "papeisExigidos",
+    "intencoesCunhadas",
+  ]) {
     assert.ok(bancada.includes(contador), `a bancada não expõe ${contador}`);
   }
 
@@ -408,29 +543,117 @@ test("FC-17: a bateria da fachada existe e mede as fábricas", () => {
     assert.match(ordem, re, `ordem-de-seguranca.spec.ts: ${queixa}`);
   }
 
-  const idem = ler(`${UNIT}/idempotencia.spec.ts`);
-  assert.match(idem, /retry legítimo reutiliza a MESMA chave/, "não prova o retry idempotente");
-  assert.match(idem, /é CONFLITO/, "não prova o conflito de fingerprint");
+  const intencao = ler(`${UNIT}/intencao.spec.ts`);
+  for (const [re, queixa] of [
+    [/retry com a MESMA intenção devolve replay e não cunha nada/, "não prova o retry idempotente"],
+    [/MESMA intenção com payload DIFERENTE é conflito/, "não prova o conflito de fingerprint"],
+    [/NOVA intenção permite trocar PIX por cartão/, "não prova a nova tentativa comercial"],
+    [/intenção AUSENTE é erro/, "não prova que ausência não gera intenção em silêncio"],
+    [/intencoesCunhadas\(\)\)\.toBe\(cunhadasAntes\)/, "não MEDE que o retry não cunha"],
+  ]) {
+    assert.match(intencao, re, `intencao.spec.ts: ${queixa}`);
+  }
 
-  // E o CI roda a fachada contra o PostgREST, sem permitir que seja pulada.
+  // O teste que tratava o travamento PIX → cartão como CORRETO foi removido.
+  // Reintroduzi-lo seria reintroduzir o defeito com prova a favor.
+  for (const arquivo of ["intencao.spec.ts", "autorizacao.spec.ts", "ordem-de-seguranca.spec.ts"]) {
+    assert.ok(
+      !ler(`${UNIT}/${arquivo}`).includes("pedido DIFERENTE sob a mesma chave"),
+      `${arquivo}: o teste que endossava o travamento por período voltou`
+    );
+  }
+  assert.ok(
+    !existe(`${UNIT}/idempotencia.spec.ts`),
+    "idempotencia.spec.ts voltou — a política agora é a da intenção"
+  );
+
+  const autorizacao = ler(`${UNIT}/autorizacao.spec.ts`);
+  for (const [re, queixa] of [
+    [/o que MEMBRO pode fazer, membro faz/, "não prova a ampliação"],
+    [/o que MEMBRO não pode fazer, membro não faz/, "não prova o limite da ampliação"],
+    [/o membro nunca recebe dado restrito ao proprietário/, "não prova o recorte de dados"],
+    [/tenant alheio e tenant inexistente continuam indistinguíveis/, "não prova a indistinguibilidade"],
+  ]) {
+    assert.match(autorizacao, re, `autorizacao.spec.ts: ${queixa}`);
+  }
+
+  // E o CI roda a fachada contra o PostgREST, sem permitir que seja pulada, e
+  // derruba as fixtures depois.
   const ci = ler(CI);
   assert.ok(ci.includes("tests/contract/facade-postgrest.spec.ts"), "o CI não roda o contrato da fachada");
   assert.match(ci, /contrato-fachada\.log/, "o CI não guarda o relatório da fachada");
   assert.match(ci, /a fachada foi pulada/, "o CI aceita a fachada pulada");
+  assert.match(ci, /teardown-contract-fixtures\.sh/, "o CI deixou de derrubar as fixtures");
+});
+
+test("FC-17b: o contrato contra o PostgREST exercita o CHECKOUT, e não pula", () => {
+  const contrato = ler(CONTRATO);
+
+  // O repositório é o REAL e o provider é o mock local — nunca o inverso.
+  assert.match(contrato, /new SupabaseBillingRepository\(cliente\)/, "o contrato não usa o repositório real");
+  assert.match(contrato, /new BillingProviderMock\(/, "o contrato não usa o provider mock");
+  assert.ok(
+    !contrato.includes("InMemoryBillingRepository"),
+    "o contrato caiu para o repositório em memória — é justamente o que ele existe para não fazer"
+  );
+
+  // Os cenários obrigatórios, nominalmente. Remover qualquer um reprova aqui.
+  for (const [re, queixa] of [
+    [/aprovado: exatamente UMA cobrança, UM snapshot e auditoria/, "checkout aprovado"],
+    [/replay: mesma intenção e mesmo payload devolvem o MESMO resultado/, "replay"],
+    [/concluída: o provider NÃO é chamado de novo no replay/, "provider retocado no replay"],
+    [/MESMA intenção com payload DIFERENTE é conflito/, "conflito de fingerprint"],
+    [/NOVA intenção permite tentativa legítima/, "nova tentativa comercial"],
+    [/PIX recusado não impede nova intenção com CARTÃO/, "troca de meio após recusa"],
+    [/recusa DETERMINÍSTICA marca `failed` e libera a repetição imediata/, "recusa determinística"],
+    [/indisponibilidade AMBÍGUA preserva `in_progress` e não duplica/, "falha ambígua"],
+    [/retomada após a lease: MESMA intenção, MESMO recurso externo/, "retomada após lease"],
+    [/falha no `finalizeCheckout` não duplica cobrança/, "falha de finalize"],
+    [/mudança de plano no meio não mistura conteúdo/, "conteúdo trocado no meio"],
+    [/isolamento: a mesma intenção em outra organização/, "isolamento entre organizações"],
+    [/MEMBRO comum obtém a decisão de acesso do tenant/, "leitura por membro"],
+    [/MEMBRO comum NÃO lê o dossiê nem escreve nada/, "limite da leitura por membro"],
+  ]) {
+    assert.match(contrato, re, `o contrato da fachada não cobre: ${queixa}`);
+  }
+
+  // As RPCs de idempotência precisam ser atravessadas de verdade.
+  for (const rpc of ["claimIdempotency", "finalizeCheckout", "readLedger"]) {
+    assert.ok(contrato.includes(rpc), `o contrato não atravessa ${rpc}`);
+  }
+
+  // Nenhum caso do checkout pode estar pulado ou isolado. O único skip
+  // tolerado é o auto-pulo por ausência de stack, e o CI reprova se ele
+  // aparecer no relatório de lá.
+  const pulos = [...contrato.matchAll(/\b(it|describe)\.(skip|only|todo)\(/g)].map((m) => m[0]);
+  assert.deepEqual(
+    pulos,
+    ["it.skip("],
+    `há caso pulado ou isolado no contrato da fachada: ${pulos.join(", ")}`
+  );
+  assert.match(
+    contrato,
+    /it\.skip\("PULADO: defina BILLING_CONTRACT_URL/,
+    "o único skip permitido é o auto-pulo por ausência de stack"
+  );
+
+  // A faixa de fixtures continua disjunta da do contrato do repositório.
+  assert.match(contrato, /const PRIMEIRO_PAR = 60;/, "a faixa da fachada saiu de 60");
+  const seed = ler("scripts/ci/seed-contract-fixtures.sql");
+  assert.match(seed, /FOR i IN 0\.\.99 LOOP/, "o seed não cobre a faixa ampliada da fachada");
 });
 
 test("FC-18: a superfície declarada bate com os comandos exportados", () => {
   const src = executavel(INDEX);
-  const exportados = [...src.matchAll(/export function (\w+)\(/g)].map((m) => m[1]).sort();
-  const declarados = (/COMANDOS_DA_FACHADA = Object\.freeze\(\[([\s\S]*?)\] as const\)/.exec(src)?.[1] ?? "")
-    .match(/"(\w+)"/g)
-    ?.map((s) => s.replace(/"/g, ""))
-    .sort();
+  const exportados = [...src.matchAll(/export (?:async )?function (\w+)\(/g)].map((m) => m[1]).sort();
+  const bloco =
+    /COMANDOS_DA_FACHADA = Object\.freeze\(\{([\s\S]*?)\} as const satisfies/.exec(src)?.[1];
+  assert.ok(bloco !== undefined, "a superfície declarada sumiu");
 
-  assert.ok(declarados !== undefined, "a superfície declarada sumiu");
+  const declarados = [...bloco.matchAll(/^\s*(\w+): "(member|owner)",$/gm)].map((m) => m[1]);
   assert.deepEqual(
     exportados,
-    declarados,
+    [...declarados].sort(),
     "os comandos exportados divergiram da superfície declarada — a matriz de autorização precisa ser revista"
   );
 
@@ -438,6 +661,185 @@ test("FC-18: a superfície declarada bate com os comandos exportados", () => {
   for (const administrativo of ["grantCourtesy", "revokeCourtesy", "saveGrandfathering", "applyProviderEvent"]) {
     assert.ok(!src.includes(administrativo), `a fachada expõe a operação administrativa ${administrativo}`);
   }
+});
+
+// ── 9. A matriz de papéis ───────────────────────────────────────────────────
+
+/** A matriz APROVADA, escrita por extenso. Papel não se decide em silêncio. */
+const MATRIZ_APROVADA = {
+  lerCatalogo: "member",
+  lerAcesso: "member",
+  lerAssinatura: "owner",
+  iniciarTrial: "owner",
+  atualizarEmailFinanceiro: "owner",
+  aceitarTermos: "owner",
+  registrarTrabalhadores: "owner",
+  escolherPlano: "owner",
+  fazerUpgrade: "owner",
+  agendarDowngrade: "owner",
+  cancelarNoFimDoPeriodo: "owner",
+  prepararIntencaoDeCheckout: "owner",
+  criarCheckout: "owner",
+};
+
+/** Comandos que ALTERAM contrato ou cobram. Nenhum pode aceitar membro. */
+const ESCRITAS = [
+  "iniciarTrial",
+  "atualizarEmailFinanceiro",
+  "aceitarTermos",
+  "registrarTrabalhadores",
+  "escolherPlano",
+  "fazerUpgrade",
+  "agendarDowngrade",
+  "cancelarNoFimDoPeriodo",
+  "criarCheckout",
+];
+
+function corpoDoComando(src, nome) {
+  return new RegExp(`export (?:async )?function ${nome}\\([\\s\\S]*?\\n}`).exec(src)?.[0] ?? "";
+}
+
+test("FC-19: a matriz de papéis é a acordada, e nenhuma escrita aceita membro", () => {
+  const src = executavel(INDEX);
+  const bloco =
+    /COMANDOS_DA_FACHADA = Object\.freeze\(\{([\s\S]*?)\} as const satisfies/.exec(src)?.[1] ?? "";
+  const matriz = Object.fromEntries(
+    [...bloco.matchAll(/^\s*(\w+): "(member|owner)",$/gm)].map((m) => [m[1], m[2]])
+  );
+  assert.deepEqual(matriz, MATRIZ_APROVADA, "a matriz de papéis divergiu da acordada");
+
+  // O papel declarado é o que cada comando REALMENTE passa adiante.
+  for (const [comando, papel] of Object.entries(MATRIZ_APROVADA)) {
+    const corpo = corpoDoComando(src, comando);
+    assert.ok(corpo.length > 0, `${comando} sumiu`);
+    assert.ok(
+      new RegExp(`"${papel}"`).test(corpo),
+      `${comando} declara "${papel}" na matriz mas não o exige na autorização`
+    );
+  }
+
+  // Dito de forma INDEPENDENTE da matriz: se alguém rebaixar um comando de
+  // escrita nos dois lugares de uma vez, isto ainda reprova.
+  for (const comando of ESCRITAS) {
+    assert.ok(
+      !/"member"/.test(corpoDoComando(src, comando)),
+      `${comando} é escrita e aceita membro — a ampliação vazou para o que altera contrato`
+    );
+  }
+
+  // O dossiê comercial continua fechado ao membro.
+  assert.ok(
+    !/"member"/.test(corpoDoComando(src, "lerAssinatura")),
+    "lerAssinatura aceita membro — CNPJ, contato financeiro e preço praticado vazariam"
+  );
+
+  // E a decisão de acesso NÃO exige proprietário: era o defeito que fechava a
+  // porta para o enforcement de entitlements de quem não paga.
+  assert.ok(
+    !/"owner"/.test(corpoDoComando(src, "lerAcesso")),
+    "lerAcesso voltou a exigir proprietário — o colaborador fica sem entitlements"
+  );
+});
+
+test("FC-19b: os casos de uso declaram o papel, e só duas consultas são de membro", () => {
+  const shared = executavel("src/lib/billing/usecases/shared.ts");
+  assert.match(shared, /export function assertTenantOwner</, "assertTenantOwner não existe");
+  assert.match(shared, /export function assertTenantMember</, "assertTenantMember não existe");
+  assert.ok(
+    !/export function assertTenant</.test(shared),
+    "o `assertTenant` ambíguo continua exportado — dois nomes para a mesma decisão"
+  );
+
+  const owner = /export function assertTenantOwner<[\s\S]*?\n}/.exec(shared)?.[0] ?? "";
+  assert.match(owner, /auth\.role !== "owner"/, "assertTenantOwner não confere o papel");
+
+  // As chamadas de membro são EXATAMENTE as esperadas, por arquivo.
+  const usoDeMembro = [];
+  for (const arquivo of ["access.ts", "payments.ts", "queries.ts", "subscription.ts"]) {
+    const src = executavel(`src/lib/billing/usecases/${arquivo}`);
+    for (const _ of src.matchAll(/assertTenantMember</g)) usoDeMembro.push(arquivo);
+  }
+  assert.deepEqual(
+    usoDeMembro.sort(),
+    ["access.ts", "queries.ts"],
+    `assertTenantMember aparece em ${usoDeMembro.join(", ")}; só a decisão de acesso e o catálogo`
+  );
+
+  // O catálogo é de membro; o dossiê é de proprietário.
+  const queries = executavel("src/lib/billing/usecases/queries.ts");
+  const catalogo = /export async function readCatalogUseCase\([\s\S]*?\n}/.exec(queries)?.[0] ?? "";
+  const estado = /export async function readSubscriptionState\([\s\S]*?\n}/.exec(queries)?.[0] ?? "";
+  assert.match(catalogo, /assertTenantMember</, "o catálogo exige proprietário");
+  assert.match(estado, /assertTenantOwner</, "o dossiê comercial aceita membro");
+
+  // E o resolvedor de sessão devolve o papel REAL, com padrão de menor
+  // privilégio: papel ausente ou inesperado não pode virar `owner`.
+  const autorizacao = executavel("src/lib/billing/authorization.ts");
+  assert.match(autorizacao, /export async function requireBillingMember\(/, "não há resolvedor de membro");
+  assert.match(
+    autorizacao,
+    /membership\.role === "owner" \? \("owner" as const\) : \("member" as const\)/,
+    "o papel resolvido não tem padrão de menor privilégio"
+  );
+});
+
+// ── 10. Uma leitura, um caso de uso ─────────────────────────────────────────
+
+test("FC-20: a fachada não lê o banco nem decide domínio", () => {
+  const src = executavel(INDEX);
+
+  // Nenhum comando chama o repositório diretamente. A versão anterior fazia
+  // isso em três: `lerCatalogo`, `lerAssinatura` e — pior — `criarCheckout`,
+  // que lia o estado para derivar a chave e depois chamava um caso de uso que
+  // lia de novo.
+  const leituras = [...src.matchAll(/env\.repo\.\w+\(/g)].map((m) => m[0]);
+  assert.deepEqual(leituras, [], `a fachada acessa o repositório diretamente: ${leituras.join(", ")}`);
+
+  // E não toma decisão de domínio: `not_found` para assinatura inexistente é
+  // de `exigirAssinatura`, e escrevê-lo aqui duplicaria a regra em duas camadas.
+  assert.ok(!/\bfail\(/.test(src), "a fachada produz recusa de domínio por conta própria");
+  assert.ok(!src.includes('"not_found"'), "a fachada decide `not_found` — regra de domínio duplicada");
+
+  const checkout = corpoDoComando(src, "criarCheckout");
+  assert.ok(checkout.length > 0, "criarCheckout sumiu");
+  assert.ok(
+    !/readState|subscription|assinatura/.test(checkout),
+    "o checkout voltou a ler o estado na fachada — duas leituras e TOCTOU"
+  );
+
+  // Exatamente UM caso de uso por comando.
+  const CASOS_DE_USO =
+    /\b(readCatalogUseCase|readSubscriptionState|resolveBillingAccess|createCheckout|startTrial|acceptTerms|updateBillingEmail|recordWorkerCount|choosePlan|upgradeSubscription|scheduleDowngradeUseCase|cancelAtPeriodEnd)\(/g;
+  const ESPERADOS = {
+    lerCatalogo: "readCatalogUseCase",
+    lerAssinatura: "readSubscriptionState",
+    lerAcesso: "resolveBillingAccess",
+    criarCheckout: "createCheckout",
+    iniciarTrial: "startTrial",
+    atualizarEmailFinanceiro: "updateBillingEmail",
+    aceitarTermos: "acceptTerms",
+    registrarTrabalhadores: "recordWorkerCount",
+    escolherPlano: "choosePlan",
+    fazerUpgrade: "upgradeSubscription",
+    agendarDowngrade: "scheduleDowngradeUseCase",
+    cancelarNoFimDoPeriodo: "cancelAtPeriodEnd",
+  };
+  for (const [comando, caso] of Object.entries(ESPERADOS)) {
+    const corpo = corpoDoComando(src, comando);
+    const chamadas = [...corpo.matchAll(CASOS_DE_USO)];
+    assert.equal(
+      chamadas.length,
+      1,
+      `${comando} chama ${chamadas.length} casos de uso; a etapa 10 exige exatamente um`
+    );
+    assert.equal(chamadas[0][1], caso, `${comando} chama ${chamadas[0][1]} em vez de ${caso}`);
+  }
+
+  // E o caso de uso do checkout lê o estado UMA vez.
+  const payments = executavel("src/lib/billing/usecases/payments.ts");
+  const criar = /export async function createCheckout\([\s\S]*?\n}/.exec(payments)?.[0] ?? "";
+  const lidas = [...criar.matchAll(/exigirAssinatura\(env\)|env\.repo\.readState\(/g)];
+  assert.equal(lidas.length, 1, `createCheckout lê o estado ${lidas.length} vezes; uma basta`);
 });
 
 console.log(`\nBilling facade guard: ${passed} passed, ${failed} failed`);

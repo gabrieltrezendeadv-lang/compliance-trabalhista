@@ -469,24 +469,70 @@ test("MUT-25: remover uma migration HISTÓRICA é DETECTADO", () => {
 test("MUT-26: remover a comparação de organização (IDOR) é DETECTADO", () => {
   // Sem a comparação, o servidor autoriza "é owner de alguma coisa" e opera
   // sobre o identificador que o cliente mandou.
+  //
+  // A âncora carrega o comentário porque a 12C.2 criou a função gêmea de
+  // MEMBRO, e as duas comparam na mesma linha: sem o comentário, a mutação
+  // casaria duas vezes e mutaria o lugar errado.
   const r = mutar(
     "src/lib/billing/authorization.ts",
-    "  if (requestedOrganizationId !== resultado.principal.organizationId) {",
-    "  if (false) {",
+    `  if (requestedOrganizationId !== resultado.principal.organizationId) {
+    // Deliberadamente \`not_owner\`, e não "organização não encontrada": a`,
+    `  if (false) {
+    // Deliberadamente \`not_owner\`, e não "organização não encontrada": a`,
     FOUNDATION
   );
   assert.equal(r.code, 1, `o IDOR passou:\n${r.out}`);
   assert.match(r.out, /BF-27/);
 });
 
+test("MUT-26b: remover a comparação no caminho de MEMBRO é DETECTADO", () => {
+  // A ampliação da 12C.2 duplicou o resolvedor. Copiar uma função e esquecer a
+  // comparação é o erro mais provável ao duplicar — e sem esta mutação a
+  // guarda aprovaria justamente isso.
+  const r = mutar(
+    "src/lib/billing/authorization.ts",
+    `  if (requestedOrganizationId !== resultado.principal.organizationId) {
+    return negar("not_owner");
+  }
+
+  return resultado;
+}`,
+    `  return resultado;
+}`,
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `o IDOR do caminho de membro passou:\n${r.out}`);
+  assert.match(r.out, /BF-27/);
+});
+
 test("MUT-27: aceitar organização vazia usando a do servidor é DETECTADO", () => {
   const r = mutar(
     "src/lib/billing/authorization.ts",
-    '    requestedOrganizationId.trim() === ""',
-    "    false",
+    `  // Entrada vazia ou de tipo inesperado é recusa, não "usa o do servidor".
+  if (
+    typeof requestedOrganizationId !== "string" ||
+    requestedOrganizationId.trim() === ""
+  ) {`,
+    `  if (
+    typeof requestedOrganizationId !== "string" ||
+    false
+  ) {`,
     FOUNDATION
   );
   assert.equal(r.code, 1, `a entrada vazia passou:\n${r.out}`);
+  assert.match(r.out, /BF-27/);
+});
+
+test("MUT-27b: papel desconhecido virar `owner` é DETECTADO", () => {
+  // O padrão do resolvedor de membro tem de ser o MENOR privilégio: um papel
+  // ausente, nulo ou inesperado não pode ser lido como proprietário.
+  const r = mutar(
+    "src/lib/billing/authorization.ts",
+    '    const role = membership.role === "owner" ? ("owner" as const) : ("member" as const);',
+    '    const role = membership.role === "member" ? ("member" as const) : ("owner" as const);',
+    FOUNDATION
+  );
+  assert.equal(r.code, 1, `o papel desconhecido virou owner:\n${r.out}`);
   assert.match(r.out, /BF-27/);
 });
 

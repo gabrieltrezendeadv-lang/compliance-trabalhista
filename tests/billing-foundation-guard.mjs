@@ -886,14 +886,18 @@ test("BF-27: identificador vindo do cliente não autoriza (IDOR)", () => {
   );
   // A comparação é o controle. Sem ela, o owner do tenant A administraria a
   // assinatura do tenant B sem sair da própria sessão.
+  //
+  // O recorte é o CORPO da função, e não o arquivo: desde que a 12C.2 criou a
+  // gêmea de membro, procurar no arquivo inteiro deixaria a comparação da
+  // outra função responder por esta.
+  const i = auth.indexOf("requireBillingOwnerFor");
+  const corpo = auth.slice(i, i + 1200);
   assert.match(
-    auth,
+    corpo,
     /requestedOrganizationId !== resultado\.principal\.organizationId/,
     "o identificador do cliente não é comparado com o resolvido no servidor"
   );
   // E o servidor tem de resolver por conta própria ANTES de comparar.
-  const i = auth.indexOf("requireBillingOwnerFor");
-  const corpo = auth.slice(i, i + 1200);
   assert.match(
     corpo,
     /await requireBillingOwner\(\)/,
@@ -901,6 +905,46 @@ test("BF-27: identificador vindo do cliente não autoriza (IDOR)", () => {
   );
   // Entrada vazia não pode cair no caminho do servidor.
   assert.match(corpo, /trim\(\) === ""/, "entrada vazia precisa ser recusada");
+
+  // ── A MESMA EXIGÊNCIA PARA A FAMÍLIA DE MEMBRO ────────────────────────────
+  //
+  // A 12C.2 abriu duas leituras ao membro comum (catálogo e decisão de acesso).
+  // Ampliar QUEM pode ler não pode ter afrouxado o anti-IDOR: um membro de A
+  // continua sem alcançar B, e a checagem é a mesma, no mesmo lugar.
+  //
+  // Sem esta metade, a guarda aprovaria uma ampliação que copiou a função e
+  // esqueceu a comparação — que é exatamente o erro mais provável ao duplicar
+  // um resolvedor.
+  assert.match(
+    auth,
+    /export async function requireBillingMemberFor/,
+    "falta a autorização de MEMBRO por organização solicitada"
+  );
+  const j = auth.indexOf("requireBillingMemberFor");
+  const corpoMembro = auth.slice(j, j + 1200);
+  assert.match(
+    corpoMembro,
+    /await requireBillingMember\(\)/,
+    "a variante de membro por organização precisa reusar a resolução server-side"
+  );
+  assert.match(
+    corpoMembro,
+    /requestedOrganizationId !== resultado\.principal\.organizationId/,
+    "o caminho de membro não compara o identificador do cliente"
+  );
+  assert.match(corpoMembro, /trim\(\) === ""/, "entrada vazia precisa ser recusada no caminho de membro");
+  assert.match(
+    corpoMembro,
+    /negar\("not_owner"\)/,
+    "o caminho de membro distingue tenant alheio de inexistente"
+  );
+
+  // O papel resolvido é o REAL, com padrão de menor privilégio.
+  assert.match(
+    auth,
+    /membership\.role === "owner" \? \("owner" as const\) : \("member" as const\)/,
+    "o resolvedor de membro não tem padrão de menor privilégio"
+  );
 });
 
 test("BF-28: a feature flag é inalcançável pelo browser", () => {
