@@ -29,7 +29,7 @@ com treze comandos e uma matriz de papéis explícita:
 | `fazerUpgrade` | owner | não | `upgradeSubscription` |
 | `agendarDowngrade` | owner | não | `scheduleDowngradeUseCase` |
 | `cancelarNoFimDoPeriodo` | owner | não | `cancelAtPeriodEnd` |
-| `prepararIntencaoDeCheckout` | owner | não | — (comando puro) |
+| `prepararIntencaoDeCheckout` | owner | não | `prepareCheckoutIntent` |
 | `criarCheckout` | owner | **sim** | `createCheckout` |
 
 Cortesia, grandfathering e webhook **não** entram: são operações
@@ -59,8 +59,20 @@ linhas de `executarComando`.
 | 7 | validação | **depois** da autorização: quem não está autorizado não aprende quais campos existem |
 | 8 | contexto confiável | ator, organização, **papel real**, origem, relógio e correlação, do servidor |
 | 9 | provider | só quando a operação precisa — só o checkout precisa |
-| 10 | um caso de uso | exatamente um, **sem exceção**; ver §6 |
+| 10 | um caso de uso | exatamente um, **sem exceção** — inclusive o comando puro; ver §6 |
 | 11 | tradução | `Result` vira `FacadeResult`, com mensagem escrita à mão |
+
+As etapas **1 a 7 vivem numa função só**, `preflight`, e os dois executores a
+reusam: o que monta repositório e provider, e o que atende comandos puros. Duas
+cópias da sequência ficariam coerentes só por comentário, e comentário não impõe
+nada — `FC-02` reprova se um executor trouxer a própria.
+
+**"Zero I/O" só existe qualificado.** `prepararIntencaoDeCheckout` tem **zero I/O
+de billing**: nenhum `BillingRepository` e nenhum provider são construídos.
+Permanece o I/O necessário à autenticação e à autorização — a sessão e a
+membership são consultadas, como em todo comando. Dizer "zero I/O" sem
+qualificar sugeriria que este caminho não toca o banco, quando ele toca
+`organization_members` para saber quem está chamando.
 
 As três primeiras propriedades não são afirmadas: são **medidas**.
 `repositorio` e `provider` são fábricas instrumentadas na bancada, e cada teste
@@ -102,8 +114,40 @@ a `MUT-FC-34g` provam que a guarda morde nas duas direções.
 
 Duas propriedades **não** foram afrouxadas junto: membro de A continua sem
 alcançar B, e tenant alheio continua indistinguível de tenant inexistente.
-`requireBillingMemberFor` compara o identificador afirmado exatamente como
+`requireBillingMemberFor` trata o identificador afirmado exatamente como
 `requireBillingOwnerFor`, e `BF-27` cobra as duas.
+
+### A resolução por tenant, e o defeito que ela tinha
+
+As variantes `…For` faziam isto:
+
+```ts
+const r = await requireBillingOwner();   // resolve a PRIMEIRA membership
+if (pedido !== r.principal.organizationId) return negar(...);
+```
+
+Isso não pergunta *"o usuário pertence ao tenant pedido?"*. Pergunta *"o tenant
+pedido é justamente o primeiro que eu resolvi?"* — e as duas perguntas só
+coincidem para quem tem uma organização só.
+
+O efeito não era abrir acesso indevido: era **recusar acesso legítimo**. Quem é
+owner de A e membro de B, com B ativo, era barrado de B. O mesmo valia para quem
+é owner de duas organizações e administra a segunda.
+
+Agora a consulta filtra por `user_id` **e** por `tenant_id = <pedido>` ao mesmo
+tempo. O identificador do cliente continua sem autorizar — ele **restringe** a
+consulta, e quem autoriza é a linha devolvida, conferida de novo em código:
+tenant igual ao pedido e papel esperado. `deleted_at IS NULL` vai junto, erro de
+consulta e resposta malformada NEGAM, e ausência de linha é `not_owner` — a
+mesma recusa de tenant alheio e de tenant inexistente.
+
+`tests/integration/billing/authorization-multi-org.spec.ts` mede os dois
+sentidos, com um fixture que **filtra de verdade**. É uma escolha oposta à do
+fake compartilhado, e deliberada: lá o defeito temido é o código esquecer o
+filtro e o fake consertar a falha; aqui é o código não enviar o filtro e recusar
+quem é legítimo. Um fake que não filtrasse devolveria a membership certa de
+qualquer jeito, e o teste passaria com o código velho. A disciplina é a mesma —
+o fixture nunca pode ser o que faz o teste passar.
 
 ## 5. Campos que nunca vêm do chamador
 
@@ -161,7 +205,8 @@ em vez de inferida de relógio ou de estado.
 ### O identificador
 
 `ci_` + 32 hex, **128 bits** de `crypto.getRandomValues`, cunhado por
-`prepararIntencaoDeCheckout` (owner, sem I/O algum) e injetado como dependência
+`prepararIntencaoDeCheckout` (owner, **zero I/O de billing**) e injetado como
+dependência
 para que os testes contem as cunhagens.
 
 Ele **não autoriza nada**: ator, tenant, papel, preço, período e fingerprint
@@ -195,6 +240,54 @@ novo", faculdade que ele tem; e o efeito é governado por
 `billing.idempotency_records`, que já é persistida, atômica e escopada por
 `UNIQUE (organization_id, scope, provider, key)`. O formato é validado para que
 a entrada continue fechada.
+
+### O fingerprint cobre o pedido INTEIRO
+
+A chave diz "é a mesma tentativa". O fingerprint diz "é o mesmo pedido" — e
+para isso ele precisa cobrir tudo o que chega ao provider.
+
+Não cobria. `createCheckout` enviava `cnpj`, `customerName` e `customerEmail` ao
+provider, e nenhum dos três entrava na identidade do pedido. Consequência: um
+retry sob a mesma intenção, com o mesmo plano e o mesmo meio, mas com **outro
+pagador**, mantinha o fingerprint — o banco entendia "mesmo pedido" e devolvia
+replay, enquanto o conteúdo destinado ao provider havia mudado.
+
+O teste que existia trocava apenas PIX por cartão. Ele provava `method`, e nada
+mais.
+
+Agora o fingerprint cobre plano, faixa, periodicidade, valor, meio, início e fim
+do período, **CNPJ, nome e e-mail do pagador**. `description` e `dueAt` não
+entram nominalmente porque são *derivados* de campos já presentes — plano e
+periodicidade a primeira, fim do período o segundo; acrescentá-los contaria a
+mesma coisa duas vezes.
+
+**A normalização, por extenso:**
+
+| Campo | Regra | Por quê |
+| --- | --- | --- |
+| CNPJ | só os dígitos | máscara é apresentação, não identidade |
+| Nome | `trim` | espaço **interno** é preservado: vai impresso na cobrança |
+| E-mail | `trim` e caixa baixa | o usuário não vê diferença entre `F@x.com` e `f@x.com` |
+
+O valor **normalizado** é o que vai ao fingerprint *e* ao provider. Normalizar
+só para o fingerprint faria a identidade dizer "mesmo pedido" enquanto o
+provider recebe bytes diferentes — a divergência que isto existe para impedir.
+
+Só o SHA-256 é persistido: nenhuma PII nova entra em `idempotency_records`, na
+auditoria, em mensagem de erro ou em log. `FC-21` reprova se algum desses campos
+aparecer na reserva.
+
+**O CNPJ não é alterável hoje** — entra por `start_trial` e é imutável por
+trigger; não há RPC que o mude. O cenário "mudar o CNPJ sob a mesma intenção"
+não é alcançável, e encená-lo seria encenar. O que se prova é a propriedade que
+importa: duas organizações com CNPJ distinto produzem fingerprints distintos.
+
+O mock também teve de mudar. Ele memoiza o cliente por organização e devolve o
+existente sem olhar nome, e-mail ou CNPJ — então um teste que olhasse o
+*resultado* passaria porque o mock **descarta** o campo, e não porque o produto
+protege. `chamadasDeCliente` registra o que o provider de fato recebeu, e a
+asserção passou a ser a certa: o conflito acontece antes, e a segunda versão
+nunca chega lá.
 
 ## 7. Persistência: por que zero migration, inclusive para o digest
 
@@ -310,6 +403,17 @@ A 12D permanece reservada ao **adaptador Asaas** e ao sandbox externo.
 * **O pagamento efetivo não é exercitado ponta a ponta.** `simulatePayment` e o
   webhook têm cobertura própria, mas nenhum teste da fachada leva uma cobrança
   de criada a paga: a fachada não expõe webhook, por decisão da §1.
+
+Sobre a resolução de tenant: as variantes **sem argumento** continuam escolhendo
+a primeira membership, e continuam sem saber qual tenant o usuário está olhando
+— adivinhar não é resolver. Os wrappers da 12C.3 devem passar o `organizationId`
+do tenant ativo, e, desde a correção das variantes `…For`, informar a
+organização de fato elimina a ambiguidade: elas consultam a membership
+**naquele** tenant em vez de resolver um padrão e comparar depois.
+
+Isto deixou de ser um limite aceito e passou a ser um requisito do contrato com
+a 12C.3. Unificar a resolução de tenant do produto inteiro continua sendo decisão
+maior do que esta etapa: `src/lib/tenant-guard.ts` é onde ela terá de acontecer.
 
 ## 12. O que esta etapa deliberadamente NÃO faz
 
