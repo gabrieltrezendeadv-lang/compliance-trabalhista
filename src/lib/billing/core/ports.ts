@@ -37,7 +37,7 @@ export interface IdGenerator {
  * `organizationId` aqui é o que o SERVIDOR resolveu a partir da sessão, nunca
  * o que o cliente enviou. O identificador vindo do cliente entra como
  * `requestedOrganizationId` nos comandos e é comparado com este; divergência é
- * recusa. Ver `assertTenant`.
+ * recusa. Ver `assertTenantOwner` e `assertTenantMember`.
  */
 export interface BillingAuthContext {
   readonly userId: string;
